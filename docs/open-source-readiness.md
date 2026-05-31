@@ -29,11 +29,18 @@ or carry their own release metadata patch.
 
 [`AppBundle/Info.plist.template`](../AppBundle/Info.plist.template) currently contains Sparkle fields:
 
-- `SUFeedURL=https://github.com/repoprompt/repoprompt-ce/releases/latest/download/appcast.xml`
+- `SUFeedURL=https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml`
 - `SUPublicEDKey=<public EdDSA key committed in the plist>`
 - `SUBundleName=RepoPrompt CE.app`
 
 These are documented as maintainer-owned release/update-channel values. Do not replace them with guessed fork values. The inherited Sparkle EdDSA key pair was rotated to a CE-specific pair on 2026-05-31: only the new public key is committed, the private key is stored in the GitHub `release` environment, and the app-side Sparkle integrity checks agree with the plist values.
+
+The stable feed is hosted in the deliberately public, artifact-only
+[`repoprompt/repoprompt-ce-updates`](https://github.com/repoprompt/repoprompt-ce-updates)
+repository. This keeps the appcast and signed updater ZIP anonymously
+downloadable while the source repository remains private during validation.
+The organization currently disables GitHub Pages creation, so the feed uses
+public GitHub Release assets in that repository rather than Pages.
 
 ## Dependency pins
 
@@ -83,7 +90,7 @@ Remaining blockers:
 - Scrub the historical contributor cohort from existing git history before the repository is made public.
 - Finish the comprehensive notice inventory for SwiftPM dependencies.
 - Harden the public Sparkle promotion path before treating automatic updates as production-ready: validate that the CI private key matches the committed public key, publish an existing reviewed draft without rebuilding it, explicitly mark the intended stable tag as GitHub's latest release, and run anonymous post-publish feed, archive-signature, and checksum smoke checks.
-- Make the repository public, or move release assets to an anonymously accessible host, before expecting installed Sparkle clients to fetch `releases/latest/download/appcast.xml`.
+- Automate mirroring reviewed release assets into the public `repoprompt-ce-updates` repository. The maintainer-only [`Scripts/publish_public_update_test.sh`](../Scripts/publish_public_update_test.sh) helper provides the explicit private-repository smoke path in the meantime.
 
 ## Contributor validation touchpoints
 

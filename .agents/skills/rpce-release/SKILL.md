@@ -34,5 +34,11 @@ chat.
 RepoPrompt CE starts its independent release history at `1.0.0 (1)`.
 Increment `BUILD_NUMBER` monotonically for every later public update.
 
+For an explicit private-source updater smoke test, use the maintainer-only
+`Scripts/publish_public_update_test.sh` helper documented in
+[`docs/releasing.md`](../../../docs/releasing.md). It publishes only verified
+Developer ID signed, notarized ZIPs to the public artifact-only update
+repository.
+
 Before a tag, commit, or push, run the repository-local
 `$rpce-contribution-check` skill and follow its approval requirements.

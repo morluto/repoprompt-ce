@@ -19,7 +19,7 @@ CHECKSUMS="$DIST_DIR/SHA256SUMS"
 RELEASE_TAG="${RELEASE_TAG:-}"
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-repoprompt/repoprompt-ce}"
 DOWNLOAD_URL_PREFIX="${DOWNLOAD_URL_PREFIX:-https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG}"
-EXPECTED_FEED_URL="https://github.com/repoprompt/repoprompt-ce/releases/latest/download/appcast.xml"
+EXPECTED_FEED_URL="https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml"
 SPARKLE_FRAMEWORK_INFO="$ROOT_DIR/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework/Versions/B/Resources/Info.plist"
 TMP_DIR=""
 

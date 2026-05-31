@@ -38,8 +38,9 @@ The intended process is:
    below.
 
 The current workflow implements draft creation. A separate protected
-promotion workflow that publishes an existing reviewed draft and runs the
-post-publish checks remains a public-launch hardening item.
+promotion workflow that publishes an existing reviewed draft, mirrors its
+public update assets, and runs the post-publish checks remains a public-launch
+hardening item.
 
 ## Contributor release candidate
 
@@ -128,28 +129,50 @@ cryptographically required.
 The appcast URL committed in the app is:
 
 ```text
-https://github.com/repoprompt/repoprompt-ce/releases/latest/download/appcast.xml
+https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml
 ```
 
-This is a stable GitHub Releases asset URL once the repository is public and at
-least one non-draft, non-prerelease release exists. Draft releases stay
-invisible to installed clients while maintainers review them.
+The deliberately public, artifact-only
+[`repoprompt/repoprompt-ce-updates`](https://github.com/repoprompt/repoprompt-ce-updates)
+repository keeps the Sparkle feed and update ZIP anonymously downloadable while
+the source repository remains private during release validation. The
+organization currently disables GitHub Pages creation, so the feed uses public
+GitHub Release assets rather than Pages. Draft releases stay invisible to
+installed clients while maintainers review them.
 
 Each appcast enclosure must use an immutable tag-specific ZIP URL:
 
 ```text
-https://github.com/repoprompt/repoprompt-ce/releases/download/<tag>/RepoPrompt-<version>-<build>.zip
+https://github.com/repoprompt/repoprompt-ce-updates/releases/download/<tag>/RepoPrompt-<version>-<build>.zip
 ```
 
 Do not point update archive enclosures at `latest/download`. The moving
 `latest/download/appcast.xml` URL is only for locating the current feed.
 
-GitHub Releases is a good initial host while stable releases are linear and a
-one-item feed is sufficient. Prefer GitHub Pages or a project-controlled
-static host later if CE needs cumulative feed history, binary deltas, beta
-channels, backports, or feed promotion independent of GitHub's latest-release
-selection. Tag-specific ZIP assets can remain on GitHub Releases in either
-model.
+GitHub Releases in the artifact-only repository are a good initial host while
+stable releases are linear and a one-item feed is sufficient. Prefer a
+project-controlled static host later if CE needs cumulative feed history,
+binary deltas, beta channels, backports, or feed promotion independent of
+GitHub's latest-release selection.
+
+## Private-repository updater smoke
+
+After the protected workflow produces a Developer ID signed, notarized draft
+ZIP, download that ZIP locally and run:
+
+```bash
+CONFIRM_PUBLIC_UPDATE_TEST=1 \
+  ./Scripts/publish_public_update_test.sh /path/to/RepoPrompt-<version>-<build>.zip
+```
+
+This maintainer-only helper refuses ad-hoc archives. It verifies the Developer
+ID signature, expected Apple team, stapled notarization ticket, bundle
+identifier, marketing version, and build number before publishing the ZIP,
+generated appcast, and checksums as a public updater-smoke release in
+`repoprompt-ce-updates`.
+
+The helper reads the CE Sparkle private key from the local Sparkle Keychain
+account `repoprompt-ce`. It refuses to overwrite an existing public test tag.
 
 ## Promote and verify
 
@@ -158,9 +181,9 @@ artifacts. Explicitly mark the intended stable tag as GitHub's latest release.
 Immediately verify anonymously:
 
 ```text
-https://github.com/repoprompt/repoprompt-ce/releases/latest
-https://github.com/repoprompt/repoprompt-ce/releases/latest/download/appcast.xml
-https://github.com/repoprompt/repoprompt-ce/releases/download/<tag>/<zip>
+https://github.com/repoprompt/repoprompt-ce-updates/releases/latest
+https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml
+https://github.com/repoprompt/repoprompt-ce-updates/releases/download/<tag>/<zip>
 https://github.com/repoprompt/repoprompt-ce/releases/download/<tag>/<dmg>
 ```
 

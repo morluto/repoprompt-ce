@@ -20,7 +20,7 @@
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
   <key>CFBundleDocumentTypes</key><array><dict><key>CFBundleTypeName</key><string>RepoPrompt CE Document</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Default</string><key>LSItemContentTypes</key><array><string>com.pvncher.repoprompt.ce.document</string></array></dict></array>
   <key>UTExportedTypeDeclarations</key><array><dict><key>UTTypeIdentifier</key><string>com.pvncher.repoprompt.ce.document</string><key>UTTypeDescription</key><string>RepoPrompt CE Document</string><key>UTTypeConformsTo</key><array><string>public.data</string></array></dict></array>
-  <key>SUFeedURL</key><string>https://github.com/repoprompt/repoprompt-ce/releases/latest/download/appcast.xml</string>
+  <key>SUFeedURL</key><string>https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml</string>
   <key>SUPublicEDKey</key><string>845kp9v5+kp4U6no85H53cUdnbfN3NmE1PJHKwH8Pd4=</string>
   <key>SUEnableInstallerLauncherService</key><true/>
   <key>SUBundleName</key><string>RepoPrompt CE.app</string>
