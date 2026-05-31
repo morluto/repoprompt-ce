@@ -39,8 +39,6 @@ Push mode validates only the current branch against its configured upstream. For
 
 Obtain explicit user approval immediately before force-push, history rewrite, branch deletion, fork deletion, credential rotation, any other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app. Do not bundle approval for a future destructive step into an earlier request.
 
-When removing exposed credentials, revoke or rotate them even after rewriting history. Scan forks and cached GitHub commit access without printing decoded values.
-
 ## Focused validation
 
-Read [references/validation-matrix.md](references/validation-matrix.md) when deciding whether additional focused tests, builds, live smoke, or GitHub Support cleanup are required.
+Read [references/validation-matrix.md](references/validation-matrix.md) when deciding whether additional focused tests, builds, or live smoke are required.

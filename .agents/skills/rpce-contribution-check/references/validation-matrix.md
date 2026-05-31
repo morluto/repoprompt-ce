@@ -18,6 +18,4 @@ Use this after the scripted preflight when the touched boundary needs focused ev
 
 - Treat obfuscated, encoded, or split credentials as secrets. Do not print their decoded values.
 - Use `gitleaks` with `--redact` for materialized staged index blobs and outgoing commits.
-- Revoke or rotate any exposed credentials even after rewriting history.
-- Remember that deleted branches, forks, cached commit views, pull requests, and collaborator clones may retain old objects. Follow GitHub Support cleanup guidance when direct SHA access remains.
 - Do not commit local configuration, prompt exports, daemon logs, raw provider traces, or generated diagnostic artifacts unless the repository explicitly allows the exact path.
