@@ -287,6 +287,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     }
 
     private func executeReadFile(args: [String: Value]) async throws -> Value {
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
         let providerTotalState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.providerTotal)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.providerTotal, providerTotalState) }
 
@@ -339,9 +340,11 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, metadata)
             }
         }
-        return try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
+        let value = try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
             try Value(readResult.reply)
         }
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerResultReady)
+        return value
     }
 
     private func fileSearchTool() -> Tool {
@@ -406,7 +409,15 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: ["pattern"]
             )
         ) { [self] _, args in
-            try await Value(executeFileSearch(args: args))
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
+            let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
+            defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
+            let reply = try await executeFileSearch(args: args)
+            let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
+                try Value(reply)
+            }
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerResultReady)
+            return value
         }
     }
 
@@ -441,6 +452,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
         let metadata = await dependencies.captureRequestMetadata()
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        let usesWorktreeProjection = lookupContext.bindingProjection != nil
         let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
         let lookupRootScope = lookupContext.rootScope
         if let current = limiters, !current.isEmpty {
@@ -448,56 +460,151 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         let results: SearchResults
         do {
-            results = try await dependencies.workspaceSearch(
-                pattern, mode, regex, true, maxResults, maxResults, limiters, includeExts, excludePatterns, contextLines, wholeWord, countOnly, pattern.contains(" "), lookupRootScope
+            results = try await EditFlowPerf.measure(
+                EditFlowPerf.Stage.Search.providerWorkspaceSearchAwait,
+                EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
+            ) {
+                try await dependencies.workspaceSearch(
+                    pattern, mode, regex, true, maxResults, maxResults, limiters, includeExts, excludePatterns, contextLines, wholeWord, countOnly, pattern.contains(" "), lookupRootScope
+                )
+            }
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.providerWorkspaceSearchReturned,
+                EditFlowPerf.Dimensions(outcome: "completed", searchMode: mode.rawValue, countOnly: countOnly)
             )
+        } catch let error as StoreBackedWorkspaceSearchAdmissionError {
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.providerWorkspaceSearchReturned,
+                EditFlowPerf.Dimensions(outcome: "backpressure", searchMode: mode.rawValue, countOnly: countOnly)
+            )
+            let reply = Self.searchBackpressureDTO(for: error, worktreeScope: worktreeScope)
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: "backpressure"))
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedBackpressure"))
+            return reply
         } catch let error as SearchPatternError {
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.providerWorkspaceSearchReturned,
+                EditFlowPerf.Dimensions(outcome: "patternError", searchMode: mode.rawValue, countOnly: countOnly)
+            )
             let parts = MCPWindowWorkspaceToolHelpers.friendlySearchErrorParts(for: pattern, isRegex: regex, error: error)
-            return ToolResultDTOs.SearchResultDTO(totalMatches: 0, totalFiles: 0, contentMatches: 0, pathMatches: 0, limitHit: false, perFileCounts: [], pathMatchLines: [], contentMatchGroups: [], errorMessage: parts.issue, suggestion: parts.suggestion, worktreeScope: worktreeScope)
+            let reply = ToolResultDTOs.SearchResultDTO(totalMatches: 0, totalFiles: 0, contentMatches: 0, pathMatches: 0, limitHit: false, perFileCounts: [], pathMatchLines: [], contentMatchGroups: [], errorMessage: parts.issue, suggestion: parts.suggestion, worktreeScope: worktreeScope)
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: "patternError"))
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedPatternError"))
+            return reply
         }
 
-        let dtoBuildState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.dtoBuild)
-        defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.dtoBuild, dtoBuildState) }
-
-        let visibleRootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
-        let allRootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
-        let baseDisplayPath = MCPWindowWorkspaceToolHelpers.makeCachedMCPDisplayPathResolver(visibleRoots: visibleRootRefs, allRoots: allRootRefs)
-        let displayPath: (String) -> String = { rawPath in
-            lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: rawPath) ?? baseDisplayPath(rawPath)
+        func dtoBuildDimensions(
+            outcome: String? = nil,
+            limitHit: Bool? = nil
+        ) -> EditFlowPerf.Dimensions {
+            EditFlowPerf.Dimensions(
+                outcome: outcome,
+                matchCount: (results.totalCount ?? results.matches?.count ?? 0) + (results.paths?.count ?? 0),
+                scannedFileCount: results.searchedFileCount,
+                matchedFileCount: results.contentFileCount,
+                contentMatchCount: results.totalCount ?? results.matches?.count,
+                pathMatchCount: results.paths?.count,
+                limitHit: limitHit,
+                usesWorktreeProjection: usesWorktreeProjection,
+                searchMode: mode.rawValue,
+                countOnly: countOnly
+            )
         }
-        let pathFilterSuggestion = MCPWindowWorkspaceToolHelpers.pathFilterSuggestion(hadPathFilter: hadPathFilter, scopedFileCount: results.scopedFileCount)
+
+        let dtoBuildState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.dtoBuild, dtoBuildDimensions())
+        var dtoBuildOutcome = "completed"
+        var dtoBuildLimitHit = false
+        var dtoBuildEnded = false
+        func endDTOBuildIfNeeded() {
+            guard !dtoBuildEnded else { return }
+            dtoBuildEnded = true
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.dtoBuild,
+                dtoBuildState,
+                dtoBuildDimensions(outcome: dtoBuildOutcome, limitHit: dtoBuildLimitHit)
+            )
+        }
+        defer { endDTOBuildIfNeeded() }
+
+        let displayRootRefsSnapshot = await EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.dtoRootRefSnapshotLookup,
+            dtoBuildDimensions()
+        ) {
+            await dependencies.promptVM.workspaceFileContextStore.displayRootRefsSnapshot()
+        }
+        let visibleRootRefs = displayRootRefsSnapshot.visibleRoots
+        let allRootRefs = displayRootRefsSnapshot.allRoots
+        let (displayPath, pathFilterSuggestion): ((String) -> String, String?) = EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.dtoDisplayResolverPreparation,
+            dtoBuildDimensions()
+        ) {
+            let baseDisplayPath = MCPWindowWorkspaceToolHelpers.makeCachedMCPDisplayPathResolver(visibleRoots: visibleRootRefs, allRoots: allRootRefs)
+            let displayPath: (String) -> String = { rawPath in
+                lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: rawPath) ?? baseDisplayPath(rawPath)
+            }
+            let pathFilterSuggestion = MCPWindowWorkspaceToolHelpers.pathFilterSuggestion(hadPathFilter: hadPathFilter, scopedFileCount: results.scopedFileCount)
+            return (displayPath, pathFilterSuggestion)
+        }
 
         if countOnly {
             let contentMatches = results.totalCount ?? results.matches?.count ?? 0
-            let normalizedContentPaths = Set((results.matches ?? []).map { displayPath($0.filePath) })
-            let normalizedPathMatches = Set((results.paths ?? []).map { displayPath($0) })
-            return ToolResultDTOs.SearchResultDTO(
-                totalMatches: contentMatches + normalizedPathMatches.count,
-                totalFiles: results.contentFileCount ?? normalizedContentPaths.count,
-                matchedFiles: normalizedContentPaths.union(normalizedPathMatches).count,
-                searchedFiles: results.searchedFileCount,
-                contentMatches: contentMatches,
-                pathMatches: normalizedPathMatches.count,
-                limitHit: false,
-                perFileCounts: [],
-                pathMatchLines: Array(normalizedPathMatches).sorted(),
-                contentMatchGroups: [],
-                suggestion: pathFilterSuggestion,
-                warning: results.warningMessage,
-                worktreeScope: worktreeScope
-            )
+            let (displayedContentPaths, displayedPathMatches) = EditFlowPerf.measure(
+                EditFlowPerf.Stage.Search.dtoPathDisplayProjection,
+                dtoBuildDimensions()
+            ) {
+                (
+                    (results.matches ?? []).map { displayPath($0.filePath) },
+                    (results.paths ?? []).map { displayPath($0) }
+                )
+            }
+            EditFlowPerf.measure(
+                EditFlowPerf.Stage.Search.dtoCapAccounting,
+                dtoBuildDimensions(outcome: "skippedCountOnly", limitHit: false)
+            ) {}
+            let reply = EditFlowPerf.measure(
+                EditFlowPerf.Stage.Search.dtoAssembly,
+                dtoBuildDimensions(outcome: "completed", limitHit: false)
+            ) {
+                let normalizedContentPaths = Set(displayedContentPaths)
+                let normalizedPathMatches = Set(displayedPathMatches)
+                return ToolResultDTOs.SearchResultDTO(
+                    totalMatches: contentMatches + normalizedPathMatches.count,
+                    totalFiles: results.contentFileCount ?? normalizedContentPaths.count,
+                    matchedFiles: normalizedContentPaths.union(normalizedPathMatches).count,
+                    searchedFiles: results.searchedFileCount,
+                    contentMatches: contentMatches,
+                    pathMatches: normalizedPathMatches.count,
+                    limitHit: false,
+                    perFileCounts: [],
+                    pathMatchLines: Array(normalizedPathMatches).sorted(),
+                    contentMatchGroups: [],
+                    suggestion: pathFilterSuggestion,
+                    warning: results.warningMessage,
+                    worktreeScope: worktreeScope
+                )
+            }
+            endDTOBuildIfNeeded()
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: "completed", countOnly: true))
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedCountOnly"))
+            return reply
         }
 
-        let normalizedMatches = (results.matches ?? []).map {
-            SearchMatch(filePath: displayPath($0.filePath), lineNumber: $0.lineNumber, lineText: $0.lineText, contextBefore: $0.contextBefore, contextAfter: $0.contextAfter)
+        let (normalizedMatches, pathMatchesFull) = EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.dtoPathDisplayProjection,
+            dtoBuildDimensions()
+        ) {
+            let normalizedMatches = (results.matches ?? []).map {
+                SearchMatch(filePath: displayPath($0.filePath), lineNumber: $0.lineNumber, lineText: $0.lineText, contextBefore: $0.contextBefore, contextAfter: $0.contextAfter)
+            }
+            let pathMatchesFull = (results.paths ?? []).map { displayPath($0) }
+            return (normalizedMatches, pathMatchesFull)
         }
-        let pathMatchesFull = (results.paths ?? []).map { displayPath($0) }
         let contentMatchesFull = normalizedMatches
-        let perFileTotalsDTO = Dictionary(grouping: contentMatchesFull, by: \.filePath)
-            .mapValues(\.count)
-            .sorted { $0.key < $1.key }
-            .map { ToolResultDTOs.PerFileCount(path: $0.key, count: $0.value) }
 
+        let dtoCapAccountingState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.Search.dtoCapAccounting,
+            dtoBuildDimensions()
+        )
         let budget = max(0, 50000 - 2000)
         var usedChars = 0
         var includedContentMatches: [SearchMatch] = []
@@ -519,54 +626,105 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         let omittedPaths = pathMatchesFull.count - includedPathLines.count
         let sizeLimitHit = omittedContent + omittedPaths > 0
         let hitMaxCountLimit = contentMatchesFull.count >= maxResults || pathMatchesFull.count >= maxResults
+        dtoBuildLimitHit = sizeLimitHit || hitMaxCountLimit
+        if dtoBuildLimitHit {
+            dtoBuildOutcome = "capped"
+        }
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Search.dtoCapAccounting,
+            dtoCapAccountingState,
+            dtoBuildDimensions(outcome: dtoBuildOutcome, limitHit: dtoBuildLimitHit)
+        )
 
-        var perFileCounts: [String: Int] = [:]
-        for match in includedContentMatches {
-            perFileCounts[match.filePath, default: 0] += 1
-        }
-        let perFileCountDTOs = perFileCounts.sorted { $0.key < $1.key }.map { ToolResultDTOs.PerFileCount(path: $0.key, count: $0.value) }
-        var seenPaths = Set<String>()
-        var orderedPaths: [String] = []
-        for match in includedContentMatches where seenPaths.insert(match.filePath).inserted {
-            orderedPaths.append(match.filePath)
-        }
-        let groupedMatches = Dictionary(grouping: includedContentMatches, by: { $0.filePath })
-        let contentGroups = orderedPaths.compactMap { path -> ToolResultDTOs.SearchResultDTO.ContentMatchGroup? in
-            guard let matches = groupedMatches[path] else { return nil }
-            let lines = matches.sorted { $0.lineNumber < $1.lineNumber }.map { match in
-                let baseLine = match.lineNumber + 1
-                let before = (match.contextBefore ?? []).isEmpty ? nil : (match.contextBefore ?? []).enumerated().map { offset, text in
-                    ToolResultDTOs.SearchResultDTO.ContentMatchGroup.ContextLine(lineNumber: max(1, baseLine - (match.contextBefore?.count ?? 0)) + offset, lineText: text)
-                }
-                let after = (match.contextAfter ?? []).isEmpty ? nil : (match.contextAfter ?? []).enumerated().map { offset, text in
-                    ToolResultDTOs.SearchResultDTO.ContentMatchGroup.ContextLine(lineNumber: baseLine + offset + 1, lineText: text)
-                }
-                return ToolResultDTOs.SearchResultDTO.ContentMatchGroup.Line(lineNumber: baseLine, lineText: match.lineText, contextBefore: before, contextAfter: after)
+        let reply = EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.dtoAssembly,
+            dtoBuildDimensions(outcome: dtoBuildOutcome, limitHit: dtoBuildLimitHit)
+        ) {
+            let perFileTotalsDTO = Dictionary(grouping: contentMatchesFull, by: \.filePath)
+                .mapValues(\.count)
+                .sorted { $0.key < $1.key }
+                .map { ToolResultDTOs.PerFileCount(path: $0.key, count: $0.value) }
+            var perFileCounts: [String: Int] = [:]
+            for match in includedContentMatches {
+                perFileCounts[match.filePath, default: 0] += 1
             }
-            return ToolResultDTOs.SearchResultDTO.ContentMatchGroup(path: path, lines: lines)
-        }
+            let perFileCountDTOs = perFileCounts.sorted { $0.key < $1.key }.map { ToolResultDTOs.PerFileCount(path: $0.key, count: $0.value) }
+            var seenPaths = Set<String>()
+            var orderedPaths: [String] = []
+            for match in includedContentMatches where seenPaths.insert(match.filePath).inserted {
+                orderedPaths.append(match.filePath)
+            }
+            let groupedMatches = Dictionary(grouping: includedContentMatches, by: { $0.filePath })
+            let contentGroups = orderedPaths.compactMap { path -> ToolResultDTOs.SearchResultDTO.ContentMatchGroup? in
+                guard let matches = groupedMatches[path] else { return nil }
+                let lines = matches.sorted { $0.lineNumber < $1.lineNumber }.map { match in
+                    let baseLine = match.lineNumber + 1
+                    let before = (match.contextBefore ?? []).isEmpty ? nil : (match.contextBefore ?? []).enumerated().map { offset, text in
+                        ToolResultDTOs.SearchResultDTO.ContentMatchGroup.ContextLine(lineNumber: max(1, baseLine - (match.contextBefore?.count ?? 0)) + offset, lineText: text)
+                    }
+                    let after = (match.contextAfter ?? []).isEmpty ? nil : (match.contextAfter ?? []).enumerated().map { offset, text in
+                        ToolResultDTOs.SearchResultDTO.ContentMatchGroup.ContextLine(lineNumber: baseLine + offset + 1, lineText: text)
+                    }
+                    return ToolResultDTOs.SearchResultDTO.ContentMatchGroup.Line(lineNumber: baseLine, lineText: match.lineText, contextBefore: before, contextAfter: after)
+                }
+                return ToolResultDTOs.SearchResultDTO.ContentMatchGroup(path: path, lines: lines)
+            }
 
-        let reply = ToolResultDTOs.SearchResultDTO(
-            totalMatches: includedContentMatches.count + includedPathLines.count,
-            totalFiles: Set(includedContentMatches.map(\.filePath)).count,
-            matchedFiles: Set(contentMatchesFull.map(\.filePath)).union(Set(pathMatchesFull)).count,
-            searchedFiles: results.searchedFileCount,
-            contentMatches: includedContentMatches.count,
-            pathMatches: includedPathLines.count,
-            limitHit: sizeLimitHit || hitMaxCountLimit,
-            perFileCounts: perFileCountDTOs,
-            pathMatchLines: includedPathLines,
-            contentMatchGroups: contentGroups,
-            sizeLimitHit: sizeLimitHit ? true : nil,
-            omittedTotal: sizeLimitHit ? (omittedContent + omittedPaths) : nil,
-            omittedContentMatches: omittedContent > 0 ? omittedContent : nil,
-            omittedPathMatches: omittedPaths > 0 ? omittedPaths : nil,
-            suggestion: pathFilterSuggestion,
-            warning: results.warningMessage,
-            perFileTotals: perFileTotalsDTO.isEmpty ? nil : perFileTotalsDTO,
+            return ToolResultDTOs.SearchResultDTO(
+                totalMatches: includedContentMatches.count + includedPathLines.count,
+                totalFiles: Set(includedContentMatches.map(\.filePath)).count,
+                matchedFiles: Set(contentMatchesFull.map(\.filePath)).union(Set(pathMatchesFull)).count,
+                searchedFiles: results.searchedFileCount,
+                contentMatches: includedContentMatches.count,
+                pathMatches: includedPathLines.count,
+                limitHit: sizeLimitHit || hitMaxCountLimit,
+                perFileCounts: perFileCountDTOs,
+                pathMatchLines: includedPathLines,
+                contentMatchGroups: contentGroups,
+                sizeLimitHit: sizeLimitHit ? true : nil,
+                omittedTotal: sizeLimitHit ? (omittedContent + omittedPaths) : nil,
+                omittedContentMatches: omittedContent > 0 ? omittedContent : nil,
+                omittedPathMatches: omittedPaths > 0 ? omittedPaths : nil,
+                suggestion: pathFilterSuggestion,
+                warning: results.warningMessage,
+                perFileTotals: perFileTotalsDTO.isEmpty ? nil : perFileTotalsDTO,
+                worktreeScope: worktreeScope
+            )
+        }
+        endDTOBuildIfNeeded()
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.Search.providerDTOReady,
+            EditFlowPerf.Dimensions(outcome: dtoBuildOutcome, searchMode: mode.rawValue, countOnly: false)
+        )
+        await EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.providerAutoSelection,
+            EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
+        ) {
+            await dependencies.enqueueFileSearchAutoSelection(mode, contextLines, reply, metadata)
+        }
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned)
+        return reply
+    }
+
+    static func searchBackpressureDTO(
+        for error: StoreBackedWorkspaceSearchAdmissionError,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO? = nil
+    ) -> ToolResultDTOs.SearchResultDTO {
+        ToolResultDTOs.SearchResultDTO(
+            totalMatches: 0,
+            totalFiles: 0,
+            contentMatches: 0,
+            pathMatches: 0,
+            limitHit: false,
+            perFileCounts: [],
+            pathMatchLines: [],
+            contentMatchGroups: [],
+            errorMessage: error.localizedDescription,
+            errorCode: "search_backpressure",
+            retryable: true,
+            retryAfterMilliseconds: error.retryAfterMilliseconds,
+            suggestion: error.suggestion,
             worktreeScope: worktreeScope
         )
-        await dependencies.maybeAutoSelectFileSearchSlices(mode, contextLines, reply)
-        return reply
     }
 }

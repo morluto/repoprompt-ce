@@ -85,7 +85,8 @@ another Mac or redistributed.
 - **Context Builder**: Let an agent explore the repository, identify relevant
   files, and curate context within a token budget.
 - **Agent orchestration**: Run and coordinate CLI-backed coding agents from the
-  native macOS app.
+  native macOS app. See [`docs/worktrees.md`](docs/worktrees.md) for app-managed
+  worktrees and `.worktreeinclude` local file copying.
 - **MCP server and CLI integration**: Connect external MCP-compatible tools and
   CLI agents to RepoPrompt CE's repository context and agent harness.
 - **Multi-root workspaces**: Work across related repositories, packages, and

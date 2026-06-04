@@ -81,6 +81,9 @@ enum ToolOutputFormatter {
     // MARK: - Search
 
     static func searchResults(dto: ToolResultDTOs.SearchResultDTO) -> String {
+        if let error = dto.errorMessage, !error.isEmpty {
+            return searchErrorResults(dto: dto, error: error)
+        }
         var lines: [String] = []
         lines.reserveCapacity(16 + dto.perFileCounts.count + dto.pathMatchLines.count + dto.contentMatchGroups.count * 6)
         let hasMatches = (dto.totalMatches > 0) || (dto.pathMatches > 0)
@@ -162,6 +165,30 @@ enum ToolOutputFormatter {
             lines.append(suggestion)
         }
 
+        return lines.joined(separator: "\n")
+    }
+
+    private static func searchErrorResults(dto: ToolResultDTOs.SearchResultDTO, error: String) -> String {
+        var lines: [String] = []
+        let isBackpressure = dto.errorCode == "search_backpressure" && dto.retryable == true
+        lines.append(isBackpressure ? "## Search Results ⚠️" : "## Search Results ❌")
+        if isBackpressure {
+            lines.append("- **Status**: Temporarily busy")
+        }
+        lines.append("- **Error**: \(error)")
+        if dto.retryable == true {
+            lines.append("- **Retryable**: yes")
+        }
+        if let retryAfterMilliseconds = dto.retryAfterMilliseconds {
+            lines.append("- **Retry after**: \(retryAfterMilliseconds) ms")
+        }
+        if let warning = dto.warning, !warning.isEmpty {
+            lines.append("- **Warning**: \(warning)")
+        }
+        lines.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .search))
+        if let suggestion = dto.suggestion, !suggestion.isEmpty {
+            lines.append("- **Suggestion**: \(suggestion)")
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -3666,7 +3693,10 @@ extension ToolOutputFormatter {
         }
         if let warning = dto.warning, !warning.isEmpty {
             out.append("")
-            out.append("> ⚠️ \(warning)")
+            let lines = warning.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            for (index, line) in lines.enumerated() {
+                out.append(index == 0 ? "> ⚠️ \(line)" : "> \(line)")
+            }
         }
         return [.text(out.joined(separator: "\n"))]
     }
@@ -4603,17 +4633,7 @@ extension ToolOutputFormatter {
     static func formatSearch(value: Value) -> [MCP.Tool.Content] {
         if let dto = value.decode(ToolResultDTOs.SearchResultDTO.self) {
             if let error = dto.errorMessage, !error.isEmpty {
-                var out: [String] = []
-                out.append("## Search Results ❌")
-                out.append("- **Error**: \(error)")
-                if let warning = dto.warning, !warning.isEmpty {
-                    out.append("- **Warning**: \(warning)")
-                }
-                out.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .search))
-                if let suggestion = dto.suggestion, !suggestion.isEmpty {
-                    out.append("- **Suggestion**: \(suggestion)")
-                }
-                return [.text(out.joined(separator: "\n"))]
+                return [.text(searchErrorResults(dto: dto, error: error))]
             }
             let text = searchResults(dto: dto)
             return [.text(text)]

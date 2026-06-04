@@ -332,16 +332,31 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
             let events = snapshot.lifecycleEvents.filter { $0.correlationID == correlation.id.uuidString }
             XCTAssertEqual(events.map(\.eventName), [
+                "FileSystem.ContentLoadEntered",
+                "FileSystem.ContentReadRequestPrepared",
+                "FileSystem.ContentReadOffActorScheduled",
                 "FileSystem.ContentReadWorkerPermitWaitBegan",
-                "FileSystem.ContentReadWorkerPermitAcquired"
+                "FileSystem.ContentReadWorkerPermitAcquired",
+                "FileSystem.ContentReadWorkerReturned",
+                "FileSystem.ContentLoadReturned"
             ])
+            let rootLifecycleEvents = events.filter { $0.eventName != "FileSystem.ContentReadWorkerPermitWaitBegan" && $0.eventName != "FileSystem.ContentReadWorkerPermitAcquired" }
+            XCTAssertEqual(Set(rootLifecycleEvents.compactMap(Self.rootToken(in:))).count, 1)
             let aggregate = try XCTUnwrap(snapshot.stages.first {
                 $0.stageName == "EditFlow.FileSystem.ContentReadWorkerPermitWait" &&
                     $0.sanitizedDimensions.contains("outcome=acquiredAfterWait") &&
                     $0.sanitizedDimensions.contains("workloadClass=interactiveRead")
             })
             XCTAssertEqual(aggregate.sampleCount, 1)
-            for dimensions in events.map(\.sanitizedDimensions) + [aggregate.sanitizedDimensions] {
+            let workerBody = try XCTUnwrap(snapshot.stages.first {
+                $0.stageName == "EditFlow.FileSystem.ContentReadWorkerBody" &&
+                    $0.sanitizedDimensions.contains("outcome=loaded") &&
+                    $0.sanitizedDimensions.contains("workloadClass=interactiveRead") &&
+                    $0.sanitizedDimensions.contains("contentSource=disk") &&
+                    $0.sanitizedDimensions.contains("fileBytes=6")
+            })
+            XCTAssertEqual(workerBody.sampleCount, 1)
+            for dimensions in events.map(\.sanitizedDimensions) + [aggregate.sanitizedDimensions, workerBody.sanitizedDimensions] {
                 XCTAssertFalse(dimensions.contains("Unsafe"))
                 XCTAssertFalse(dimensions.contains("/"))
                 XCTAssertFalse(dimensions.contains("|"))
@@ -398,9 +413,16 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
             let events = snapshot.lifecycleEvents.filter { $0.correlationID == correlation.id.uuidString }
             XCTAssertEqual(events.map(\.eventName), [
+                "FileSystem.ContentLoadEntered",
+                "FileSystem.ContentReadRequestPrepared",
+                "FileSystem.ContentReadOffActorScheduled",
                 "FileSystem.ContentReadWorkerPermitWaitBegan",
-                "FileSystem.ContentReadWorkerPermitCancelled"
+                "FileSystem.ContentReadWorkerPermitCancelled",
+                "FileSystem.ContentReadWorkerReturned",
+                "FileSystem.ContentLoadReturned"
             ])
+            let rootLifecycleEvents = events.filter { $0.eventName != "FileSystem.ContentReadWorkerPermitWaitBegan" && $0.eventName != "FileSystem.ContentReadWorkerPermitCancelled" }
+            XCTAssertEqual(Set(rootLifecycleEvents.compactMap(Self.rootToken(in:))).count, 1)
             XCTAssertFalse(events.contains { $0.eventName == "FileSystem.ContentReadWorkerPermitAcquired" })
             XCTAssertTrue(snapshot.stages.contains {
                 $0.stageName == "EditFlow.FileSystem.ContentReadWorkerPermitWait" &&
@@ -481,6 +503,13 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
                 waited += interval
             }
             return false
+        }
+
+        private static func rootToken(in event: EditFlowPerf.DebugCaptureLifecycleEvent) -> String? {
+            event.sanitizedDimensions
+                .split(separator: " ")
+                .first { $0.hasPrefix("rootToken=") }
+                .map(String.init)
         }
 
         private func startedCapture(label: String, maxSamples: Int) -> EditFlowPerf.DebugCaptureSnapshot {

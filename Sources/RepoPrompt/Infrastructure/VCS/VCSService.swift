@@ -443,10 +443,111 @@ public extension VCSService {
         guard let resolved else {
             throw VCSError.notARepository(path: repoURL.path)
         }
+        return try await listGitWorktrees(for: resolved)
+    }
+
+    func listGitWorktrees(for resolved: VCSResolvedRepo) async throws -> [GitWorktreeDescriptor] {
         guard resolved.backendKind == .git else {
             throw VCSError.unsupportedOperation(operation: "list_worktrees", backend: resolved.backendKind)
         }
         return try await gitBackend().listWorktrees(at: resolved.rootURL)
+    }
+
+    /// Resolve the read-only Git repo/worktree/branch context for a filesystem path.
+    ///
+    /// The input may be either a worktree root or a subdirectory inside a worktree.
+    /// Non-Git roots return `nil`; no checkout, branch switching, or worktree mutation
+    /// is performed.
+    func gitWorktreeContext(for url: URL) async -> GitWorktreeContextSummary? {
+        guard let resolved = await resolveRepo(from: url) else { return nil }
+        return await gitWorktreeContext(for: url, resolved: resolved)
+    }
+
+    func gitWorktreeContext(for url: URL, resolved: VCSResolvedRepo) async -> GitWorktreeContextSummary? {
+        guard resolved.backendKind == .git else { return nil }
+        do {
+            let worktrees = try await listGitWorktrees(for: resolved)
+            return await gitWorktreeContext(for: url, resolved: resolved, worktrees: worktrees)
+        } catch {
+            return await gitWorktreeContext(for: url, resolved: resolved, worktrees: nil)
+        }
+    }
+
+    func gitWorktreeContext(
+        for url: URL,
+        resolved: VCSResolvedRepo,
+        worktrees: [GitWorktreeDescriptor]?
+    ) async -> GitWorktreeContextSummary? {
+        guard resolved.backendKind == .git else { return nil }
+
+        if let worktrees,
+           let summary = gitWorktreeContextFromList(
+               for: url,
+               resolved: resolved,
+               worktrees: worktrees
+           )
+        {
+            return summary
+        }
+
+        return await fallbackGitWorktreeContext(for: resolved.rootURL)
+    }
+
+    private nonisolated func gitWorktreeContextFromList(
+        for url: URL,
+        resolved: VCSResolvedRepo,
+        worktrees: [GitWorktreeDescriptor]
+    ) -> GitWorktreeContextSummary? {
+        let inputPath = StandardizedPath.absolute(url.path)
+        let resolvedRootPath = StandardizedPath.absolute(resolved.rootURL.path)
+        if let exact = worktrees.first(where: { StandardizedPath.absolute($0.path) == resolvedRootPath }) {
+            return GitWorktreeContextSummary(descriptor: exact)
+        }
+        if let contained = worktrees.first(where: { descriptor in
+            let worktreePath = StandardizedPath.absolute(descriptor.path)
+            return StandardizedPath.isDescendant(inputPath, of: worktreePath)
+                || StandardizedPath.isDescendant(resolvedRootPath, of: worktreePath)
+        }) {
+            return GitWorktreeContextSummary(descriptor: contained)
+        }
+        return nil
+    }
+
+    private func fallbackGitWorktreeContext(for repoURL: URL) async -> GitWorktreeContextSummary? {
+        let repoRootPath = StandardizedPath.absolute(repoURL.path)
+        guard let layout = gitRepositoryLayout(forRepoRoot: repoURL) else {
+            return nil
+        }
+        let mainWorktreeRoot = layout.commonDir.deletingLastPathComponent()
+        let identity = GitWorktreeIdentity.repositoryIdentity(
+            commonGitDir: layout.commonDir,
+            mainWorktreeRoot: mainWorktreeRoot
+        )
+        let branch = try? await gitBackend().getCurrentBranch(at: repoURL)
+        let head = try? await gitBackend().getHeadID(at: repoURL)
+        let worktreeName = Self.fallbackName(from: repoRootPath, fallback: "worktree")
+        let worktreeID = GitWorktreeIdentity.worktreeID(
+            repositoryID: identity.repositoryID,
+            gitDir: layout.gitDir,
+            isMain: !layout.isWorktree,
+            path: layout.workTreeRoot
+        )
+        return GitWorktreeContextSummary(
+            repositoryID: identity.repositoryID,
+            repoKey: identity.repoKey,
+            repositoryDisplayName: identity.displayName,
+            worktreeID: worktreeID,
+            worktreePath: repoRootPath,
+            worktreeName: worktreeName,
+            branch: branch,
+            head: head,
+            isDetached: branch == nil && head != nil
+        )
+    }
+
+    private nonisolated static func fallbackName(from path: String, fallback: String) -> String {
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        return name.isEmpty ? fallback : name
     }
 
     /// Create a Git worktree for a repository.
@@ -454,6 +555,18 @@ public extension VCSService {
         request: GitWorktreeCreateRequest,
         at repoURL: URL
     ) async throws -> GitWorktreeDescriptor {
+        let result = try await createGitWorktreeWithResult(request: request, at: repoURL)
+        if let warning = result.includeCopyResult?.warningText {
+            NSLog("RepoPrompt .worktreeinclude copy warning for worktree %@: %@", result.descriptor.path, warning)
+        }
+        return result.descriptor
+    }
+
+    /// Create a Git worktree and keep best-effort `.worktreeinclude` copy details.
+    func createGitWorktreeWithResult(
+        request: GitWorktreeCreateRequest,
+        at repoURL: URL
+    ) async throws -> GitWorktreeCreateResult {
         let resolved = await resolveRepo(from: repoURL)
         guard let resolved else {
             throw VCSError.notARepository(path: repoURL.path)
@@ -462,10 +575,10 @@ public extension VCSService {
             throw VCSError.unsupportedOperation(operation: "create_worktree", backend: resolved.backendKind)
         }
 
-        let created = try await gitBackend().createWorktree(request: request, at: resolved.rootURL)
+        let result = try await gitBackend().createWorktreeWithResult(request: request, at: resolved.rootURL)
         invalidateCache(for: resolved.rootURL)
         invalidateCache(for: request.path)
-        return created
+        return result
     }
 
     func inspectGitWorktreeMerge(_ request: GitWorktreeMergeInspectRequest) async throws -> GitWorktreeMergeInspection {

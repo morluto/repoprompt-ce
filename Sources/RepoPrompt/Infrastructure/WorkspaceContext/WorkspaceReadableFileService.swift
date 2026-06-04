@@ -16,9 +16,33 @@ struct WorkspaceReadableFileService {
         _ userPath: String,
         fallbackScope: WorkspaceLookupRootScope
     ) async {
-        _ = await store.awaitAppliedIngressForExplicitRequest(
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessBegan,
+            correlation: lifecycleCorrelation
+        )
+        let freshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait)
+        let samples = await store.awaitAppliedIngressForExplicitRequest(
             userPath: userPath,
             fallbackScope: fallbackScope
+        )
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait,
+            freshnessState,
+            EditFlowPerf.Dimensions(
+                rootCount: samples.count,
+                pendingRootCount: samples.count(where: { $0.pendingRawEventCountBeforeFlush > 0 }),
+                pendingRawEventCount: samples.reduce(0) { $0 + $1.pendingRawEventCountBeforeFlush }
+            )
+        )
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessEnded,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(
+                rootCount: samples.count,
+                pendingRootCount: samples.count(where: { $0.pendingRawEventCountBeforeFlush > 0 }),
+                pendingRawEventCount: samples.reduce(0) { $0 + $1.pendingRawEventCountBeforeFlush }
+            )
         )
     }
 
@@ -35,7 +59,14 @@ struct WorkspaceReadableFileService {
         rootScope: WorkspaceLookupRootScope
     ) async -> WorkspaceFileRecord? {
         guard let absolutePath = Self.exactAbsoluteCatalogHitInput(rawPath) else { return nil }
-        guard case let .matched(file) = await store.lookupCatalogFileForExplicitRequest(absolutePath, rootScope: rootScope) else {
+        return await resolveExactWorkspaceCatalogHit(absolutePath, rootScope: rootScope)
+    }
+
+    func resolveExactWorkspaceCatalogHit(
+        _ rawPath: String,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> WorkspaceFileRecord? {
+        guard case let .matched(file) = await store.lookupCatalogFileForExplicitRequest(rawPath, rootScope: rootScope) else {
             return nil
         }
         return file

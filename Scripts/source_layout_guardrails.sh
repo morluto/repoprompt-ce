@@ -270,6 +270,7 @@ allowed_tracked_docs=(
   "docs/architecture/source-layout.md"
   "docs/open-source-readiness.md"
   "docs/releasing.md"
+  "docs/worktrees.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )

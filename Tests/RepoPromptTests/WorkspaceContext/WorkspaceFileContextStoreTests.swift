@@ -1020,6 +1020,34 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         XCTAssertFalse(snapshot.files.contains { $0.standardizedRelativePath == "Hidden.ignored" })
     }
 
+    func testDisplayRootRefsSnapshotMatchesExistingScopesPreservesLoadOrderAndRemainsStable() async throws {
+        let visibleRootA = try makeTemporaryRoot(name: "DisplayRootSnapshotVisibleA")
+        let supplementalRoot = try makeTemporaryRoot(name: "DisplayRootSnapshotSupplemental")
+        let visibleRootB = try makeTemporaryRoot(name: "DisplayRootSnapshotVisibleB")
+        let laterVisibleRoot = try makeTemporaryRoot(name: "DisplayRootSnapshotVisibleLater")
+
+        let store = WorkspaceFileContextStore()
+        let visibleA = try await store.loadRoot(path: visibleRootA.path)
+        let supplemental = try await store.loadRoot(path: supplementalRoot.path, kind: .supplementalSystem)
+        let visibleB = try await store.loadRoot(path: visibleRootB.path)
+
+        let retainedSnapshot = await store.displayRootRefsSnapshot()
+        let existingVisibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        let existingAllRoots = await store.rootRefs(scope: .allLoaded)
+        XCTAssertEqual(retainedSnapshot.visibleRoots, existingVisibleRoots)
+        XCTAssertEqual(retainedSnapshot.allRoots, existingAllRoots)
+        XCTAssertEqual(retainedSnapshot.visibleRoots.map(\.id), [visibleA.id, visibleB.id])
+        XCTAssertEqual(retainedSnapshot.allRoots.map(\.id), [visibleA.id, supplemental.id, visibleB.id])
+        XCTAssertTrue(Set(retainedSnapshot.visibleRoots).isSubset(of: Set(retainedSnapshot.allRoots)))
+
+        let laterVisible = try await store.loadRoot(path: laterVisibleRoot.path)
+        let freshSnapshot = await store.displayRootRefsSnapshot()
+        XCTAssertEqual(retainedSnapshot.visibleRoots.map(\.id), [visibleA.id, visibleB.id])
+        XCTAssertEqual(retainedSnapshot.allRoots.map(\.id), [visibleA.id, supplemental.id, visibleB.id])
+        XCTAssertEqual(freshSnapshot.visibleRoots.map(\.id), [visibleA.id, visibleB.id, laterVisible.id])
+        XCTAssertEqual(freshSnapshot.allRoots.map(\.id), [visibleA.id, supplemental.id, visibleB.id, laterVisible.id])
+    }
+
     func testSearchCatalogSnapshotCacheSeparatesStaticScopes() async throws {
         let visibleRoot = try makeTemporaryRoot(name: "SearchSnapshotVisible")
         let gitDataRoot = try makeTemporaryRoot(name: "SearchSnapshotGitData")

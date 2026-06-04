@@ -145,6 +145,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             try Self.assertSearchResult(secondMixed.0, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
             try Self.assertReadResult(secondMixed.1, contains: fixture.contextB.sentinel, excludes: fixture.contextA.sentinel)
 
+            try await Self.assertRetainedReadSpellings(endpointA, context: fixture.contextA)
             try await runBroadSearchAdmissionCheckpoint(fixture: fixture)
 
             try await Self.assertPing(endpointA, tag: "after-a")
@@ -163,15 +164,35 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
 
         func runBroadSearchAdmissionCheckpoint(fixture: Fixture) async throws {
+            try await StoreBackedWorkspaceSearchSharedAdmissionTestLease.shared.withLease {
+                try await runSerializedBroadSearchAdmissionCheckpoint(fixture: fixture)
+            }
+        }
+
+        func runSerializedBroadSearchAdmissionCheckpoint(fixture: Fixture) async throws {
             let endpointA = try fixture.endpointA()
             let endpointAQueued = try fixture.endpointAQueuedSearch()
+            let endpointAOverflow = try fixture.endpointAOverflowSearch()
             let endpointARead = try fixture.endpointARead()
             let endpointB = try fixture.endpointB()
             try await Self.bind(endpointAQueued, to: fixture.contextA.tabID)
+            try await Self.bind(endpointAOverflow, to: fixture.contextA.tabID)
             try await Self.bind(endpointARead, to: fixture.contextA.tabID)
             fixture.assertStableBindings(includeAdditionalContextAEndpoints: true)
 
             let coordinator = StoreBackedWorkspaceSearchAdmissionCoordinator.shared
+            let baselineConfiguration = await coordinator.snapshotForDebug().configuration
+            let liveSweepConfiguration = StoreBackedWorkspaceSearchAdmissionCoordinator.Configuration(
+                perStoreCapacity: 2,
+                globalCapacity: 3,
+                maxQueuedPerStore: 0,
+                maxQueuedGlobally: 0,
+                maxQueueWait: .seconds(8)
+            )
+            guard case .applied = await coordinator.configureForDebug(liveSweepConfiguration) else {
+                XCTFail("Shared admission coordinator should be idle before retained MCP checkpoint")
+                return
+            }
             let heldStore = fixture.contextA.window.workspaceFileContextStore
             let gate = SearchAdmissionGate()
             await coordinator.setPermitAcquiredHandlerForTesting { store in
@@ -179,55 +200,123 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 await gate.markStartedAndWaitForRelease()
             }
             do {
-                let heldSearch = Task {
+                let firstHeldSearch = Task {
                     try await endpointA.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
                 }
-                let heldSearchStarted = await gate.waitUntilStartedWithinTimeout()
-                XCTAssertTrue(heldSearchStarted)
-                let queuedSearch = Task {
+                let secondHeldSearch = Task {
                     try await endpointAQueued.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
                 }
-                let queuedBehindHeldSearch = await Self.waitForAdmissionWaiterCount(1, store: heldStore, coordinator: coordinator)
-                XCTAssertTrue(queuedBehindHeldSearch)
+                let heldSearchesStarted = await gate.waitUntilStartedCount(2)
+                XCTAssertTrue(heldSearchesStarted)
+                let heldSnapshot = await coordinator.snapshot(for: heldStore)
+                XCTAssertEqual(heldSnapshot.activePermitCount, 2)
+                XCTAssertEqual(heldSnapshot.waiterCount, 0)
 
-                async let exactRead = endpointARead.callTool(
+                let overflow = try await endpointAOverflow.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
+                try Self.assertSearchBackpressureResult(overflow)
+
+                guard case .started = EditFlowPerf.beginDebugCapture(label: "retained-same-connection-read-wait", maxSamples: 500) else {
+                    throw ClientFixtureError.telemetryCaptureBusy
+                }
+                defer { EditFlowPerf.resetDebugCaptureForTesting() }
+                let sameConnectionReadFinished = CompletionSignal()
+                let sameConnectionRead = Task {
+                    let response = try await endpointA.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": fixture.contextA.fileURL.path]
+                    )
+                    await sameConnectionReadFinished.mark()
+                    return response
+                }
+                let sameConnectionReadReachedLimiterWait = await Self.waitForLifecycleEvent(
+                    "MCP.ToolCall.LimiterWaitBegan",
+                    containingDimension: "tool=read_file"
+                )
+                XCTAssertTrue(sameConnectionReadReachedLimiterWait)
+                let sameConnectionReadCompletedBeforeRelease = await sameConnectionReadFinished.isMarked()
+                XCTAssertFalse(
+                    sameConnectionReadCompletedBeforeRelease,
+                    "A read observed waiting on the held search connection must remain behind the per-connection limiter."
+                )
+
+                let exactRead = try await endpointARead.callTool(
                     name: MCPWindowToolName.readFile,
                     arguments: ["path": fixture.contextA.fileURL.path]
                 )
-                async let peerSearch = endpointB.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
-                let independent = try await (exactRead, peerSearch)
-                try Self.assertReadResult(independent.0, contains: fixture.contextA.sentinel, excludes: fixture.contextB.sentinel)
-                try Self.assertSearchResult(independent.1, contains: fixture.contextB.fileURL.lastPathComponent, excludes: fixture.contextA.fileURL.lastPathComponent)
+                try Self.assertReadResult(exactRead, contains: fixture.contextA.sentinel, excludes: fixture.contextB.sentinel)
+                try await Self.assertRetainedReadSpellings(endpointARead, context: fixture.contextA)
+                let sameStorePathControl = try await endpointARead.callTool(
+                    name: MCPWindowToolName.search,
+                    arguments: Self.pathSearchArguments
+                )
+                try Self.assertSearchResult(sameStorePathControl, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+                let sameStoreScopedContentControl = try await endpointARead.callTool(
+                    name: MCPWindowToolName.search,
+                    arguments: Self.scopedSearchArguments(path: fixture.contextA.fileURL.path)
+                )
+                try Self.assertSearchResult(sameStoreScopedContentControl, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+
+                let peerRead = try await endpointB.callTool(
+                    name: MCPWindowToolName.readFile,
+                    arguments: ["path": fixture.contextB.fileURL.path]
+                )
+                try Self.assertReadResult(peerRead, contains: fixture.contextB.sentinel, excludes: fixture.contextA.sentinel)
+                let peerPathControl = try await endpointB.callTool(
+                    name: MCPWindowToolName.search,
+                    arguments: Self.pathSearchArguments
+                )
+                try Self.assertSearchResult(peerPathControl, contains: fixture.contextB.fileURL.lastPathComponent, excludes: fixture.contextA.fileURL.lastPathComponent)
+                let peerSearch = try await endpointB.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
+                try Self.assertSearchResult(peerSearch, contains: fixture.contextB.fileURL.lastPathComponent, excludes: fixture.contextA.fileURL.lastPathComponent)
 
                 await gate.release()
-                let held = try await heldSearch.value
-                let queued = try await queuedSearch.value
-                try Self.assertSearchResult(held, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
-                try Self.assertSearchResult(queued, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+                let firstHeld = try await firstHeldSearch.value
+                let secondHeld = try await secondHeldSearch.value
+                let serializedRead = try await sameConnectionRead.value
+                try Self.assertSearchResult(firstHeld, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+                try Self.assertSearchResult(secondHeld, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+                try Self.assertReadResult(serializedRead, contains: fixture.contextA.sentinel, excludes: fixture.contextB.sentinel)
+                let sameConnectionReadCompletedAfterRelease = await sameConnectionReadFinished.isMarked()
+                XCTAssertTrue(sameConnectionReadCompletedAfterRelease)
+                let sameConnectionCapture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+                XCTAssertTrue(sameConnectionCapture.lifecycleEvents.contains {
+                    $0.eventName == "MCP.ToolCall.LimiterWaitBegan" &&
+                        $0.sanitizedDimensions.contains("tool=read_file")
+                })
+
+                let settledRetry = try await endpointAOverflow.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
+                try Self.assertSearchResult(settledRetry, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
                 let snapshot = await coordinator.snapshot(for: heldStore)
                 XCTAssertFalse(snapshot.hasActivePermit)
                 XCTAssertEqual(snapshot.waiterCount, 0)
-                await coordinator.setPermitAcquiredHandlerForTesting(nil)
+                await restoreBroadSearchAdmissionConfiguration(
+                    baselineConfiguration,
+                    coordinator: coordinator
+                )
             } catch {
                 await gate.release()
-                await coordinator.setPermitAcquiredHandlerForTesting(nil)
+                await restoreBroadSearchAdmissionConfiguration(
+                    baselineConfiguration,
+                    coordinator: coordinator
+                )
                 throw error
             }
         }
 
-        static func waitForAdmissionWaiterCount(
-            _ expectedCount: Int,
-            store: WorkspaceFileContextStore,
-            coordinator: StoreBackedWorkspaceSearchAdmissionCoordinator,
-            timeoutNanoseconds: UInt64 = 1_000_000_000
-        ) async -> Bool {
-            let interval: UInt64 = 10_000_000
-            var waited: UInt64 = 0
-            while await coordinator.snapshot(for: store).waiterCount != expectedCount, waited < timeoutNanoseconds {
-                try? await Task.sleep(nanoseconds: interval)
-                waited += interval
+        func restoreBroadSearchAdmissionConfiguration(
+            _ configuration: StoreBackedWorkspaceSearchAdmissionCoordinator.Configuration,
+            coordinator: StoreBackedWorkspaceSearchAdmissionCoordinator
+        ) async {
+            await coordinator.setPermitAcquiredHandlerForTesting(nil)
+            for _ in 0 ..< 10000 {
+                switch await coordinator.configureForDebug(configuration) {
+                case .applied:
+                    return
+                case .busy:
+                    await Task.yield()
+                }
             }
-            return await coordinator.snapshot(for: store).waiterCount == expectedCount
+            XCTFail("Shared admission coordinator should restore DEBUG baseline after retained MCP checkpoint")
         }
 
         func runExactRoutingSessionCleanupCheckpoint(
@@ -471,6 +560,42 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             "context_lines": 0
         ]
 
+        static let pathSearchArguments: [String: Any] = [
+            "pattern": "*.swift",
+            "mode": "path",
+            "regex": false,
+            "max_results": 10,
+            "count_only": false,
+            "context_lines": 0
+        ]
+
+        static func scopedSearchArguments(path: String) -> [String: Any] {
+            [
+                "pattern": Fixture.sharedSearchToken,
+                "mode": "content",
+                "regex": false,
+                "filter": ["paths": [path]],
+                "max_results": 10,
+                "count_only": false,
+                "context_lines": 0
+            ]
+        }
+
+        static func assertRetainedReadSpellings(_ endpoint: Endpoint, context: ContextFixture) async throws {
+            let aliasPath = "\(context.rootURL.lastPathComponent)/Sources/\(context.fileURL.lastPathComponent)"
+            for path in [
+                context.fileURL.path,
+                "Sources/\(context.fileURL.lastPathComponent)",
+                aliasPath
+            ] {
+                let response = try await endpoint.callTool(
+                    name: MCPWindowToolName.readFile,
+                    arguments: ["path": path]
+                )
+                try assertReadResult(response, contains: context.sentinel, excludes: "sentinel-peer-not-present")
+            }
+        }
+
         static func bind(_ endpoint: Endpoint, to tabID: UUID) async throws {
             let response = try await endpoint.callTool(
                 name: "bind_context",
@@ -557,6 +682,14 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             XCTAssertFalse(text.contains(peer), text)
         }
 
+        static func assertSearchBackpressureResult(_ response: RPCResponse) throws {
+            let text = try toolText(from: response)
+            XCTAssertTrue(text.contains("Temporarily busy"), text)
+            XCTAssertTrue(text.contains("Retryable**: yes"), text)
+            XCTAssertTrue(text.contains("filter.paths"), text)
+            XCTAssertFalse(text.contains("Complete (limit not reached)"), text)
+        }
+
         static func debugPayload(from response: RPCResponse) throws -> [String: Any] {
             let text = try toolText(from: response)
             let data = try XCTUnwrap(text.data(using: .utf8))
@@ -580,6 +713,26 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             XCTAssertEqual((object["id"] as? NSNumber)?.intValue, response.id)
             XCTAssertNil(object["error"])
             return object
+        }
+
+        static func waitForLifecycleEvent(
+            _ eventName: String,
+            containingDimension: String,
+            timeoutNanoseconds: UInt64 = 1_000_000_000
+        ) async -> Bool {
+            let interval: UInt64 = 10_000_000
+            var waited: UInt64 = 0
+            while waited < timeoutNanoseconds {
+                let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: false)
+                if snapshot.lifecycleEvents.contains(where: {
+                    $0.eventName == eventName && $0.sanitizedDimensions.contains(containingDimension)
+                }) {
+                    return true
+                }
+                try? await Task.sleep(nanoseconds: interval)
+                waited += interval
+            }
+            return false
         }
 
         static func measureMilliseconds(_ operation: () async throws -> Void) async rethrows -> Double {
@@ -612,6 +765,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private var firstEndpoint: Endpoint?
         private var secondEndpoint: Endpoint?
         private var queuedSearchEndpoint: Endpoint?
+        private var overflowSearchEndpoint: Endpoint?
         private var exactReadEndpoint: Endpoint?
         private var cleanedUp = false
 
@@ -676,6 +830,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 fixture.firstEndpoint = try await Endpoint.make(label: "a", networkManager: fixture.networkManager)
                 fixture.secondEndpoint = try await Endpoint.make(label: "b", networkManager: fixture.networkManager)
                 fixture.queuedSearchEndpoint = try await Endpoint.make(label: "a-queued-search", networkManager: fixture.networkManager)
+                fixture.overflowSearchEndpoint = try await Endpoint.make(label: "a-overflow-search", networkManager: fixture.networkManager)
                 fixture.exactReadEndpoint = try await Endpoint.make(label: "a-exact-read", networkManager: fixture.networkManager)
                 return fixture
             } catch {
@@ -705,12 +860,16 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             try XCTUnwrap(queuedSearchEndpoint)
         }
 
+        func endpointAOverflowSearch() throws -> Endpoint {
+            try XCTUnwrap(overflowSearchEndpoint)
+        }
+
         func endpointARead() throws -> Endpoint {
             try XCTUnwrap(exactReadEndpoint)
         }
 
         func endpoints() throws -> [Endpoint] {
-            try [endpointA(), endpointB(), endpointAQueuedSearch(), endpointARead()]
+            try [endpointA(), endpointB(), endpointAQueuedSearch(), endpointAOverflowSearch(), endpointARead()]
         }
 
         func snapshot(_ endpoint: Endpoint, context: ContextFixture) async -> EndpointSnapshot {
@@ -738,17 +897,20 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             XCTAssertNil(second.flatMap { contextA.window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).tabID })
             guard includeAdditionalContextAEndpoints else { return }
             let queued = try? endpointAQueuedSearch()
+            let overflow = try? endpointAOverflowSearch()
             let exactRead = try? endpointARead()
             XCTAssertEqual(queued.map { contextA.window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).tabID }, contextA.tabID)
+            XCTAssertEqual(overflow.map { contextA.window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).tabID }, contextA.tabID)
             XCTAssertEqual(exactRead.map { contextA.window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).tabID }, contextA.tabID)
             XCTAssertNil(queued.flatMap { contextB.window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).tabID })
+            XCTAssertNil(overflow.flatMap { contextB.window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).tabID })
             XCTAssertNil(exactRead.flatMap { contextB.window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).tabID })
         }
 
         func cleanup() async {
             guard !cleanedUp else { return }
             cleanedUp = true
-            for endpoint in [firstEndpoint, secondEndpoint, queuedSearchEndpoint, exactReadEndpoint].compactMap(\.self) {
+            for endpoint in [firstEndpoint, secondEndpoint, queuedSearchEndpoint, overflowSearchEndpoint, exactReadEndpoint].compactMap(\.self) {
                 endpoint.client.close()
                 await endpoint.connectionManager.stop()
                 await networkManager.debugRemoveConnection(endpoint.connectionID)
@@ -1252,14 +1414,26 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
     }
 
+    private actor CompletionSignal {
+        private var marked = false
+
+        func mark() {
+            marked = true
+        }
+
+        func isMarked() -> Bool {
+            marked
+        }
+    }
+
     private actor SearchAdmissionGate {
-        private var started = false
+        private var startedCount = 0
         private var released = false
         private var startWaiters: [CheckedContinuation<Void, Never>] = []
         private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
         func markStartedAndWaitForRelease() async {
-            started = true
+            startedCount += 1
             startWaiters.forEach { $0.resume() }
             startWaiters.removeAll()
             guard !released else { return }
@@ -1268,14 +1442,14 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             }
         }
 
-        func waitUntilStartedWithinTimeout(timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
+        func waitUntilStartedCount(_ expectedCount: Int, timeoutNanoseconds: UInt64 = 1_000_000_000) async -> Bool {
             let interval: UInt64 = 10_000_000
             var waited: UInt64 = 0
-            while !started, waited < timeoutNanoseconds {
+            while startedCount < expectedCount, waited < timeoutNanoseconds {
                 try? await Task.sleep(nanoseconds: interval)
                 waited += interval
             }
-            return started
+            return startedCount >= expectedCount
         }
 
         func release() {
@@ -1288,6 +1462,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
     private enum ClientFixtureError: Error {
         case exactAbsoluteCatalogMiss
         case routingServiceUnavailable
+        case telemetryCaptureBusy
         case toolReturnedError(String)
     }
 #endif

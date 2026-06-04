@@ -1,66 +1,25 @@
 import Foundation
 
-enum BroadSearchAdmissionClass: String {
-    case unscopedContent
-    case unscopedBoth
-}
-
-enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable {
-    enum QueueScope: String {
-        case perStore
-        case global
-    }
-
-    case queueFull(scope: QueueScope, retryAfterMilliseconds: Int)
-    case waitExpired(retryAfterMilliseconds: Int)
-    case contentFetchQueueFull(scope: QueueScope, retryAfterMilliseconds: Int)
-    case contentFetchWaitExpired(retryAfterMilliseconds: Int)
-
-    var retryAfterMilliseconds: Int {
-        switch self {
-        case let .queueFull(_, retryAfterMilliseconds),
-             let .waitExpired(retryAfterMilliseconds),
-             let .contentFetchQueueFull(_, retryAfterMilliseconds),
-             let .contentFetchWaitExpired(retryAfterMilliseconds):
-            retryAfterMilliseconds
-        }
-    }
-
-    var suggestion: String {
-        "Retry after the suggested delay, or use filter.paths to narrow the content search when a smaller scope is acceptable."
-    }
-
-    var errorDescription: String? {
-        switch self {
-        case .queueFull:
-            "Broad content search capacity is temporarily busy and the bounded wait queue is full."
-        case .waitExpired:
-            "Broad content search capacity remained busy until the bounded queue wait expired."
-        case .contentFetchQueueFull:
-            "Content-search fetch capacity is temporarily busy and the bounded wait queue is full."
-        case .contentFetchWaitExpired:
-            "Content-search fetch capacity remained busy until the bounded queue wait expired."
-        }
-    }
-}
-
-actor StoreBackedWorkspaceSearchAdmissionCoordinator {
+/// Bounds store-backed content-search descriptor work before freshness validation and
+/// root content reads enter store/filesystem actors. Exact reads intentionally bypass
+/// this search-only ingress.
+actor StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator {
     struct Configuration: Equatable {
         static var production: Configuration {
             let processorCount = ProcessInfo.processInfo.activeProcessorCount
-            // Per-store admission is the primary protection. The global cap only guards
-            // pathological aggregate pressure while allowing ordinary 12+ window use.
             return Configuration(
-                perStoreCapacity: 2,
+                fairSharePerStore: 2,
+                maxBurstPerStore: 4,
                 globalCapacity: max(12, min(32, processorCount * 2)),
-                maxQueuedPerStore: 2,
-                maxQueuedGlobally: 4,
+                maxQueuedPerStore: max(32, min(128, processorCount * 4)),
+                maxQueuedGlobally: max(128, min(512, processorCount * 16)),
                 maxQueueWait: .seconds(8),
                 retryAfterMilliseconds: 1000
             )
         }
 
-        let perStoreCapacity: Int
+        let fairSharePerStore: Int
+        let maxBurstPerStore: Int
         let globalCapacity: Int
         let maxQueuedPerStore: Int
         let maxQueuedGlobally: Int
@@ -74,20 +33,23 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         }
 
         init(
-            perStoreCapacity: Int,
+            fairSharePerStore: Int,
+            maxBurstPerStore: Int,
             globalCapacity: Int,
             maxQueuedPerStore: Int,
             maxQueuedGlobally: Int,
             maxQueueWait: Duration,
             retryAfterMilliseconds: Int = 1000
         ) {
-            precondition(perStoreCapacity > 0)
+            precondition(fairSharePerStore > 0)
+            precondition(maxBurstPerStore >= fairSharePerStore)
             precondition(globalCapacity > 0)
             precondition(maxQueuedPerStore >= 0)
             precondition(maxQueuedGlobally >= 0)
             precondition(maxQueueWait > .zero)
             precondition(retryAfterMilliseconds >= 0)
-            self.perStoreCapacity = perStoreCapacity
+            self.fairSharePerStore = fairSharePerStore
+            self.maxBurstPerStore = maxBurstPerStore
             self.globalCapacity = globalCapacity
             self.maxQueuedPerStore = maxQueuedPerStore
             self.maxQueuedGlobally = maxQueuedGlobally
@@ -112,18 +74,13 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         let sleepUntil: @Sendable (_ deadline: Duration) async throws -> Void
     }
 
-    static let shared = StoreBackedWorkspaceSearchAdmissionCoordinator()
+    static let shared = StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator()
 
     #if DEBUG
-        /// These DEBUG snapshots retain aggregate counters only. They intentionally avoid
-        /// per-caller histories so synthetic hundreds-of-caller sweeps stay bounded.
+        /// Aggregate-only snapshots intentionally omit store and search identifiers.
         struct Snapshot: Equatable {
             let activePermitCount: Int
             let waiterCount: Int
-
-            var hasActivePermit: Bool {
-                activePermitCount > 0
-            }
         }
 
         struct GlobalSnapshot: Equatable {
@@ -136,6 +93,7 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
             struct LaneLoad: Equatable {
                 let activeCount: Int
                 let queuedCount: Int
+                let queuedSearchCount: Int
             }
 
             let configuration: Configuration
@@ -168,8 +126,7 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
     private struct PermitAcquisition {
         let leaseID: UUID
         let storeKey: ObjectIdentifier
-        let searchMode: SearchMode
-        let admissionClass: BroadSearchAdmissionClass?
+        let searchID: UUID
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
         let waited: Bool
         let queueAgeBucket: String
@@ -178,8 +135,7 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
     private struct WaiterState {
         let continuation: CheckedContinuation<PermitAcquisition, Error>
-        let searchMode: SearchMode
-        let admissionClass: BroadSearchAdmissionClass?
+        let searchID: UUID
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
         let enqueueOrdinal: UInt64
         let enqueuedAtUptimeNanoseconds: UInt64
@@ -189,7 +145,8 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
     private struct Lane {
         var activeLeaseIDs = Set<UUID>()
-        var waiterOrder: [UUID] = []
+        var waiterSearchOrder: [UUID] = []
+        var waiterIDsBySearch: [UUID: [UUID]] = [:]
         var waiterStates: [UUID: WaiterState] = [:]
         var lastGrantOrdinal: UInt64?
     }
@@ -211,7 +168,7 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
     private var waitExpiryCount = 0
     private var queuedCancellationCount = 0
     #if DEBUG
-        private var permitAcquiredHandlerForTesting: (@Sendable (WorkspaceFileContextStore) async -> Void)?
+        private var permitAcquiredHandlerForTesting: (@Sendable (WorkspaceFileContextStore, UUID) async -> Void)?
     #endif
 
     init(
@@ -222,54 +179,37 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         self.clock = clock
     }
 
-    func withBroadSearchPermit<T>(
+    func withContentFetchPermit<T>(
         for store: WorkspaceFileContextStore,
-        searchMode: SearchMode,
-        admissionClass: BroadSearchAdmissionClass? = nil,
+        searchID: UUID,
         operation: () async throws -> T
     ) async throws -> T {
         let storeKey = ObjectIdentifier(store)
         let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
-        let initialMetrics = metrics(for: storeKey)
         let waitState = EditFlowPerf.begin(
-            EditFlowPerf.Stage.Search.broadAdmissionWait,
-            admissionDimensions(
-                searchMode: searchMode,
-                admissionClass: admissionClass,
-                metrics: initialMetrics,
-                queueAgeBucket: "immediate"
-            )
+            EditFlowPerf.Stage.Search.contentFetchAdmissionWait,
+            admissionDimensions(metrics: metrics(for: storeKey), queueAgeBucket: "immediate")
         )
 
         let acquisition: PermitAcquisition
         do {
-            acquisition = try await acquire(
-                for: storeKey,
-                searchMode: searchMode,
-                admissionClass: admissionClass,
-                lifecycleCorrelation: lifecycleCorrelation
-            )
+            acquisition = try await acquire(for: storeKey, searchID: searchID, lifecycleCorrelation: lifecycleCorrelation)
             EditFlowPerf.end(
-                EditFlowPerf.Stage.Search.broadAdmissionWait,
+                EditFlowPerf.Stage.Search.contentFetchAdmissionWait,
                 waitState,
                 admissionDimensions(
                     outcome: acquisition.waited ? "acquiredAfterWait" : "immediate",
-                    searchMode: searchMode,
-                    admissionClass: admissionClass,
                     metrics: acquisition.metrics,
                     queueAgeBucket: acquisition.queueAgeBucket
                 )
             )
         } catch {
-            let currentMetrics = metrics(for: storeKey)
             EditFlowPerf.end(
-                EditFlowPerf.Stage.Search.broadAdmissionWait,
+                EditFlowPerf.Stage.Search.contentFetchAdmissionWait,
                 waitState,
                 admissionDimensions(
                     outcome: Self.waitOutcome(for: error),
-                    searchMode: searchMode,
-                    admissionClass: admissionClass,
-                    metrics: currentMetrics,
+                    metrics: metrics(for: storeKey),
                     queueAgeBucket: queueAgeBucket(for: error)
                 )
             )
@@ -277,23 +217,16 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         }
 
         let leaseHoldState = EditFlowPerf.begin(
-            EditFlowPerf.Stage.Search.broadAdmissionLeaseHold,
-            admissionDimensions(
-                searchMode: searchMode,
-                admissionClass: admissionClass,
-                metrics: acquisition.metrics,
-                queueAgeBucket: acquisition.queueAgeBucket
-            )
+            EditFlowPerf.Stage.Search.contentFetchLeaseHold,
+            admissionDimensions(metrics: acquisition.metrics, queueAgeBucket: acquisition.queueAgeBucket)
         )
         var leaseHoldOutcome = "completed"
         defer {
             EditFlowPerf.end(
-                EditFlowPerf.Stage.Search.broadAdmissionLeaseHold,
+                EditFlowPerf.Stage.Search.contentFetchLeaseHold,
                 leaseHoldState,
                 admissionDimensions(
                     outcome: leaseHoldOutcome,
-                    searchMode: searchMode,
-                    admissionClass: admissionClass,
                     metrics: metrics(for: storeKey),
                     queueAgeBucket: acquisition.queueAgeBucket
                 )
@@ -304,7 +237,7 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
             try Task.checkCancellation()
             #if DEBUG
                 if let permitAcquiredHandlerForTesting {
-                    await permitAcquiredHandlerForTesting(store)
+                    await permitAcquiredHandlerForTesting(store, searchID)
                 }
             #endif
             try Task.checkCancellation()
@@ -319,27 +252,21 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         if error is CancellationError { return "cancelled" }
         guard let error = error as? StoreBackedWorkspaceSearchAdmissionError else { return "error" }
         switch error {
-        case .queueFull:
-            return "queueFull"
-        case .waitExpired:
-            return "waitExpired"
         case .contentFetchQueueFull:
             return "queueFull"
         case .contentFetchWaitExpired:
             return "waitExpired"
+        case .queueFull, .waitExpired:
+            return "error"
         }
     }
 
     private func queueAgeBucket(for error: Error) -> String {
         guard let error = error as? StoreBackedWorkspaceSearchAdmissionError else { return "immediate" }
         switch error {
-        case .queueFull:
+        case .contentFetchQueueFull, .queueFull:
             return "immediate"
-        case .waitExpired:
-            return Self.queueAgeBucket(milliseconds: configuration.maxQueueWaitMilliseconds)
-        case .contentFetchQueueFull:
-            return "immediate"
-        case .contentFetchWaitExpired:
+        case .contentFetchWaitExpired, .waitExpired:
             return Self.queueAgeBucket(milliseconds: configuration.maxQueueWaitMilliseconds)
         }
     }
@@ -372,19 +299,17 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
     private func acquire(
         for storeKey: ObjectIdentifier,
-        searchMode: SearchMode,
-        admissionClass: BroadSearchAdmissionClass?,
+        searchID: UUID,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) async throws -> PermitAcquisition {
         try Task.checkCancellation()
         scheduleAvailablePermits()
         var lane = lanes[storeKey] ?? Lane()
-        if canGrantPermit(in: lane) {
+        if canGrantImmediatePermit(for: storeKey, in: lane) {
             let acquisition = allocatePermit(
                 for: storeKey,
                 lane: &lane,
-                searchMode: searchMode,
-                admissionClass: admissionClass,
+                searchID: searchID,
                 lifecycleCorrelation: lifecycleCorrelation,
                 waited: false
             )
@@ -399,9 +324,8 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
                 enqueueWaiter(
                     id: waiterID,
                     for: storeKey,
+                    searchID: searchID,
                     continuation: continuation,
-                    searchMode: searchMode,
-                    admissionClass: admissionClass,
                     lifecycleCorrelation: lifecycleCorrelation
                 )
             }
@@ -413,21 +337,22 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
     private func enqueueWaiter(
         id: UUID,
         for storeKey: ObjectIdentifier,
+        searchID: UUID,
         continuation: CheckedContinuation<PermitAcquisition, Error>,
-        searchMode: SearchMode,
-        admissionClass: BroadSearchAdmissionClass?,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) {
+        guard !Task.isCancelled else {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
         let enqueuedAt = clock.now()
-
         scheduleAvailablePermits()
         var lane = lanes[storeKey] ?? Lane()
-        if canGrantPermit(in: lane) {
+        if canGrantImmediatePermit(for: storeKey, in: lane) {
             let acquisition = allocatePermit(
                 for: storeKey,
                 lane: &lane,
-                searchMode: searchMode,
-                admissionClass: admissionClass,
+                searchID: searchID,
                 lifecycleCorrelation: lifecycleCorrelation,
                 waited: false
             )
@@ -438,28 +363,16 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         }
 
         if lane.waiterStates.count >= configuration.maxQueuedPerStore {
-            recordOverload(
-                scope: .perStore,
-                storeKey: storeKey,
-                searchMode: searchMode,
-                admissionClass: admissionClass,
-                lifecycleCorrelation: lifecycleCorrelation
-            )
-            continuation.resume(throwing: StoreBackedWorkspaceSearchAdmissionError.queueFull(
+            recordOverload(scope: .perStore, storeKey: storeKey, lifecycleCorrelation: lifecycleCorrelation)
+            continuation.resume(throwing: StoreBackedWorkspaceSearchAdmissionError.contentFetchQueueFull(
                 scope: .perStore,
                 retryAfterMilliseconds: configuration.retryAfterMilliseconds
             ))
             return
         }
         if globalQueuedCount >= configuration.maxQueuedGlobally {
-            recordOverload(
-                scope: .global,
-                storeKey: storeKey,
-                searchMode: searchMode,
-                admissionClass: admissionClass,
-                lifecycleCorrelation: lifecycleCorrelation
-            )
-            continuation.resume(throwing: StoreBackedWorkspaceSearchAdmissionError.queueFull(
+            recordOverload(scope: .global, storeKey: storeKey, lifecycleCorrelation: lifecycleCorrelation)
+            continuation.resume(throwing: StoreBackedWorkspaceSearchAdmissionError.contentFetchQueueFull(
                 scope: .global,
                 retryAfterMilliseconds: configuration.retryAfterMilliseconds
             ))
@@ -470,26 +383,23 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         let deadline = enqueuedAt + configuration.maxQueueWait
         lane.waiterStates[id] = WaiterState(
             continuation: continuation,
-            searchMode: searchMode,
-            admissionClass: admissionClass,
+            searchID: searchID,
             lifecycleCorrelation: lifecycleCorrelation,
             enqueueOrdinal: nextEnqueueOrdinal,
             enqueuedAtUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
             deadline: deadline,
             timeoutTask: nil
         )
-        lane.waiterOrder.append(id)
+        if lane.waiterIDsBySearch[searchID]?.isEmpty != false {
+            lane.waiterSearchOrder.append(searchID)
+        }
+        lane.waiterIDsBySearch[searchID, default: []].append(id)
         globalQueuedCount += 1
         lanes[storeKey] = lane
         EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.Search.broadAdmissionWaitBegan,
+            EditFlowPerf.Lifecycle.Search.contentFetchWaitBegan,
             correlation: lifecycleCorrelation,
-            admissionDimensions(
-                searchMode: searchMode,
-                admissionClass: admissionClass,
-                metrics: metrics(for: storeKey),
-                queueAgeBucket: "lt100ms"
-            )
+            admissionDimensions(metrics: metrics(for: storeKey), queueAgeBucket: "lt100ms")
         )
 
         let timeoutTask = Task { [clock] in
@@ -512,20 +422,17 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
     private func cancelWaiter(id: UUID, for storeKey: ObjectIdentifier) {
         guard var lane = lanes[storeKey],
-              let state = lane.waiterStates.removeValue(forKey: id)
+              let state = removeWaiter(id: id, from: &lane)
         else { return }
         state.timeoutTask?.cancel()
-        lane.waiterOrder.removeAll { $0 == id }
         globalQueuedCount = max(0, globalQueuedCount - 1)
         storeOrRemoveLane(lane, for: storeKey)
         queuedCancellationCount &+= 1
         EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.Search.broadAdmissionPermitCancelled,
+            EditFlowPerf.Lifecycle.Search.contentFetchPermitCancelled,
             correlation: state.lifecycleCorrelation,
             admissionDimensions(
                 outcome: "cancelled",
-                searchMode: state.searchMode,
-                admissionClass: state.admissionClass,
                 metrics: metrics(for: storeKey),
                 queueAgeBucket: Self.queueAgeBucket(since: state.enqueuedAtUptimeNanoseconds)
             )
@@ -536,24 +443,21 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
     private func expireWaiter(id: UUID, for storeKey: ObjectIdentifier) {
         guard var lane = lanes[storeKey],
-              let state = lane.waiterStates.removeValue(forKey: id)
+              let state = removeWaiter(id: id, from: &lane)
         else { return }
-        lane.waiterOrder.removeAll { $0 == id }
         globalQueuedCount = max(0, globalQueuedCount - 1)
         storeOrRemoveLane(lane, for: storeKey)
         waitExpiryCount &+= 1
         EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.Search.broadAdmissionWaitExpired,
+            EditFlowPerf.Lifecycle.Search.contentFetchWaitExpired,
             correlation: state.lifecycleCorrelation,
             admissionDimensions(
                 outcome: "waitExpired",
-                searchMode: state.searchMode,
-                admissionClass: state.admissionClass,
                 metrics: metrics(for: storeKey),
                 queueAgeBucket: Self.queueAgeBucket(milliseconds: configuration.maxQueueWaitMilliseconds)
             )
         )
-        state.continuation.resume(throwing: StoreBackedWorkspaceSearchAdmissionError.waitExpired(
+        state.continuation.resume(throwing: StoreBackedWorkspaceSearchAdmissionError.contentFetchWaitExpired(
             retryAfterMilliseconds: configuration.retryAfterMilliseconds
         ))
         scheduleAvailablePermits()
@@ -566,12 +470,10 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         globalActiveCount = max(0, globalActiveCount - 1)
         storeOrRemoveLane(lane, for: acquisition.storeKey)
         EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.Search.broadAdmissionPermitReleased,
+            EditFlowPerf.Lifecycle.Search.contentFetchPermitReleased,
             correlation: acquisition.lifecycleCorrelation,
             admissionDimensions(
                 outcome: "released",
-                searchMode: acquisition.searchMode,
-                admissionClass: acquisition.admissionClass,
                 metrics: metrics(for: acquisition.storeKey),
                 queueAgeBucket: acquisition.queueAgeBucket
             )
@@ -580,21 +482,21 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
     }
 
     private func scheduleAvailablePermits() {
-        while globalActiveCount < configuration.globalCapacity,
-              let storeKey = nextEligibleStoreKey()
-        {
+        while globalActiveCount < configuration.globalCapacity {
+            let storeKey = nextEligibleStoreKey(requiringFairShare: true) ?? nextEligibleStoreKey(requiringFairShare: false)
+            guard let storeKey else { return }
             guard grantNextQueuedPermit(for: storeKey) else { continue }
         }
     }
 
-    private func nextEligibleStoreKey() -> ObjectIdentifier? {
+    private func nextEligibleStoreKey(requiringFairShare: Bool) -> ObjectIdentifier? {
         var candidates: [EligibleLane] = []
         for (key, lane) in lanes {
-            guard lane.activeLeaseIDs.count < configuration.perStoreCapacity,
-                  let waiterID = lane.waiterOrder.first,
-                  let waiter = lane.waiterStates[waiterID]
+            let activeLimit = requiringFairShare ? configuration.fairSharePerStore : configuration.maxBurstPerStore
+            guard lane.activeLeaseIDs.count < activeLimit,
+                  let enqueueOrdinal = firstEnqueueOrdinal(in: lane)
             else { continue }
-            candidates.append(EligibleLane(key: key, lastGrant: lane.lastGrantOrdinal, enqueueOrdinal: waiter.enqueueOrdinal))
+            candidates.append(EligibleLane(key: key, lastGrant: lane.lastGrantOrdinal, enqueueOrdinal: enqueueOrdinal))
         }
         return candidates.min { lhs, rhs in
             switch (lhs.lastGrant, rhs.lastGrant) {
@@ -611,18 +513,32 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         }?.key
     }
 
+    private func firstEnqueueOrdinal(in lane: Lane) -> UInt64? {
+        lane.waiterSearchOrder
+            .compactMap { lane.waiterIDsBySearch[$0]?.first }
+            .compactMap { lane.waiterStates[$0]?.enqueueOrdinal }
+            .min()
+    }
+
     private func grantNextQueuedPermit(for storeKey: ObjectIdentifier) -> Bool {
         guard var lane = lanes[storeKey] else { return false }
-        while !lane.waiterOrder.isEmpty {
-            let waiterID = lane.waiterOrder.removeFirst()
+        while !lane.waiterSearchOrder.isEmpty {
+            let searchID = lane.waiterSearchOrder.removeFirst()
+            guard var waiterIDs = lane.waiterIDsBySearch.removeValue(forKey: searchID),
+                  !waiterIDs.isEmpty
+            else { continue }
+            let waiterID = waiterIDs.removeFirst()
+            if !waiterIDs.isEmpty {
+                lane.waiterIDsBySearch[searchID] = waiterIDs
+                lane.waiterSearchOrder.append(searchID)
+            }
             guard let state = lane.waiterStates.removeValue(forKey: waiterID) else { continue }
             state.timeoutTask?.cancel()
             globalQueuedCount = max(0, globalQueuedCount - 1)
             let acquisition = allocatePermit(
                 for: storeKey,
                 lane: &lane,
-                searchMode: state.searchMode,
-                admissionClass: state.admissionClass,
+                searchID: state.searchID,
                 lifecycleCorrelation: state.lifecycleCorrelation,
                 waited: true,
                 queueAgeBucket: Self.queueAgeBucket(since: state.enqueuedAtUptimeNanoseconds)
@@ -636,11 +552,23 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         return false
     }
 
+    private func removeWaiter(id: UUID, from lane: inout Lane) -> WaiterState? {
+        guard let state = lane.waiterStates.removeValue(forKey: id) else { return nil }
+        guard var waiterIDs = lane.waiterIDsBySearch[state.searchID] else { return state }
+        waiterIDs.removeAll { $0 == id }
+        if waiterIDs.isEmpty {
+            lane.waiterIDsBySearch.removeValue(forKey: state.searchID)
+            lane.waiterSearchOrder.removeAll { $0 == state.searchID }
+        } else {
+            lane.waiterIDsBySearch[state.searchID] = waiterIDs
+        }
+        return state
+    }
+
     private func allocatePermit(
         for storeKey: ObjectIdentifier,
         lane: inout Lane,
-        searchMode: SearchMode,
-        admissionClass: BroadSearchAdmissionClass?,
+        searchID: UUID,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
         waited: Bool,
         queueAgeBucket: String = "immediate"
@@ -653,8 +581,7 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         return PermitAcquisition(
             leaseID: leaseID,
             storeKey: storeKey,
-            searchMode: searchMode,
-            admissionClass: admissionClass,
+            searchID: searchID,
             lifecycleCorrelation: lifecycleCorrelation,
             waited: waited,
             queueAgeBucket: queueAgeBucket,
@@ -662,9 +589,23 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         )
     }
 
-    private func canGrantPermit(in lane: Lane) -> Bool {
-        globalActiveCount < configuration.globalCapacity &&
-            lane.activeLeaseIDs.count < configuration.perStoreCapacity
+    private func canGrantImmediatePermit(for storeKey: ObjectIdentifier, in lane: Lane) -> Bool {
+        guard globalActiveCount < configuration.globalCapacity,
+              lane.waiterStates.isEmpty,
+              lane.activeLeaseIDs.count < configuration.maxBurstPerStore
+        else { return false }
+        if lane.activeLeaseIDs.count < configuration.fairSharePerStore {
+            return true
+        }
+        return !hasCompetingFairShareWaiter(excluding: storeKey)
+    }
+
+    private func hasCompetingFairShareWaiter(excluding storeKey: ObjectIdentifier) -> Bool {
+        lanes.contains { key, lane in
+            key != storeKey &&
+                !lane.waiterStates.isEmpty &&
+                lane.activeLeaseIDs.count < configuration.fairSharePerStore
+        }
     }
 
     private func storeOrRemoveLane(_ lane: Lane, for storeKey: ObjectIdentifier) {
@@ -677,12 +618,10 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
     private func recordPermitAcquired(_ acquisition: PermitAcquisition) {
         EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.Search.broadAdmissionPermitAcquired,
+            EditFlowPerf.Lifecycle.Search.contentFetchPermitAcquired,
             correlation: acquisition.lifecycleCorrelation,
             admissionDimensions(
                 outcome: acquisition.waited ? "acquiredAfterWait" : "immediate",
-                searchMode: acquisition.searchMode,
-                admissionClass: acquisition.admissionClass,
                 metrics: acquisition.metrics,
                 queueAgeBucket: acquisition.queueAgeBucket
             )
@@ -692,18 +631,14 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
     private func recordOverload(
         scope: StoreBackedWorkspaceSearchAdmissionError.QueueScope,
         storeKey: ObjectIdentifier,
-        searchMode: SearchMode,
-        admissionClass: BroadSearchAdmissionClass?,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) {
         overloadCount &+= 1
         EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.Search.broadAdmissionOverloaded,
+            EditFlowPerf.Lifecycle.Search.contentFetchOverloaded,
             correlation: lifecycleCorrelation,
             admissionDimensions(
                 outcome: scope.rawValue,
-                searchMode: searchMode,
-                admissionClass: admissionClass,
                 metrics: metrics(for: storeKey),
                 queueAgeBucket: "immediate"
             )
@@ -712,21 +647,18 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
     private func admissionDimensions(
         outcome: String? = nil,
-        searchMode: SearchMode,
-        admissionClass: BroadSearchAdmissionClass?,
         metrics: AdmissionMetrics,
         queueAgeBucket: String
     ) -> EditFlowPerf.Dimensions {
         EditFlowPerf.Dimensions(
             outcome: outcome,
-            storeCapacity: configuration.perStoreCapacity,
+            storeCapacity: configuration.maxBurstPerStore,
             globalCapacity: configuration.globalCapacity,
             storeActiveCount: metrics.storeActiveCount,
             globalActiveCount: metrics.globalActiveCount,
             storeQueueDepth: metrics.storeQueueDepth,
             globalQueueDepth: metrics.globalQueueDepth,
-            searchMode: searchMode.rawValue,
-            admissionClass: admissionClass?.rawValue,
+            admissionClass: "contentFetch",
             queueAgeBucket: queueAgeBucket,
             queueDepth: metrics.storeQueueDepth,
             waiterCount: metrics.storeQueueDepth
@@ -765,12 +697,17 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
 
         func snapshotForDebug() -> DebugSnapshot {
             let laneLoads = lanes.values
-                .map { DebugSnapshot.LaneLoad(activeCount: $0.activeLeaseIDs.count, queuedCount: $0.waiterStates.count) }
+                .map {
+                    DebugSnapshot.LaneLoad(
+                        activeCount: $0.activeLeaseIDs.count,
+                        queuedCount: $0.waiterStates.count,
+                        queuedSearchCount: $0.waiterIDsBySearch.count
+                    )
+                }
                 .sorted {
-                    if $0.activeCount == $1.activeCount {
-                        return $0.queuedCount < $1.queuedCount
-                    }
-                    return $0.activeCount < $1.activeCount
+                    if $0.activeCount != $1.activeCount { return $0.activeCount < $1.activeCount }
+                    if $0.queuedCount != $1.queuedCount { return $0.queuedCount < $1.queuedCount }
+                    return $0.queuedSearchCount < $1.queuedSearchCount
                 }
 
             return DebugSnapshot(
@@ -804,7 +741,7 @@ actor StoreBackedWorkspaceSearchAdmissionCoordinator {
         }
 
         func setPermitAcquiredHandlerForTesting(
-            _ handler: (@Sendable (WorkspaceFileContextStore) async -> Void)?
+            _ handler: (@Sendable (WorkspaceFileContextStore, UUID) async -> Void)?
         ) {
             permitAcquiredHandlerForTesting = handler
         }

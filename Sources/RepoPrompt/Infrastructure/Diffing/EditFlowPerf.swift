@@ -52,12 +52,30 @@ enum EditFlowPerf {
         var chunkCount: Int?
         var taskCount: Int?
         var activeCount: Int?
+        var storeCapacity: Int?
+        var globalCapacity: Int?
+        var storeActiveCount: Int?
+        var globalActiveCount: Int?
+        var storeQueueDepth: Int?
+        var globalQueueDepth: Int?
+        var admittedFileCount: Int?
+        var scannedFileCount: Int?
+        var matchedFileCount: Int?
+        var contentMatchCount: Int?
+        var pathMatchCount: Int?
+        var errorCount: Int?
         var isError: Bool?
         var isForced: Bool?
         var isAgentMode: Bool?
         var includesToolCardDiff: Bool?
+        var limitHit: Bool?
+        var usesWorktreeProjection: Bool?
         var searchMode: String?
         var workloadClass: String?
+        var admissionClass: String?
+        var queueAgeBucket: String?
+        var contentSource: String?
+        var freshnessPolicy: String?
         var scanKind: String?
         var fileCount: Int?
         var batchSize: Int?
@@ -113,12 +131,30 @@ enum EditFlowPerf {
             chunkCount: Int? = nil,
             taskCount: Int? = nil,
             activeCount: Int? = nil,
+            storeCapacity: Int? = nil,
+            globalCapacity: Int? = nil,
+            storeActiveCount: Int? = nil,
+            globalActiveCount: Int? = nil,
+            storeQueueDepth: Int? = nil,
+            globalQueueDepth: Int? = nil,
+            admittedFileCount: Int? = nil,
+            scannedFileCount: Int? = nil,
+            matchedFileCount: Int? = nil,
+            contentMatchCount: Int? = nil,
+            pathMatchCount: Int? = nil,
+            errorCount: Int? = nil,
             isError: Bool? = nil,
             isForced: Bool? = nil,
             isAgentMode: Bool? = nil,
             includesToolCardDiff: Bool? = nil,
+            limitHit: Bool? = nil,
+            usesWorktreeProjection: Bool? = nil,
             searchMode: String? = nil,
             workloadClass: String? = nil,
+            admissionClass: String? = nil,
+            queueAgeBucket: String? = nil,
+            contentSource: String? = nil,
+            freshnessPolicy: String? = nil,
             scanKind: String? = nil,
             fileCount: Int? = nil,
             batchSize: Int? = nil,
@@ -173,12 +209,30 @@ enum EditFlowPerf {
             self.chunkCount = Self.nonNegative(chunkCount)
             self.taskCount = Self.nonNegative(taskCount)
             self.activeCount = Self.nonNegative(activeCount)
+            self.storeCapacity = Self.nonNegative(storeCapacity)
+            self.globalCapacity = Self.nonNegative(globalCapacity)
+            self.storeActiveCount = Self.nonNegative(storeActiveCount)
+            self.globalActiveCount = Self.nonNegative(globalActiveCount)
+            self.storeQueueDepth = Self.nonNegative(storeQueueDepth)
+            self.globalQueueDepth = Self.nonNegative(globalQueueDepth)
+            self.admittedFileCount = Self.nonNegative(admittedFileCount)
+            self.scannedFileCount = Self.nonNegative(scannedFileCount)
+            self.matchedFileCount = Self.nonNegative(matchedFileCount)
+            self.contentMatchCount = Self.nonNegative(contentMatchCount)
+            self.pathMatchCount = Self.nonNegative(pathMatchCount)
+            self.errorCount = Self.nonNegative(errorCount)
             self.isError = isError
             self.isForced = isForced
             self.isAgentMode = isAgentMode
             self.includesToolCardDiff = includesToolCardDiff
+            self.limitHit = limitHit
+            self.usesWorktreeProjection = usesWorktreeProjection
             self.searchMode = Self.sanitizedLabel(searchMode)
             self.workloadClass = Self.sanitizedLabel(workloadClass)
+            self.admissionClass = Self.sanitizedLabel(admissionClass)
+            self.queueAgeBucket = Self.sanitizedLabel(queueAgeBucket)
+            self.contentSource = Self.sanitizedLabel(contentSource)
+            self.freshnessPolicy = Self.sanitizedLabel(freshnessPolicy)
             self.scanKind = Self.sanitizedLabel(scanKind)
             self.fileCount = Self.nonNegative(fileCount)
             self.batchSize = Self.nonNegative(batchSize)
@@ -236,12 +290,30 @@ enum EditFlowPerf {
             append("chunkCount", chunkCount, to: &parts)
             append("taskCount", taskCount, to: &parts)
             append("activeCount", activeCount, to: &parts)
+            append("storeCapacity", storeCapacity, to: &parts)
+            append("globalCapacity", globalCapacity, to: &parts)
+            append("storeActiveCount", storeActiveCount, to: &parts)
+            append("globalActiveCount", globalActiveCount, to: &parts)
+            append("storeQueueDepth", storeQueueDepth, to: &parts)
+            append("globalQueueDepth", globalQueueDepth, to: &parts)
+            append("admittedFileCount", admittedFileCount, to: &parts)
+            append("scannedFileCount", scannedFileCount, to: &parts)
+            append("matchedFileCount", matchedFileCount, to: &parts)
+            append("contentMatchCount", contentMatchCount, to: &parts)
+            append("pathMatchCount", pathMatchCount, to: &parts)
+            append("errorCount", errorCount, to: &parts)
             append("isError", isError, to: &parts)
             append("isForced", isForced, to: &parts)
             append("isAgentMode", isAgentMode, to: &parts)
             append("includesToolCardDiff", includesToolCardDiff, to: &parts)
+            append("limitHit", limitHit, to: &parts)
+            append("usesWorktreeProjection", usesWorktreeProjection, to: &parts)
             append("searchMode", searchMode, to: &parts)
             append("workloadClass", workloadClass, to: &parts)
+            append("admissionClass", admissionClass, to: &parts)
+            append("queueAgeBucket", queueAgeBucket, to: &parts)
+            append("contentSource", contentSource, to: &parts)
+            append("freshnessPolicy", freshnessPolicy, to: &parts)
             append("scanKind", scanKind, to: &parts)
             append("fileCount", fileCount, to: &parts)
             append("batchSize", batchSize, to: &parts)
@@ -356,8 +428,12 @@ enum EditFlowPerf {
             static let serviceToolLookupWindowCatalogToolsActorBodyTotal: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsActorBodyTotal"
             static let serviceToolLookupWindowCatalogToolsMaterialization: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsMaterialization"
             static let dispatch: StaticString = "EditFlow.MCPToolCall.Dispatch"
+            static let resolvedProviderDispatch: StaticString = "EditFlow.MCPToolCall.ResolvedProviderDispatch"
+            static let handlerResultHandoff: StaticString = "EditFlow.MCPToolCall.HandlerResultHandoff"
             static let permitPostDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPostDispatchEnvelope"
             static let completionObservers: StaticString = "EditFlow.MCPToolCall.CompletionObservers"
+            static let completionObserverResultEncoding: StaticString = "EditFlow.MCPToolCall.CompletionObserverResultEncoding"
+            static let completionObserverCallbacks: StaticString = "EditFlow.MCPToolCall.CompletionObserverCallbacks"
             static let preToolFilesystemFlush: StaticString = "EditFlow.MCPToolCall.PreToolFilesystemFlush"
             static let runToolSetup: StaticString = "EditFlow.MCPToolCall.RunToolSetup"
             static let runToolRegistration: StaticString = "EditFlow.MCPToolCall.RunToolRegistration"
@@ -399,6 +475,15 @@ enum EditFlowPerf {
 
         enum Search {
             static let broadAdmissionWait: StaticString = "EditFlow.Search.BroadAdmissionWait"
+            static let broadAdmissionLeaseHold: StaticString = "EditFlow.Search.BroadAdmissionLeaseHold"
+            static let contentFetchAdmissionWait: StaticString = "EditFlow.Search.ContentFetchAdmissionWait"
+            static let contentFetchLeaseHold: StaticString = "EditFlow.Search.ContentFetchLeaseHold"
+            static let ingressFreshnessWait: StaticString = "EditFlow.Search.IngressFreshnessWait"
+            static let contentFreshnessValidation: StaticString = "EditFlow.Search.ContentFreshnessValidation"
+            static let contentFreshnessValidationStoreActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.StoreActorBody"
+            static let contentFreshnessValidationRootActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.RootActorBody"
+            static let contentScanTotal: StaticString = "EditFlow.Search.ContentScanTotal"
+            static let resultConstruction: StaticString = "EditFlow.Search.ResultConstruction"
             static let entrypoint: StaticString = "EditFlow.Search.Entrypoint"
             static let scopeFiltering: StaticString = "EditFlow.Search.ScopeFiltering"
             static let actorSearchCall: StaticString = "EditFlow.Search.ActorSearchCall"
@@ -416,6 +501,21 @@ enum EditFlowPerf {
             static let materializeMatches: StaticString = "EditFlow.Search.MaterializeMatches"
             static let catalogSnapshot: StaticString = "EditFlow.Search.CatalogSnapshot"
             static let dtoBuild: StaticString = "EditFlow.Search.DTOBuild"
+            static let dtoRootRefSnapshotLookup: StaticString = "EditFlow.Search.DTOBuild.RootRefSnapshotLookup"
+            static let dtoDisplayResolverPreparation: StaticString = "EditFlow.Search.DTOBuild.DisplayResolverPreparation"
+            static let dtoPathDisplayProjection: StaticString = "EditFlow.Search.DTOBuild.PathDisplayProjection"
+            static let dtoCapAccounting: StaticString = "EditFlow.Search.DTOBuild.CapAccounting"
+            static let dtoAssembly: StaticString = "EditFlow.Search.DTOBuild.Assembly"
+            static let providerTotal: StaticString = "EditFlow.Search.ProviderTotal"
+            static let providerWorkspaceSearchAwait: StaticString = "EditFlow.Search.ProviderWorkspaceSearchAwait"
+            static let providerAutoSelection: StaticString = "EditFlow.Search.ProviderAutoSelection"
+            static let providerValueEncoding: StaticString = "EditFlow.Search.ProviderValueEncoding"
+
+            enum AutoSelect {
+                static let shapeEligibility: StaticString = "EditFlow.Search.AutoSelect.ShapeEligibility"
+                static let agentEligibility: StaticString = "EditFlow.Search.AutoSelect.AgentEligibility"
+                static let mutation: StaticString = "EditFlow.Search.AutoSelect.Mutation"
+            }
         }
 
         enum ReadFile {
@@ -428,6 +528,11 @@ enum EditFlowPerf {
             static let providerReplyProjection: StaticString = "EditFlow.ReadFile.ProviderReplyProjection"
             static let providerAutoSelect: StaticString = "EditFlow.ReadFile.ProviderAutoSelect"
             static let providerValueEncoding: StaticString = "EditFlow.ReadFile.ProviderValueEncoding"
+            static let explicitIngressFreshnessWait: StaticString = "EditFlow.ReadFile.ExplicitIngressFreshnessWait"
+            static let exactCatalogShortcut: StaticString = "EditFlow.ReadFile.ExactCatalogShortcut"
+            static let storeReadContentForwardAwait: StaticString = "EditFlow.ReadFile.StoreReadContentForwardAwait"
+            static let folderResolutionGeneralLookupFallback: StaticString = "EditFlow.ReadFile.FolderResolutionGeneralLookupFallback"
+            static let pathLookupStaticSnapshotBuild: StaticString = "EditFlow.ReadFile.PathLookupStaticSnapshotBuild"
             static let resolveReadableFile: StaticString = "EditFlow.ReadFile.ResolveReadableFile"
             static let exactPathIssueDetection: StaticString = "EditFlow.ReadFile.ExactPathIssueDetection"
             static let rootRefsLookup: StaticString = "EditFlow.ReadFile.RootRefsLookup"
@@ -489,8 +594,20 @@ enum EditFlowPerf {
         }
 
         enum FileSystem {
+            static let contentLoadTotal: StaticString = "EditFlow.FileSystem.ContentLoadTotal"
             static let contentLoadActorBody: StaticString = "EditFlow.FileSystem.ContentLoadActorBody"
+            static let contentReadRequestPreparation: StaticString = "EditFlow.FileSystem.ContentReadRequestPreparation"
+            static let contentReadOffActorAwait: StaticString = "EditFlow.FileSystem.ContentReadOffActorAwait"
+            static let contentModificationDateLookup: StaticString = "EditFlow.FileSystem.ContentModificationDateLookup"
             static let contentReadWorkerPermitWait: StaticString = "EditFlow.FileSystem.ContentReadWorkerPermitWait"
+            static let contentReadWorkerBody: StaticString = "EditFlow.FileSystem.ContentReadWorkerBody"
+        }
+
+        enum Bootstrap {
+            static let handshakeIOQueueEnvelope: StaticString = "EditFlow.Bootstrap.HandshakeIOQueueEnvelope"
+            static let handshakeIOBlockingRead: StaticString = "EditFlow.Bootstrap.HandshakeIOBlockingRead"
+            static let admission: StaticString = "EditFlow.Bootstrap.Admission"
+            static let postAcceptStartup: StaticString = "EditFlow.Bootstrap.PostAcceptStartup"
         }
 
         enum WorkspaceDurability {
@@ -540,6 +657,10 @@ enum EditFlowPerf {
             static let limiterWaitBegan: StaticString = "MCP.ToolCall.LimiterWaitBegan"
             static let limiterAcquired: StaticString = "MCP.ToolCall.LimiterAcquired"
             static let completionObserverReturned: StaticString = "MCP.ToolCall.CompletionObserverReturned"
+            static let formatResultReturned: StaticString = "MCP.ToolCall.FormatResultReturned"
+            static let resolvedProviderBegan: StaticString = "MCP.ToolCall.ResolvedProviderBegan"
+            static let resolvedProviderEnded: StaticString = "MCP.ToolCall.ResolvedProviderEnded"
+            static let handlerResultReady: StaticString = "MCP.ToolCall.HandlerResultReady"
         }
 
         enum MCPRunTool {
@@ -562,16 +683,64 @@ enum EditFlowPerf {
             static let callbackAccepted: StaticString = "FileSystem.CallbackAccepted"
             static let serviceEnqueueEntered: StaticString = "FileSystem.ServiceEnqueueEntered"
             static let servicePublish: StaticString = "FileSystem.ServicePublish"
+            static let contentLoadEntered: StaticString = "FileSystem.ContentLoadEntered"
+            static let contentReadRequestPrepared: StaticString = "FileSystem.ContentReadRequestPrepared"
+            static let contentReadOffActorScheduled: StaticString = "FileSystem.ContentReadOffActorScheduled"
+            static let contentReadWorkerReturned: StaticString = "FileSystem.ContentReadWorkerReturned"
+            static let contentLoadReturned: StaticString = "FileSystem.ContentLoadReturned"
             static let contentReadWorkerPermitWaitBegan: StaticString = "FileSystem.ContentReadWorkerPermitWaitBegan"
             static let contentReadWorkerPermitAcquired: StaticString = "FileSystem.ContentReadWorkerPermitAcquired"
             static let contentReadWorkerPermitCancelled: StaticString = "FileSystem.ContentReadWorkerPermitCancelled"
         }
 
         enum Search {
+            static let contentFreshnessStoreEntered: StaticString = "Search.ContentFreshnessStoreEntered"
+            static let contentFreshnessStoreReturned: StaticString = "Search.ContentFreshnessStoreReturned"
+            static let contentFreshnessRootEntered: StaticString = "Search.ContentFreshnessRootEntered"
+            static let contentFreshnessRootReturned: StaticString = "Search.ContentFreshnessRootReturned"
             static let broadAdmissionWaitBegan: StaticString = "Search.BroadAdmissionWaitBegan"
             static let broadAdmissionPermitAcquired: StaticString = "Search.BroadAdmissionPermitAcquired"
             static let broadAdmissionPermitCancelled: StaticString = "Search.BroadAdmissionPermitCancelled"
             static let broadAdmissionPermitReleased: StaticString = "Search.BroadAdmissionPermitReleased"
+            static let broadAdmissionOverloaded: StaticString = "Search.BroadAdmissionOverloaded"
+            static let broadAdmissionWaitExpired: StaticString = "Search.BroadAdmissionWaitExpired"
+            static let contentFetchWaitBegan: StaticString = "Search.ContentFetchWaitBegan"
+            static let contentFetchPermitAcquired: StaticString = "Search.ContentFetchPermitAcquired"
+            static let contentFetchPermitCancelled: StaticString = "Search.ContentFetchPermitCancelled"
+            static let contentFetchPermitReleased: StaticString = "Search.ContentFetchPermitReleased"
+            static let contentFetchOverloaded: StaticString = "Search.ContentFetchOverloaded"
+            static let contentFetchWaitExpired: StaticString = "Search.ContentFetchWaitExpired"
+            static let providerEntered: StaticString = "Search.ProviderEntered"
+            static let providerWorkspaceSearchReturned: StaticString = "Search.ProviderWorkspaceSearchReturned"
+            static let providerDTOReady: StaticString = "Search.ProviderDTOReady"
+            static let providerAutoSelectionReturned: StaticString = "Search.ProviderAutoSelectionReturned"
+            static let providerResultReady: StaticString = "Search.ProviderResultReady"
+        }
+
+        enum ReadFile {
+            static let providerEntered: StaticString = "ReadFile.ProviderEntered"
+            static let explicitFreshnessBegan: StaticString = "ReadFile.ExplicitFreshnessBegan"
+            static let explicitFreshnessEnded: StaticString = "ReadFile.ExplicitFreshnessEnded"
+            static let exactCatalogLookupResolved: StaticString = "ReadFile.ExactCatalogLookupResolved"
+            static let exactCatalogShortcutResolved: StaticString = "ReadFile.ExactCatalogShortcutResolved"
+            static let folderResolutionReturned: StaticString = "ReadFile.FolderResolutionReturned"
+            static let readableServiceResolutionReturned: StaticString = "ReadFile.ReadableServiceResolutionReturned"
+            static let storeReadContentEntered: StaticString = "ReadFile.StoreReadContentEntered"
+            static let storeReadContentReturned: StaticString = "ReadFile.StoreReadContentReturned"
+            static let providerResultReady: StaticString = "ReadFile.ProviderResultReady"
+        }
+
+        enum Bootstrap {
+            static let socketAccepted: StaticString = "Bootstrap.SocketAccepted"
+            static let handshakeIOQueued: StaticString = "Bootstrap.HandshakeIOQueued"
+            static let handshakeIOBegan: StaticString = "Bootstrap.HandshakeIOBegan"
+            static let handshakeIOEnded: StaticString = "Bootstrap.HandshakeIOEnded"
+            static let admissionBegan: StaticString = "Bootstrap.AdmissionBegan"
+            static let admissionEnded: StaticString = "Bootstrap.AdmissionEnded"
+            static let acceptedResponseSent: StaticString = "Bootstrap.AcceptedResponseSent"
+            static let ownershipTransferred: StaticString = "Bootstrap.OwnershipTransferred"
+            static let postAcceptStartupBegan: StaticString = "Bootstrap.PostAcceptStartupBegan"
+            static let postAcceptStartupEnded: StaticString = "Bootstrap.PostAcceptStartupEnded"
         }
 
         enum WorkspaceIngress {

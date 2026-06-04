@@ -74,6 +74,84 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         #endif
     }
 
+    func testBootstrapSilentRawSocketBurstRecordsBoundedSerialQueueAttributionAndStopsCleanly() async throws {
+        #if DEBUG
+            EditFlowPerf.resetDebugCaptureForTesting()
+            defer { EditFlowPerf.resetDebugCaptureForTesting() }
+            switch EditFlowPerf.beginDebugCapture(label: "bootstrap-silent-raw-burst", maxSamples: 500) {
+            case .started:
+                break
+            case .busy:
+                XCTFail("Bootstrap attribution capture should start")
+            }
+
+            let fixture = try TemporarySocketFixture.make(prefix: "silent-burst")
+            defer { fixture.removeOwnedDirectory() }
+            let server = BootstrapSocketServer(socketURL: fixture.socketURL)
+            let admissionCount = AsyncCounter()
+            var clientFDs: [Int32] = []
+            defer { clientFDs.forEach(Self.closeIfOpen) }
+
+            try await server.start { _, _, _, _ in
+                await admissionCount.increment()
+                return .reject()
+            }
+            do {
+                let maxInFlight = await server.diagnostics().maxInFlightHandshakes
+                for _ in 0 ..< maxInFlight {
+                    try clientFDs.append(Self.connectRawUnixClient(to: fixture.socketURL))
+                }
+                let saturated = await Self.waitUntil {
+                    let diagnostics = await server.diagnostics()
+                    let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: false)
+                    let queuedCount = snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.HandshakeIOQueued" })
+                    let beganCount = snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.HandshakeIOBegan" })
+                    let endedCount = snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.HandshakeIOEnded" })
+                    return diagnostics.inFlightHandshakes == maxInFlight
+                        && diagnostics.acceptSuspendedForBackpressure
+                        && queuedCount == maxInFlight
+                        && beganCount == 1
+                        && endedCount == 0
+                }
+                XCTAssertTrue(saturated)
+                let admissionCountWhileSaturated = await admissionCount.value
+                XCTAssertEqual(admissionCountWhileSaturated, 0)
+
+                await server.stop()
+                let drained = await Self.waitUntil {
+                    EditFlowPerf.debugCaptureSnapshot(finish: false).lifecycleEvents
+                        .count(where: { $0.eventName == "Bootstrap.HandshakeIOEnded" }) == maxInFlight
+                }
+                XCTAssertTrue(drained)
+                let diagnostics = await server.diagnostics()
+                XCTAssertEqual(diagnostics.inFlightHandshakes, 0)
+                XCTAssertFalse(diagnostics.acceptSuspendedForBackpressure)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.socketURL.path))
+
+                let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+                XCTAssertEqual(snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.SocketAccepted" }), maxInFlight)
+                XCTAssertEqual(snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.HandshakeIOQueued" }), maxInFlight)
+                XCTAssertEqual(snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.HandshakeIOBegan" }), maxInFlight)
+                XCTAssertEqual(snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.HandshakeIOEnded" }), maxInFlight)
+                XCTAssertEqual(snapshot.lifecycleEvents.count(where: { $0.eventName == "Bootstrap.AdmissionBegan" }), 0)
+                XCTAssertEqual(snapshot.stages.filter { $0.stageName == "EditFlow.Bootstrap.HandshakeIOQueueEnvelope" }.reduce(0) { $0 + $1.sampleCount }, maxInFlight)
+                XCTAssertEqual(snapshot.stages.filter { $0.stageName == "EditFlow.Bootstrap.HandshakeIOBlockingRead" }.reduce(0) { $0 + $1.sampleCount }, maxInFlight)
+                for dimensions in snapshot.lifecycleEvents.map(\.sanitizedDimensions) + snapshot.stages.map(\.sanitizedDimensions) {
+                    XCTAssertFalse(dimensions.contains("/"))
+                    XCTAssertFalse(dimensions.contains("fd-hardening"))
+                    XCTAssertFalse(dimensions.contains("silent-burst"))
+                    XCTAssertFalse(dimensions.contains("session"))
+                    XCTAssertFalse(dimensions.contains("client"))
+                }
+            } catch {
+                await server.stop()
+                throw error
+            }
+        #else
+            throw XCTSkip("Bootstrap handshake attribution seam is DEBUG-only")
+        #endif
+    }
+
     func testAppTransportSetsCloseOnExecOnAdoptedSocket() async throws {
         #if DEBUG
             let descriptors = try Self.makeSocketPair()

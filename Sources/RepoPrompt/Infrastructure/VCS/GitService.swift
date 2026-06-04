@@ -145,10 +145,19 @@ actor GitService {
         request: GitWorktreeCreateRequest,
         at repoURL: URL
     ) async throws -> GitWorktreeDescriptor {
+        let result = try await createWorktreeWithResult(request: request, at: repoURL)
+        return result.descriptor
+    }
+
+    /// Create a Git worktree and return best-effort `.worktreeinclude` copy details.
+    func createWorktreeWithResult(
+        request: GitWorktreeCreateRequest,
+        at repoURL: URL
+    ) async throws -> GitWorktreeCreateResult {
         let mutationKey = getLayout(for: repoURL)?.commonDir.standardizedFileURL.path
             ?? repoURL.standardizedFileURL.path
 
-        return try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
+        let created = try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
             guard let self else {
                 throw GitError(message: "git service was released before worktree creation")
             }
@@ -198,6 +207,60 @@ actor GitService {
 
             throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
         }
+
+        let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
+        let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
+            request: request,
+            sourceRepoURL: repoURL,
+            destinationURL: destinationURL
+        )
+        return GitWorktreeCreateResult(descriptor: created, includeCopyResult: includeCopyResult)
+    }
+
+    private func copyWorktreeIncludeFilesIfRequested(
+        request: GitWorktreeCreateRequest,
+        sourceRepoURL: URL,
+        destinationURL: URL
+    ) async -> GitWorktreeIncludeCopyResult? {
+        guard request.copyWorktreeIncludeFiles,
+              let appManagedContainer = request.appManagedContainer,
+              Self.isPath(destinationURL, equalToOrInside: appManagedContainer)
+        else { return nil }
+        let includeURL = sourceRepoURL.appendingPathComponent(".worktreeinclude", isDirectory: false)
+        guard FileManager.default.fileExists(atPath: includeURL.path) else { return nil }
+
+        do {
+            let (stdout, stderr, exitCode) = try await runGit(
+                ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+                at: sourceRepoURL
+            )
+            guard exitCode == 0 else {
+                return GitWorktreeIncludeCopyResult(
+                    copiedCount: 0,
+                    matchedCount: 0,
+                    errorSummaries: ["could not list Git-ignored files: \(stderr)"]
+                )
+            }
+            return GitWorktreeIncludeCopier.copyIncludedFiles(
+                from: sourceRepoURL,
+                to: destinationURL,
+                ignoredFilesNULOutput: stdout,
+                appManagedContainer: appManagedContainer
+            )
+        } catch {
+            return GitWorktreeIncludeCopyResult(
+                copiedCount: 0,
+                matchedCount: 0,
+                errorSummaries: ["could not copy .worktreeinclude files: \(error.localizedDescription)"]
+            )
+        }
+    }
+
+    private static func isPath(_ path: URL, equalToOrInside root: URL) -> Bool {
+        StandardizedPath.isDescendant(
+            StandardizedPath.absolute(path.path),
+            of: StandardizedPath.absolute(root.path)
+        )
     }
 
     // MARK: - Worktree Merge Primitives

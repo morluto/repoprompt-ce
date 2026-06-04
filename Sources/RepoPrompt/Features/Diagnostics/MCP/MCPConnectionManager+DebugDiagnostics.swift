@@ -129,6 +129,30 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_capture_snapshot` is only available in DEBUG builds.")
                 #endif
+            case "mcp_read_search_admission_snapshot":
+                #if DEBUG
+                    return await debugMCPReadSearchAdmissionSnapshotPayload(op: op)
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_admission_snapshot` is only available in DEBUG builds.")
+                #endif
+            case "mcp_read_search_admission_configure":
+                #if DEBUG
+                    return await debugMCPReadSearchAdmissionConfigurePayload(op: op, arguments: arguments)
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_admission_configure` is only available in DEBUG builds.")
+                #endif
+            case "mcp_read_search_content_fetch_admission_snapshot":
+                #if DEBUG
+                    return await debugMCPReadSearchContentFetchAdmissionSnapshotPayload(op: op)
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_content_fetch_admission_snapshot` is only available in DEBUG builds.")
+                #endif
+            case "mcp_read_search_content_fetch_admission_configure":
+                #if DEBUG
+                    return await debugMCPReadSearchContentFetchAdmissionConfigurePayload(op: op, arguments: arguments)
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_content_fetch_admission_configure` is only available in DEBUG builds.")
+                #endif
             case "bootstrap_diagnostics":
                 return await debugBootstrapDiagnosticsPayload(op: op)
             case "sparkle_status":

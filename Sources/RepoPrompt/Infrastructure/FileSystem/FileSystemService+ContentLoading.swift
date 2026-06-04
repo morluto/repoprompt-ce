@@ -57,12 +57,19 @@ private struct ContentReadRequest {
     #endif
 }
 
+private enum ContentReadTelemetryOutcome: String {
+    case loaded
+    case unavailable
+    case oversized
+}
+
 private struct ContentReadResult {
     let absolutePath: String
     let content: String?
     let detectedEncodingRawValue: UInt?
     let modificationDate: Date?
     let fingerprint: ContentReadFingerprint?
+    let telemetryOutcome: ContentReadTelemetryOutcome
 
     var detectedEncoding: String.Encoding? {
         detectedEncodingRawValue.map(String.Encoding.init(rawValue:))
@@ -301,25 +308,100 @@ extension FileSystemService {
         ofRelativePath relativePath: String,
         workloadClass: ContentReadWorkloadClass = .unspecified
     ) async throws -> String? {
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.contentLoadEntered,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        let contentLoadState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentLoadTotal,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        var contentLoadOutcome = "error"
+        defer {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentLoadTotal,
+                contentLoadState,
+                EditFlowPerf.Dimensions(
+                    outcome: contentLoadOutcome,
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: diagnosticRootToken.uuidString
+                )
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.FileSystem.contentLoadReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: contentLoadOutcome,
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: diagnosticRootToken.uuidString
+                )
+            )
+        }
         if Self.hasAlwaysBinaryExtension(relativePath) {
+            contentLoadOutcome = "unavailable"
             return nil
         }
 
-        let request = try makeContentReadRequest(
-            cacheKey: relativePath,
-            chunkSize: 1_048_576,
-            fileSizeLimit: 10_000_000,
-            mode: .automatic,
-            workloadClass: workloadClass
+        let preparationState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentReadRequestPreparation,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        let request: ContentReadRequest
+        do {
+            request = try makeContentReadRequest(
+                cacheKey: relativePath,
+                chunkSize: 1_048_576,
+                fileSizeLimit: 10_000_000,
+                mode: .automatic,
+                workloadClass: workloadClass
+            )
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadRequestPreparation,
+                preparationState,
+                EditFlowPerf.Dimensions(outcome: "prepared", workloadClass: workloadClass.rawValue)
+            )
+        } catch {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadRequestPreparation,
+                preparationState,
+                EditFlowPerf.Dimensions(outcome: "error", workloadClass: workloadClass.rawValue)
+            )
+            throw error
+        }
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.contentReadRequestPrepared,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
         )
         #if DEBUG
             if shouldUseSerialContentReadFallback {
-                return try await loadContentSerialForTesting(request)
+                do {
+                    let content = try await loadContentSerialForTesting(request)
+                    contentLoadOutcome = Self.telemetryOutcomeForSerialFallback(content)
+                    return content
+                } catch {
+                    contentLoadOutcome = error is CancellationError ? "cancelled" : "error"
+                    throw error
+                }
             }
         #endif
-        let result = try await Self.performContentReadOffActor(request)
-        try Task.checkCancellation()
+        let result: ContentReadResult
+        do {
+            result = try await performMeasuredContentReadOffActor(request, lifecycleCorrelation: lifecycleCorrelation)
+        } catch {
+            contentLoadOutcome = error is CancellationError ? "cancelled" : "error"
+            throw error
+        }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            contentLoadOutcome = "cancelled"
+            throw error
+        }
         commitContentReadResultIfCurrent(result, cacheKey: request.cacheKey)
+        contentLoadOutcome = result.telemetryOutcome.rawValue
         return result.content
     }
 
@@ -353,27 +435,111 @@ extension FileSystemService {
         fileSizeLimit: Int64 = 10_000_000, // 10 MB
         workloadClass: ContentReadWorkloadClass = .unspecified
     ) async throws -> String? {
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.contentLoadEntered,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        let contentLoadState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentLoadTotal,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        var contentLoadOutcome = "error"
+        defer {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentLoadTotal,
+                contentLoadState,
+                EditFlowPerf.Dimensions(
+                    outcome: contentLoadOutcome,
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: diagnosticRootToken.uuidString
+                )
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.FileSystem.contentLoadReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: contentLoadOutcome,
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: diagnosticRootToken.uuidString
+                )
+            )
+        }
         if Self.hasAlwaysBinaryExtension(relativePath) {
+            contentLoadOutcome = "unavailable"
             return nil
         }
 
-        let request = try makeContentReadRequest(
-            cacheKey: relativePath,
-            chunkSize: chunkSize,
-            fileSizeLimit: fileSizeLimit,
-            mode: .streamed,
-            workloadClass: workloadClass
+        let preparationState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentReadRequestPreparation,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        let request: ContentReadRequest
+        do {
+            request = try makeContentReadRequest(
+                cacheKey: relativePath,
+                chunkSize: chunkSize,
+                fileSizeLimit: fileSizeLimit,
+                mode: .streamed,
+                workloadClass: workloadClass
+            )
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadRequestPreparation,
+                preparationState,
+                EditFlowPerf.Dimensions(outcome: "prepared", workloadClass: workloadClass.rawValue)
+            )
+        } catch {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadRequestPreparation,
+                preparationState,
+                EditFlowPerf.Dimensions(outcome: "error", workloadClass: workloadClass.rawValue)
+            )
+            throw error
+        }
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.contentReadRequestPrepared,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
         )
         #if DEBUG
             if shouldUseSerialContentReadFallback {
-                return try await loadEntireFileContentOptimizedSerialForTesting(request)
+                do {
+                    let content = try await loadEntireFileContentOptimizedSerialForTesting(request)
+                    contentLoadOutcome = Self.telemetryOutcomeForSerialFallback(content)
+                    return content
+                } catch {
+                    contentLoadOutcome = error is CancellationError ? "cancelled" : "error"
+                    throw error
+                }
             }
         #endif
-        let result = try await Self.performContentReadOffActor(request)
-        try Task.checkCancellation()
+        let result: ContentReadResult
+        do {
+            result = try await performMeasuredContentReadOffActor(request, lifecycleCorrelation: lifecycleCorrelation)
+        } catch {
+            contentLoadOutcome = error is CancellationError ? "cancelled" : "error"
+            throw error
+        }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            contentLoadOutcome = "cancelled"
+            throw error
+        }
         commitContentReadResultIfCurrent(result, cacheKey: request.cacheKey)
+        contentLoadOutcome = result.telemetryOutcome.rawValue
         return result.content
     }
+
+    #if DEBUG
+        private nonisolated static func telemetryOutcomeForSerialFallback(_ content: String?) -> String {
+            guard let content else { return ContentReadTelemetryOutcome.unavailable.rawValue }
+            return content.hasPrefix("[File too large: ")
+                ? ContentReadTelemetryOutcome.oversized.rawValue
+                : ContentReadTelemetryOutcome.loaded.rawValue
+        }
+    #endif
 
     private func makeContentReadRequest(
         cacheKey: String,
@@ -431,6 +597,56 @@ extension FileSystemService {
         #endif
     }
 
+    private func performMeasuredContentReadOffActor(
+        _ request: ContentReadRequest,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
+    ) async throws -> ContentReadResult {
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.contentReadOffActorScheduled,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(workloadClass: request.workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        let offActorState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentReadOffActorAwait,
+            EditFlowPerf.Dimensions(workloadClass: request.workloadClass.rawValue, rootToken: diagnosticRootToken.uuidString)
+        )
+        do {
+            let result = try await Self.performContentReadOffActor(request)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadOffActorAwait,
+                offActorState,
+                EditFlowPerf.Dimensions(outcome: result.telemetryOutcome.rawValue, workloadClass: request.workloadClass.rawValue)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: result.telemetryOutcome.rawValue,
+                    workloadClass: request.workloadClass.rawValue,
+                    rootToken: diagnosticRootToken.uuidString
+                )
+            )
+            return result
+        } catch {
+            let outcome = error is CancellationError ? "cancelled" : "error"
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadOffActorAwait,
+                offActorState,
+                EditFlowPerf.Dimensions(outcome: outcome, workloadClass: request.workloadClass.rawValue)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: outcome,
+                    workloadClass: request.workloadClass.rawValue,
+                    rootToken: diagnosticRootToken.uuidString
+                )
+            )
+            throw error
+        }
+    }
+
     private func commitContentReadResultIfCurrent(_ result: ContentReadResult, cacheKey: String) {
         guard let detectedEncoding = result.detectedEncoding,
               let fingerprint = result.fingerprint
@@ -460,24 +676,60 @@ extension FileSystemService {
     }
 
     private nonisolated static func readContentFromDisk(_ request: ContentReadRequest) async throws -> ContentReadResult {
-        if hasAlwaysBinaryExtension(request.relativePath) {
-            return ContentReadResult(
-                absolutePath: request.absolutePath,
-                content: nil,
-                detectedEncodingRawValue: nil,
-                modificationDate: nil,
-                fingerprint: nil
+        let workerBodyState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
+            EditFlowPerf.Dimensions(
+                workloadClass: request.workloadClass.rawValue,
+                contentSource: "disk"
+            )
+        )
+        var workerBodyOutcome = "failed"
+        var workerBodyFileBytes: Int?
+        defer {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
+                workerBodyState,
+                EditFlowPerf.Dimensions(
+                    outcome: workerBodyOutcome,
+                    fileBytes: workerBodyFileBytes,
+                    workloadClass: request.workloadClass.rawValue,
+                    contentSource: "disk"
+                )
             )
         }
 
-        try Task.checkCancellation()
-        let validated = try validateContentFileForReading(request)
-        switch request.mode {
-        case .automatic:
-            return try await readAutomaticContent(request, validated: validated)
-        case .streamed:
-            return try await readStreamedContent(request, validated: validated)
+        do {
+            if hasAlwaysBinaryExtension(request.relativePath) {
+                workerBodyOutcome = ContentReadTelemetryOutcome.unavailable.rawValue
+                return ContentReadResult(
+                    absolutePath: request.absolutePath,
+                    content: nil,
+                    detectedEncodingRawValue: nil,
+                    modificationDate: nil,
+                    fingerprint: nil,
+                    telemetryOutcome: .unavailable
+                )
+            }
+
+            try Task.checkCancellation()
+            let validated = try validateContentFileForReading(request)
+            workerBodyFileBytes = telemetryFileBytes(validated.fileSize)
+            let result: ContentReadResult = switch request.mode {
+            case .automatic:
+                try await readAutomaticContent(request, validated: validated)
+            case .streamed:
+                try await readStreamedContent(request, validated: validated)
+            }
+            workerBodyOutcome = result.telemetryOutcome.rawValue
+            return result
+        } catch {
+            workerBodyOutcome = error is CancellationError ? "cancelled" : "failed"
+            throw error
         }
+    }
+
+    private nonisolated static func telemetryFileBytes(_ fileSize: Int64) -> Int {
+        Int(clamping: max(0, fileSize))
     }
 
     private nonisolated static func readAutomaticContent(
@@ -510,7 +762,8 @@ extension FileSystemService {
                 content: detected.string,
                 detectedEncodingRawValue: detected.encoding.rawValue,
                 modificationDate: validated.modificationDate,
-                fingerprint: validated.fingerprint
+                fingerprint: validated.fingerprint,
+                telemetryOutcome: .loaded
             )
         }
         return try await readStreamedContent(request, validated: validated)
@@ -524,7 +777,8 @@ extension FileSystemService {
             return noEncodingContentReadResult(
                 request,
                 validated: validated,
-                content: "[File too large: \(validated.fileSize) bytes]"
+                content: "[File too large: \(validated.fileSize) bytes]",
+                telemetryOutcome: .oversized
             )
         }
 
@@ -578,7 +832,8 @@ extension FileSystemService {
             content: String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]",
             detectedEncodingRawValue: encoding.rawValue,
             modificationDate: validated.modificationDate,
-            fingerprint: validated.fingerprint
+            fingerprint: validated.fingerprint,
+            telemetryOutcome: .loaded
         )
     }
 
@@ -643,21 +898,24 @@ extension FileSystemService {
         noEncodingContentReadResult(
             request,
             validated: validated,
-            content: "[File too large: \(observedByteCount) bytes]"
+            content: "[File too large: \(observedByteCount) bytes]",
+            telemetryOutcome: .oversized
         )
     }
 
     private nonisolated static func noEncodingContentReadResult(
         _ request: ContentReadRequest,
         validated: ValidatedContentFile,
-        content: String?
+        content: String?,
+        telemetryOutcome: ContentReadTelemetryOutcome = .unavailable
     ) -> ContentReadResult {
         ContentReadResult(
             absolutePath: request.absolutePath,
             content: content,
             detectedEncodingRawValue: nil,
             modificationDate: validated.modificationDate,
-            fingerprint: validated.fingerprint
+            fingerprint: validated.fingerprint,
+            telemetryOutcome: telemetryOutcome
         )
     }
 
@@ -1070,13 +1328,44 @@ extension FileSystemService {
         try await contentReadWorkerLimiter.withPermit(workloadClass: request.workloadClass) {
             try await withThrowingTaskGroup(of: String.Encoding.self) { group in
                 group.addTask(priority: .utility) {
-                    try Task.checkCancellation()
-                    let validated = try validateContentFileForReading(request)
-                    switch try await readBoundedData(request, url: validated.url) {
-                    case let .data(data):
-                        return detectFileEncoding(in: data)
-                    case .tooLarge:
-                        throw FileSystemError.fileTooLarge
+                    let workerBodyState = EditFlowPerf.begin(
+                        EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
+                        EditFlowPerf.Dimensions(
+                            workloadClass: request.workloadClass.rawValue,
+                            contentSource: "disk"
+                        )
+                    )
+                    var workerBodyOutcome = "failed"
+                    var workerBodyFileBytes: Int?
+                    defer {
+                        EditFlowPerf.end(
+                            EditFlowPerf.Stage.FileSystem.contentReadWorkerBody,
+                            workerBodyState,
+                            EditFlowPerf.Dimensions(
+                                outcome: workerBodyOutcome,
+                                fileBytes: workerBodyFileBytes,
+                                workloadClass: request.workloadClass.rawValue,
+                                contentSource: "disk"
+                            )
+                        )
+                    }
+                    do {
+                        try Task.checkCancellation()
+                        let validated = try validateContentFileForReading(request)
+                        workerBodyFileBytes = telemetryFileBytes(validated.fileSize)
+                        switch try await readBoundedData(request, url: validated.url) {
+                        case let .data(data):
+                            workerBodyOutcome = "loaded"
+                            return detectFileEncoding(in: data)
+                        case .tooLarge:
+                            workerBodyOutcome = "oversized"
+                            throw FileSystemError.fileTooLarge
+                        }
+                    } catch {
+                        if error is CancellationError {
+                            workerBodyOutcome = "cancelled"
+                        }
+                        throw error
                     }
                 }
                 guard let encoding = try await group.next() else {

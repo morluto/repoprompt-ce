@@ -12,7 +12,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    func testReadFileSourceOrderKeepsValidationAndRootsBeforeExactAbsoluteShortcutAndFallbackAfterIt() throws {
+    func testReadFileSourceOrderKeepsValidationAndRootsBeforeExactCatalogShortcutAndFallbackAfterIt() throws {
         let source = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
         let readFile = try XCTUnwrap(source.slice(
             from: "    private func readFile(\n",
@@ -22,12 +22,12 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         try assertOrdered([
             "await store.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope)",
             "await store.rootRefs(scope: lookupRootScope)",
-            "await readableService.resolveExactAbsoluteWorkspaceCatalogHit(path, rootScope: lookupRootScope)",
+            "await readableService.resolveExactWorkspaceCatalogHit(path, rootScope: lookupRootScope)",
             "await store.resolveFolderInput(path, rootScope: lookupRootScope, profile: .mcpRead)",
             "readableService.resolveAlwaysReadableExternalFolderDisplayPath(path)",
             "await readableService.resolveReadableFile(path, profile: .mcpRead, rootScope: lookupRootScope)"
         ], in: readFile)
-        XCTAssertTrue(readFile.contains("return (roots, WorkspaceReadableFileHandle.workspace(exactAbsoluteCatalogHit))"))
+        XCTAssertTrue(readFile.contains("return (roots, WorkspaceReadableFileHandle.workspace(exactCatalogHit))"))
         XCTAssertTrue(readFile.contains("is a folder; read_file requires a file path"))
     }
 
@@ -60,7 +60,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         XCTAssertEqual(hit?.standardizedFullPath, fileURL.path)
     }
 
-    func testRelativeAndAliasCatalogHitsDoNotUseShortcut() async throws {
+    func testRelativeAndAliasCatalogHitsUseGenericShortcutWhileAbsoluteWrapperRemainsNarrow() async throws {
         let root = try makeTemporaryRoot(name: "RelativeAlias")
         let fileURL = root.appendingPathComponent("Sources/Visible.swift")
         try write("visible", to: fileURL)
@@ -77,10 +77,14 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         guard case .matched = await store.lookupCatalogFileForExplicitRequest(alias, rootScope: .visibleWorkspace) else {
             return XCTFail("Expected the store to preserve alias catalog lookup")
         }
-        let relativeHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(relative, rootScope: .visibleWorkspace)
-        let aliasHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(alias, rootScope: .visibleWorkspace)
-        XCTAssertNil(relativeHit)
-        XCTAssertNil(aliasHit)
+        let relativeHit = await service.resolveExactWorkspaceCatalogHit(relative, rootScope: .visibleWorkspace)
+        let aliasHit = await service.resolveExactWorkspaceCatalogHit(alias, rootScope: .visibleWorkspace)
+        XCTAssertEqual(relativeHit?.standardizedFullPath, fileURL.path)
+        XCTAssertEqual(aliasHit?.standardizedFullPath, fileURL.path)
+        let absoluteWrapperRelativeHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(relative, rootScope: .visibleWorkspace)
+        let absoluteWrapperAliasHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(alias, rootScope: .visibleWorkspace)
+        XCTAssertNil(absoluteWrapperRelativeHit)
+        XCTAssertNil(absoluteWrapperAliasHit)
     }
 
     func testAbsoluteCatalogMissFallsThroughToIgnoredFileMaterialization() async throws {
@@ -93,7 +97,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         let record = try await store.loadRoot(path: root.path)
         let service = WorkspaceReadableFileService(store: store)
 
-        let shortcutHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(ignoredURL.path, rootScope: .visibleWorkspace)
+        let shortcutHit = await service.resolveExactWorkspaceCatalogHit(ignoredURL.path, rootScope: .visibleWorkspace)
         XCTAssertNil(shortcutHit)
         let readable = await service.resolveReadableFile(ignoredURL.path, profile: .mcpRead, rootScope: .visibleWorkspace)
         guard case let .workspace(file) = readable else {
@@ -118,12 +122,12 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         _ = try await store.loadRoot(path: root.path)
         let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
 
-        let folderShortcutHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(folderURL.path, rootScope: .visibleWorkspace)
+        let folderShortcutHit = await service.resolveExactWorkspaceCatalogHit(folderURL.path, rootScope: .visibleWorkspace)
         XCTAssertNil(folderShortcutHit)
         let folderResolution = await store.resolveFolderInput(folderURL.path, rootScope: .visibleWorkspace, profile: .mcpRead)
         XCTAssertEqual(folderResolution.folder?.standardizedFullPath, folderURL.path)
 
-        let externalShortcutHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(externalFile.path, rootScope: .visibleWorkspace)
+        let externalShortcutHit = await service.resolveExactWorkspaceCatalogHit(externalFile.path, rootScope: .visibleWorkspace)
         XCTAssertNil(externalShortcutHit)
         XCTAssertEqual(service.resolveAlwaysReadableExternalFolderDisplayPath(externalFolder.path), "~/.agents/skills/example")
         let readable = await service.resolveReadableFile(externalFile.path, profile: .mcpRead, rootScope: .visibleWorkspace)
@@ -148,19 +152,24 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         let missing = parentA.appendingPathComponent("missing.swift").path
         let blocked = "/tmp/blocked\0.swift"
         let ambiguousAlias = "App/Visible.swift"
+        let ambiguousRelative = "Visible.swift"
 
         let missingLookup = await store.lookupCatalogFileForExplicitRequest(missing, rootScope: .visibleWorkspace)
-        let missingShortcutHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(missing, rootScope: .visibleWorkspace)
+        let missingShortcutHit = await service.resolveExactWorkspaceCatalogHit(missing, rootScope: .visibleWorkspace)
         let blockedLookup = await store.lookupCatalogFileForExplicitRequest(blocked, rootScope: .visibleWorkspace)
-        let blockedShortcutHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(blocked, rootScope: .visibleWorkspace)
+        let blockedShortcutHit = await service.resolveExactWorkspaceCatalogHit(blocked, rootScope: .visibleWorkspace)
         let ambiguousLookup = await store.lookupCatalogFileForExplicitRequest(ambiguousAlias, rootScope: .visibleWorkspace)
-        let ambiguousShortcutHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(ambiguousAlias, rootScope: .visibleWorkspace)
+        let ambiguousShortcutHit = await service.resolveExactWorkspaceCatalogHit(ambiguousAlias, rootScope: .visibleWorkspace)
+        let ambiguousRelativeLookup = await store.lookupCatalogFileForExplicitRequest(ambiguousRelative, rootScope: .visibleWorkspace)
+        let ambiguousRelativeShortcutHit = await service.resolveExactWorkspaceCatalogHit(ambiguousRelative, rootScope: .visibleWorkspace)
         XCTAssertEqual(missingLookup, .noCandidate)
         XCTAssertNil(missingShortcutHit)
         XCTAssertEqual(blockedLookup, .blocked)
         XCTAssertNil(blockedShortcutHit)
         XCTAssertEqual(ambiguousLookup, .ambiguous)
         XCTAssertNil(ambiguousShortcutHit)
+        XCTAssertEqual(ambiguousRelativeLookup, .ambiguous)
+        XCTAssertNil(ambiguousRelativeShortcutHit)
     }
 
     func testEmptyAndEmbeddedNULIssuesRemainValidatedBeforeShortcut() async throws {
@@ -176,7 +185,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
 
         let source = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
         let validation = try XCTUnwrap(source.range(of: "await store.exactPathResolutionIssue(for: path"))
-        let shortcut = try XCTUnwrap(source.range(of: "await readableService.resolveExactAbsoluteWorkspaceCatalogHit(path"))
+        let shortcut = try XCTUnwrap(source.range(of: "await readableService.resolveExactWorkspaceCatalogHit(path"))
         XCTAssertLessThan(validation.lowerBound, shortcut.lowerBound)
     }
 
@@ -197,20 +206,20 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         let worktreeRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
         let service = WorkspaceReadableFileService(store: store)
 
-        let visibleGitDataHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(gitDataFile.path, rootScope: .visibleWorkspace)
+        let visibleGitDataHit = await service.resolveExactWorkspaceCatalogHit(gitDataFile.path, rootScope: .visibleWorkspace)
         XCTAssertNil(visibleGitDataHit)
-        let gitDataHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(gitDataFile.path, rootScope: .visibleWorkspacePlusGitData)
+        let gitDataHit = await service.resolveExactWorkspaceCatalogHit(gitDataFile.path, rootScope: .visibleWorkspacePlusGitData)
         XCTAssertEqual(gitDataHit?.rootID, gitDataRecord.id)
 
-        let visibleWorktreeHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(worktreeFile.path, rootScope: .visibleWorkspace)
+        let visibleWorktreeHit = await service.resolveExactWorkspaceCatalogHit(worktreeFile.path, rootScope: .visibleWorkspace)
         XCTAssertNil(visibleWorktreeHit)
         let sessionScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
             logicalRootPaths: [logicalRoot.path],
             physicalRootPaths: [worktreeRoot.path]
         )
-        let worktreeHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(worktreeFile.path, rootScope: sessionScope)
+        let worktreeHit = await service.resolveExactWorkspaceCatalogHit(worktreeFile.path, rootScope: sessionScope)
         XCTAssertEqual(worktreeHit?.rootID, worktreeRecord.id)
-        let sessionLogicalHit = await service.resolveExactAbsoluteWorkspaceCatalogHit(logicalFile.path, rootScope: sessionScope)
+        let sessionLogicalHit = await service.resolveExactWorkspaceCatalogHit(logicalFile.path, rootScope: sessionScope)
         XCTAssertNil(sessionLogicalHit)
     }
 

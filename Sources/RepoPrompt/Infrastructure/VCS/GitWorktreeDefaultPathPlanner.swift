@@ -75,6 +75,7 @@ enum GitWorktreeDefaultPathPlanner {
         }
 
         let branch = normalizedBranch(request.branch) ?? defaultBranch(for: request)
+        let copyWorktreeIncludeFiles = isPath(path, equalToOrInside: container)
         let createRequest = GitWorktreeCreateRequest(
             path: path,
             branch: branch,
@@ -85,7 +86,8 @@ enum GitWorktreeDefaultPathPlanner {
             allowExternalPath: request.allowExternalPath,
             appManagedContainer: container,
             mainWorktreeRoot: mainRoot,
-            knownWorktreeRoots: existingRoots
+            knownWorktreeRoots: existingRoots,
+            copyWorktreeIncludeFiles: copyWorktreeIncludeFiles
         )
         return Plan(path: path, branch: branch, appManagedContainer: container, createRequest: createRequest)
     }

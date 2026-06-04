@@ -143,6 +143,9 @@ enum ToolResultDTOs {
         let omittedContentMatches: Int?
         let omittedPathMatches: Int?
         let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
         let suggestion: String?
         let warning: String?
         let perFileTotals: [PerFileCount]?
@@ -165,6 +168,9 @@ enum ToolResultDTOs {
             omittedContentMatches: Int? = nil,
             omittedPathMatches: Int? = nil,
             errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil,
             suggestion: String? = nil,
             warning: String? = nil,
             perFileTotals: [PerFileCount]? = nil,
@@ -185,6 +191,9 @@ enum ToolResultDTOs {
             self.omittedContentMatches = omittedContentMatches
             self.omittedPathMatches = omittedPathMatches
             self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
             self.suggestion = suggestion
             self.warning = warning
             self.perFileTotals = perFileTotals
@@ -209,6 +218,9 @@ enum ToolResultDTOs {
             case omittedContentMatches = "omitted_content_matches"
             case omittedPathMatches = "omitted_path_matches"
             case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
             case suggestion
             case warning
             case perFileTotals = "per_file_totals"

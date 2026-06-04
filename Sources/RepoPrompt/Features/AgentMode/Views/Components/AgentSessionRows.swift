@@ -117,6 +117,35 @@ struct AgentSessionRow: View {
         isThreadCollapsed ? "Expand sub-agent chats" : "Collapse sub-agent chats"
     }
 
+    private var pinActionLabel: String {
+        isPinned ? "Unpin chat" : "Pin chat"
+    }
+
+    private var renameActionLabel: String {
+        "Rename chat"
+    }
+
+    private var stashActionLabel: String {
+        "Stash chat for later"
+    }
+
+    private var dismissAttentionActionLabel: String {
+        "Dismiss status badge"
+    }
+
+    private var deleteActionLabel: String {
+        "Delete chat"
+    }
+
+    private func beginRename() {
+        renameText = title
+        showRenameAlert = true
+    }
+
+    private func requestDeleteConfirmation() {
+        showDeleteConfirmation = true
+    }
+
     var body: some View {
         HStack(spacing: rowSpacing) {
             if threadDepth > 0 {
@@ -176,8 +205,8 @@ struct AgentSessionRow: View {
                     }
                     .buttonStyle(.plain)
                     .onHover { isDismissAttentionHovered = $0 }
-                    .hoverTooltip("Dismiss status badge")
-                    .accessibilityLabel("Dismiss status badge")
+                    .hoverTooltip(dismissAttentionActionLabel)
+                    .accessibilityLabel(dismissAttentionActionLabel)
                 }
 
                 Button(action: onTogglePin) {
@@ -187,19 +216,16 @@ struct AgentSessionRow: View {
                 }
                 .buttonStyle(.plain)
                 .onHover { isPinHovered = $0 }
-                .hoverTooltip(isPinned ? "Unpin chat" : "Pin chat")
+                .hoverTooltip(pinActionLabel)
 
-                Button {
-                    renameText = title
-                    showRenameAlert = true
-                } label: {
+                Button(action: beginRename) {
                     Image(systemName: "pencil")
                         .font(.system(size: 11))
                         .foregroundColor(isRenameHovered ? .accentColor : .secondary)
                 }
                 .buttonStyle(.plain)
                 .onHover { isRenameHovered = $0 }
-                .hoverTooltip("Rename chat")
+                .hoverTooltip(renameActionLabel)
 
                 Button(action: onStash) {
                     Image(systemName: "tray.and.arrow.down")
@@ -208,18 +234,16 @@ struct AgentSessionRow: View {
                 }
                 .buttonStyle(.plain)
                 .onHover { isStashHovered = $0 }
-                .hoverTooltip("Stash chat for later")
+                .hoverTooltip(stashActionLabel)
 
-                Button {
-                    showDeleteConfirmation = true
-                } label: {
+                Button(action: requestDeleteConfirmation) {
                     Image(systemName: "trash")
                         .font(.system(size: 11))
                         .foregroundColor(isDeleteHovered ? .red : .secondary)
                 }
                 .buttonStyle(.plain)
                 .onHover { isDeleteHovered = $0 }
-                .hoverTooltip("Delete chat")
+                .hoverTooltip(deleteActionLabel)
             }
             // Selected state is already signaled by the accent-tinted background +
             // semibold title weight; a trailing checkmark was redundant.
@@ -239,6 +263,21 @@ struct AgentSessionRow: View {
             }
         )
         .contentShape(Rectangle())
+        .contextMenu {
+            Button(pinActionLabel, action: onTogglePin)
+
+            Button(renameActionLabel, action: beginRename)
+
+            Button(stashActionLabel, action: onStash)
+
+            if attentionRunState != nil, let onDismissAttention {
+                Button(dismissAttentionActionLabel, action: onDismissAttention)
+            }
+
+            Divider()
+
+            Button(deleteActionLabel, role: .destructive, action: requestDeleteConfirmation)
+        }
         .onHover { isHovered = $0 }
         .onTapGesture { onSelect() }
         .accessibilityLabel(title)
@@ -698,6 +737,14 @@ struct AgentStashedSessionRow: View {
         fontPreset.scaledClamped(10, max: 13)
     }
 
+    private var restoreActionLabel: String {
+        "Restore tab"
+    }
+
+    private var deleteActionLabel: String {
+        "Delete stashed tab"
+    }
+
     var body: some View {
         HStack(spacing: rowSpacing) {
             Image(systemName: "tray.and.arrow.down")
@@ -728,7 +775,7 @@ struct AgentStashedSessionRow: View {
                 }
                 .buttonStyle(.plain)
                 .onHover { isRestoreHovered = $0 }
-                .hoverTooltip("Restore tab")
+                .hoverTooltip(restoreActionLabel)
 
                 Button(action: onDelete) {
                     Image(systemName: "trash")
@@ -737,7 +784,7 @@ struct AgentStashedSessionRow: View {
                 }
                 .buttonStyle(.plain)
                 .onHover { isDeleteHovered = $0 }
-                .hoverTooltip("Delete stashed tab")
+                .hoverTooltip(deleteActionLabel)
             }
         }
         .padding(.horizontal, rowHorizontalPadding)
@@ -752,6 +799,13 @@ struct AgentStashedSessionRow: View {
             }
         )
         .contentShape(Rectangle())
+        .contextMenu {
+            Button(restoreActionLabel, action: onRestore)
+
+            Divider()
+
+            Button(deleteActionLabel, role: .destructive, action: onDelete)
+        }
         .onHover { isHovered = $0 }
         .onTapGesture(perform: onRestore)
         .accessibilityLabel("\(stashed.tab.name), archived session")

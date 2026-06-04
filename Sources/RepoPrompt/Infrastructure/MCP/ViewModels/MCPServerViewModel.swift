@@ -774,9 +774,9 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return }
             await drainReadFileAutoSelection(metadata: metadata, requirement: requirement)
         },
-        maybeAutoSelectFileSearchSlices: { [weak self] mode, contextLines, reply in
+        enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, metadata in
             guard let self else { return }
-            await maybeAutoSelectFileSearchSlices(mode: mode, contextLines: contextLines, reply: reply)
+            await enqueueFileSearchAutoSelection(mode: mode, contextLines: contextLines, reply: reply, metadata: metadata)
         },
         workspaceContextMessage: { [weak self] operation, path in
             guard let self else { return "Window deallocated while resolving workspace context." }
@@ -2726,50 +2726,6 @@ final class MCPServerViewModel: ObservableObject {
         return (resolved, invalid)
     }
 
-    private func shouldAutoSelectAgentSlices() async -> Bool {
-        let metadata = await captureRequestMetadata()
-        guard let connectionID = metadata.connectionID else {
-            return false
-        }
-
-        let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
-        let resolvedContext = try? resolveTabContextSnapshot(
-            from: metadata,
-            toolName: "autoSelectAgentSlices",
-            policy: .allowLegacyImplicitRouting
-        )
-        let hasTabContext = resolvedContext?.usesActiveTabCompatibility == false
-
-        return AutoSliceSelection.shouldApply(purpose: purpose, hasVirtualContext: hasTabContext)
-    }
-
-    private func applyAutoSelectedSlices(_ entries: [AutoSliceSelection.SliceEntry]) async {
-        guard !entries.isEmpty else { return }
-        #if DEBUG || EDIT_FLOW_PERF
-            let sliceFlowTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.sliceFlowTotal)
-            var sliceFlowOutcome = "error"
-            defer {
-                EditFlowPerf.end(
-                    EditFlowPerf.Stage.ReadFile.AutoSelect.sliceFlowTotal,
-                    sliceFlowTotal,
-                    EditFlowPerf.Dimensions(outcome: sliceFlowOutcome)
-                )
-            }
-        #endif
-        let sliceInputs = entries.map { entry in
-            WorkspaceSelectionSliceInput(path: entry.path, ranges: entry.ranges)
-        }
-
-        do {
-            _ = try await applySelectionSlices(entries: sliceInputs, mode: .add)
-            #if DEBUG || EDIT_FLOW_PERF
-                sliceFlowOutcome = "attempted"
-            #endif
-        } catch {
-            mcpServerViewModelDebugLog("Auto slice selection skipped due to slice apply error: \(error.localizedDescription)")
-        }
-    }
-
     private func applyAutoSelectedFullFiles(_ paths: [String]) async {
         let normalizedPaths = paths
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -2953,6 +2909,7 @@ final class MCPServerViewModel: ObservableObject {
         func setReadFileAutoSelectionCanonicalApplyGateForTesting(_ gate: (() async -> Void)?) {
             readFileAutoSelectionCoordinator.setCanonicalApplyGateForTesting(gate)
         }
+
     #endif
 
     @MainActor
@@ -3032,6 +2989,17 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         if !batch.sliceEntries.isEmpty {
+            #if DEBUG || EDIT_FLOW_PERF
+                let sliceFlowTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.sliceFlowTotal)
+                var sliceFlowOutcome = "unchanged"
+                defer {
+                    EditFlowPerf.end(
+                        EditFlowPerf.Stage.ReadFile.AutoSelect.sliceFlowTotal,
+                        sliceFlowTotal,
+                        EditFlowPerf.Dimensions(outcome: sliceFlowOutcome)
+                    )
+                }
+            #endif
             let existingFullPaths = await autoSelectedFullFilePaths(
                 selection: selection,
                 lookupRootScope: lookupRootScope
@@ -3051,6 +3019,9 @@ final class MCPServerViewModel: ObservableObject {
                     mode: .add,
                     lookupRootScope: lookupRootScope
                 ).selection
+                #if DEBUG || EDIT_FLOW_PERF
+                    sliceFlowOutcome = "attempted"
+                #endif
             }
         }
 
@@ -3107,16 +3078,94 @@ final class MCPServerViewModel: ObservableObject {
         return fullPaths
     }
 
-    private func maybeAutoSelectFileSearchSlices(
+    private func enqueueFileSearchAutoSelection(
         mode: SearchMode,
         contextLines: Int,
-        reply: ToolResultDTOs.SearchResultDTO
+        reply: ToolResultDTOs.SearchResultDTO,
+        metadata: RequestMetadata
     ) async {
-        guard await shouldAutoSelectAgentSlices() else { return }
-        guard AutoSliceSelection.shouldSliceFileSearch(mode: mode, contextLines: contextLines) else { return }
-        guard !reply.contentMatchGroups.isEmpty else { return }
-        let entries = AutoSliceSelection.searchEntries(from: reply.contentMatchGroups)
-        await applyAutoSelectedSlices(entries)
+        let shapeEligibility = EditFlowPerf.begin(
+            EditFlowPerf.Stage.Search.AutoSelect.shapeEligibility,
+            EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
+        )
+        guard AutoSliceSelection.shouldSliceFileSearch(mode: mode, contextLines: contextLines) else {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.AutoSelect.shapeEligibility,
+                shapeEligibility,
+                EditFlowPerf.Dimensions(outcome: "skippedShape", searchMode: mode.rawValue, contextLines: contextLines)
+            )
+            return
+        }
+        guard !reply.contentMatchGroups.isEmpty else {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.AutoSelect.shapeEligibility,
+                shapeEligibility,
+                EditFlowPerf.Dimensions(outcome: "skippedEmpty", searchMode: mode.rawValue, contextLines: contextLines)
+            )
+            return
+        }
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Search.AutoSelect.shapeEligibility,
+            shapeEligibility,
+            EditFlowPerf.Dimensions(outcome: "eligible", searchMode: mode.rawValue, contextLines: contextLines)
+        )
+
+        let agentEligibility = EditFlowPerf.begin(EditFlowPerf.Stage.Search.AutoSelect.agentEligibility)
+        guard let connectionID = metadata.connectionID else {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.AutoSelect.agentEligibility,
+                agentEligibility,
+                EditFlowPerf.Dimensions(outcome: "ineligible")
+            )
+            return
+        }
+        let purpose: MCPRunPurpose = if let capturedPurpose = metadata.runPurpose {
+            capturedPurpose
+        } else {
+            await ServerNetworkManager.shared.runPurpose(for: connectionID)
+        }
+        guard let resolvedContext = try? resolveTabContextSnapshot(
+            from: metadata,
+            toolName: "enqueueFileSearchAutoSelection",
+            policy: .allowLegacyImplicitRouting
+        ) else {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.AutoSelect.agentEligibility,
+                agentEligibility,
+                EditFlowPerf.Dimensions(outcome: "ineligible")
+            )
+            return
+        }
+        let shouldApply = AutoSliceSelection.shouldApply(
+            purpose: purpose,
+            hasVirtualContext: !resolvedContext.usesActiveTabCompatibility
+        )
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Search.AutoSelect.agentEligibility,
+            agentEligibility,
+            EditFlowPerf.Dimensions(outcome: shouldApply ? "eligible" : "ineligible")
+        )
+        guard shouldApply else { return }
+
+        let mutation = EditFlowPerf.begin(EditFlowPerf.Stage.Search.AutoSelect.mutation)
+        let entries = AutoSliceSelection.searchEntries(from: reply.contentMatchGroups).map { entry in
+            WorkspaceSelectionSliceInput(path: entry.path, ranges: entry.ranges)
+        }
+        guard !entries.isEmpty else {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.AutoSelect.mutation,
+                mutation,
+                EditFlowPerf.Dimensions(outcome: "skippedEmpty")
+            )
+            return
+        }
+        let key = readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
+        let accepted = readFileAutoSelectionCoordinator.enqueue(intent: .slices(entries: entries), for: key)
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Search.AutoSelect.mutation,
+            mutation,
+            EditFlowPerf.Dimensions(outcome: accepted ? "enqueued" : "invalidated")
+        )
     }
 
     private func applySelectionSlices(
@@ -3434,8 +3483,19 @@ final class MCPServerViewModel: ObservableObject {
             let roots = await store.rootRefs(scope: lookupRootScope)
             EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
 
-            if let exactAbsoluteCatalogHit = await readableService.resolveExactAbsoluteWorkspaceCatalogHit(path, rootScope: lookupRootScope) {
-                return (roots, WorkspaceReadableFileHandle.workspace(exactAbsoluteCatalogHit))
+            let exactCatalogShortcutState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogShortcut)
+            let exactCatalogHit = await readableService.resolveExactWorkspaceCatalogHit(path, rootScope: lookupRootScope)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.exactCatalogShortcut,
+                exactCatalogShortcutState,
+                EditFlowPerf.Dimensions(outcome: exactCatalogHit == nil ? "miss" : "matched")
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.exactCatalogShortcutResolved,
+                EditFlowPerf.Dimensions(outcome: exactCatalogHit == nil ? "miss" : "matched")
+            )
+            if let exactCatalogHit {
+                return (roots, WorkspaceReadableFileHandle.workspace(exactCatalogHit))
             }
 
             let folderResolutionStage = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.folderResolution)
@@ -3443,6 +3503,10 @@ final class MCPServerViewModel: ObservableObject {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.folderResolution,
                 folderResolutionStage,
+                EditFlowPerf.Dimensions(outcome: folderResolution.folder == nil ? "noFolder" : "folder")
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.folderResolutionReturned,
                 EditFlowPerf.Dimensions(outcome: folderResolution.folder == nil ? "noFolder" : "folder")
             )
             if let folder = folderResolution.folder {
@@ -3466,6 +3530,19 @@ final class MCPServerViewModel: ObservableObject {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.readableServiceResolution,
                 readableServiceResolution,
+                EditFlowPerf.Dimensions(outcome: {
+                    switch readableFile {
+                    case .some(.workspace):
+                        "workspace"
+                    case .some(.external):
+                        "external"
+                    case .none:
+                        "noCandidate"
+                    }
+                }())
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.readableServiceResolutionReturned,
                 EditFlowPerf.Dimensions(outcome: {
                     switch readableFile {
                     case .some(.workspace):

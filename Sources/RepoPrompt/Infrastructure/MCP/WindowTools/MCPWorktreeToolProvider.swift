@@ -202,7 +202,8 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             )
         )
 
-        let created = try await vcsService.createGitWorktree(request: plan.createRequest, at: context.repo.rootURL)
+        let createResult = try await vcsService.createGitWorktreeWithResult(request: plan.createRequest, at: context.repo.rootURL)
+        let created = createResult.descriptor
         let identity = try persistOrResolveVisualIdentity(
             for: created,
             args: args,
@@ -230,6 +231,12 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             }
         }
 
+        let includeCopyWarning = createResult.includeCopyResult?.warningText
+        let fallbackBindingWarning = bindAfterCreate && bindingDTO == nil
+            ? "Worktree created but no session binding was applied."
+            : nil
+        let warning = combinedWarnings([includeCopyWarning, bindingWarning, fallbackBindingWarning])
+
         return ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "create",
             repository: repositoryDTO(from: created.repository, fallback: context.repo),
@@ -237,7 +244,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             createdWorktree: createdDTO,
             binding: bindingDTO,
             previousBinding: previousDTO,
-            warning: bindingWarning ?? (bindAfterCreate && bindingDTO == nil ? "Worktree created but no session binding was applied." : nil)
+            warning: warning
         )
     }
 
@@ -751,6 +758,17 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
 
     func parseBool(_ value: Value?) -> Bool? {
         value?.boolValue
+    }
+
+    private func combinedWarnings(_ warnings: [String?]) -> String? {
+        let parts = warnings.compactMap { warning -> String? in
+            guard let warning = warning?.trimmingCharacters(in: .whitespacesAndNewlines), !warning.isEmpty else {
+                return nil
+            }
+            return warning
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: "\n")
     }
 
     private func standardizedPath(_ path: String) -> String {

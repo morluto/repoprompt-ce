@@ -102,6 +102,11 @@ enum WorkspaceExplicitCatalogFileLookupResult: Equatable {
     case ambiguous
 }
 
+struct WorkspaceDisplayRootRefsSnapshot: Equatable {
+    let visibleRoots: [WorkspaceRootRef]
+    let allRoots: [WorkspaceRootRef]
+}
+
 actor WorkspaceFileContextStore {
     private struct RootState {
         let root: WorkspaceRootRecord
@@ -1938,10 +1943,56 @@ actor WorkspaceFileContextStore {
         workloadClass: ContentReadWorkloadClass = .unspecified
     ) async throws -> String? {
         let state = try state(for: rootID)
-        return try await state.service.loadContent(
-            ofRelativePath: StandardizedPath.relative(relativePath),
-            workloadClass: workloadClass
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.ReadFile.storeReadContentEntered,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(
+                workloadClass: workloadClass.rawValue,
+                rootToken: state.service.diagnosticRootToken.uuidString
+            )
         )
+        let forwardState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue)
+        )
+        do {
+            let content = try await state.service.loadContent(
+                ofRelativePath: StandardizedPath.relative(relativePath),
+                workloadClass: workloadClass
+            )
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait,
+                forwardState,
+                EditFlowPerf.Dimensions(outcome: "returned", workloadClass: workloadClass.rawValue)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.storeReadContentReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: "returned",
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: state.service.diagnosticRootToken.uuidString
+                )
+            )
+            return content
+        } catch {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait,
+                forwardState,
+                EditFlowPerf.Dimensions(outcome: error is CancellationError ? "cancelled" : "error", workloadClass: workloadClass.rawValue)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.storeReadContentReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: error is CancellationError ? "cancelled" : "error",
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: state.service.diagnosticRootToken.uuidString
+                )
+            )
+            throw error
+        }
     }
 
     func readContentWithDate(
@@ -1950,10 +2001,56 @@ actor WorkspaceFileContextStore {
         workloadClass: ContentReadWorkloadClass = .unspecified
     ) async throws -> (content: String?, modificationDate: Date) {
         let state = try state(for: rootID)
-        return try await state.service.loadContentWithDate(
-            ofRelativePath: StandardizedPath.relative(relativePath),
-            workloadClass: workloadClass
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.ReadFile.storeReadContentEntered,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(
+                workloadClass: workloadClass.rawValue,
+                rootToken: state.service.diagnosticRootToken.uuidString
+            )
         )
+        let forwardState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait,
+            EditFlowPerf.Dimensions(workloadClass: workloadClass.rawValue)
+        )
+        do {
+            let loaded = try await state.service.loadContentWithDate(
+                ofRelativePath: StandardizedPath.relative(relativePath),
+                workloadClass: workloadClass
+            )
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait,
+                forwardState,
+                EditFlowPerf.Dimensions(outcome: "returned", workloadClass: workloadClass.rawValue)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.storeReadContentReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: "returned",
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: state.service.diagnosticRootToken.uuidString
+                )
+            )
+            return loaded
+        } catch {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait,
+                forwardState,
+                EditFlowPerf.Dimensions(outcome: error is CancellationError ? "cancelled" : "error", workloadClass: workloadClass.rawValue)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.ReadFile.storeReadContentReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    outcome: error is CancellationError ? "cancelled" : "error",
+                    workloadClass: workloadClass.rawValue,
+                    rootToken: state.service.diagnosticRootToken.uuidString
+                )
+            )
+            throw error
+        }
     }
 
     func fileExistsOnDisk(rootID: UUID, relativePath: String) async throws -> Bool {
@@ -2288,10 +2385,30 @@ actor WorkspaceFileContextStore {
     }
 
     func validateCatalogFileStillPresent(_ file: WorkspaceFileRecord) async -> WorkspaceFileRecord? {
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.Search.contentFreshnessStoreEntered,
+            correlation: lifecycleCorrelation
+        )
+        let validationState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.contentFreshnessValidationStoreActorBody)
+        var outcome = "missing"
+        defer {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.contentFreshnessValidationStoreActorBody,
+                validationState,
+                EditFlowPerf.Dimensions(outcome: outcome)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.contentFreshnessStoreReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(outcome: outcome)
+            )
+        }
         guard let state = rootStatesByID[file.rootID],
               let current = self.file(rootID: file.rootID, relativePath: file.standardizedRelativePath)
         else { return nil }
         if await state.service.regularFileExistsOnDisk(relativePath: current.standardizedRelativePath) {
+            outcome = "current"
             return current
         }
         pruneCatalogFileMissingOnDisk(rootID: file.rootID, relativePath: current.standardizedRelativePath, publishDelta: true)
@@ -2365,12 +2482,18 @@ actor WorkspaceFileContextStore {
     ) -> WorkspaceExplicitCatalogFileLookupResult {
         #if DEBUG || EDIT_FLOW_PERF
             var exactCatalogLookupOutcome = "noCandidate"
+            var exactCatalogLookupRoute = "empty"
             let exactCatalogLookupActorBody = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogLookupActorBody)
             defer {
+                let dimensions = EditFlowPerf.Dimensions(status: exactCatalogLookupRoute, outcome: exactCatalogLookupOutcome)
                 EditFlowPerf.end(
                     EditFlowPerf.Stage.ReadFile.exactCatalogLookupActorBody,
                     exactCatalogLookupActorBody,
-                    EditFlowPerf.Dimensions(outcome: exactCatalogLookupOutcome)
+                    dimensions
+                )
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.ReadFile.exactCatalogLookupResolved,
+                    dimensions
                 )
             }
         #endif
@@ -2379,6 +2502,7 @@ actor WorkspaceFileContextStore {
         guard !trimmed.isEmpty else { return .noCandidate }
         guard !StandardizedPath.containsNUL(trimmed) else {
             #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupRoute = "blocked"
                 exactCatalogLookupOutcome = "blocked"
             #endif
             return .blocked
@@ -2389,6 +2513,9 @@ actor WorkspaceFileContextStore {
         let roots = rootRefs(scope: rootScope)
 
         if standardized.hasPrefix("/") {
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupRoute = "absolute"
+            #endif
             guard let root = roots
                 .filter({ StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) })
                 .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })
@@ -2408,6 +2535,9 @@ actor WorkspaceFileContextStore {
             options: RootAliasOptions(requireRemainder: true)
         ) {
         case let .prefixed(root, _, remainder):
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupRoute = "rootAlias"
+            #endif
             guard let file = file(rootID: root.id, relativePath: remainder) else { return .noCandidate }
             #if DEBUG || EDIT_FLOW_PERF
                 exactCatalogLookupOutcome = "matched"
@@ -2415,6 +2545,7 @@ actor WorkspaceFileContextStore {
             return .matched(file)
         case .ambiguous:
             #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupRoute = "rootAlias"
                 exactCatalogLookupOutcome = "ambiguous"
             #endif
             return .ambiguous
@@ -2422,6 +2553,9 @@ actor WorkspaceFileContextStore {
             break
         }
 
+        #if DEBUG || EDIT_FLOW_PERF
+            exactCatalogLookupRoute = "relative"
+        #endif
         let relativePath = StandardizedPath.relative(standardized)
         guard !relativePath.isEmpty,
               relativePath != "..",
@@ -2919,6 +3053,13 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    func displayRootRefsSnapshot() -> WorkspaceDisplayRootRefsSnapshot {
+        WorkspaceDisplayRootRefsSnapshot(
+            visibleRoots: rootRefs(scope: .visibleWorkspace),
+            allRoots: rootRefs(scope: .allLoaded)
+        )
+    }
+
     func exactPathResolutionIssue(
         for userPath: String,
         kind: WorkspaceExactPathLookupKind,
@@ -3078,8 +3219,14 @@ actor WorkspaceFileContextStore {
             )
         }
 
-        if let lookup = await lookupPath(WorkspacePathLookupRequest(userPath: cleaned, profile: profile, rootScope: rootScope)),
-           let folder = lookup.folder,
+        let generalLookupState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.folderResolutionGeneralLookupFallback)
+        let lookup = await lookupPath(WorkspacePathLookupRequest(userPath: cleaned, profile: profile, rootScope: rootScope))
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.folderResolutionGeneralLookupFallback,
+            generalLookupState,
+            EditFlowPerf.Dimensions(outcome: lookup?.folder == nil ? "noFolder" : "folder")
+        )
+        if let folder = lookup?.folder,
            let root = roots.first(where: { $0.id == folder.rootID })
         {
             return (folder, ClientPathFormatter.displayPath(root: root, relativePath: folder.standardizedRelativePath, visibleRoots: roots), nil)
@@ -3156,6 +3303,8 @@ actor WorkspaceFileContextStore {
     }
 
     private func buildStaticSnapshot(scope: WorkspaceLookupRootScope) -> StaticPathMatchData {
+        let snapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild, snapshotState) }
         let roots = rootsForPathLookup(scope: scope)
         let allowedRootIDs = Set(roots.map(\.id))
         var fileRecords: [String: FileRecord] = [:]

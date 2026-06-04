@@ -21,6 +21,23 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("\"worktree_id\":\"wt_feature\""))
     }
 
+    func testCreateOutputShowsWorktreeIncludeWarning() throws {
+        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "create",
+            worktree: Self.worktreeDTO(),
+            createdWorktree: Self.worktreeDTO(),
+            warning: "\n\n"
+                + ".worktreeinclude copied 1 of 2 eligible file(s); some files were skipped or failed: destination already exists for .env.local\n"
+                + "Worktree created but no session binding was applied."
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("> ⚠️ .worktreeinclude copied 1 of 2 eligible file(s)"), text)
+        XCTAssertTrue(text.contains("destination already exists for .env.local"), text)
+        XCTAssertTrue(text.contains("> Worktree created but no session binding was applied."), text)
+    }
+
     func testBindOutputIncludesPreviousBindingAndNextStepCommands() throws {
         let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "bind",

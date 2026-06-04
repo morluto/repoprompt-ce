@@ -1,3 +1,7 @@
 # Vendored release payloads are maintainer-managed and should stay out of
 # ordinary contributor and agent context.
 Vendor/Sparkle/
+
+# Documentation should remain available to RepoPrompt tooling.
+!docs/
+!docs/**

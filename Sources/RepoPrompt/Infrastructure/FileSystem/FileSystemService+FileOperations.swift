@@ -330,6 +330,11 @@ extension FileSystemService {
     }
 
     func getFileModificationDate(atRelativePath relativePath: String) async throws -> Date {
+        let lookupState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentModificationDateLookup,
+            EditFlowPerf.Dimensions(rootToken: diagnosticRootToken.uuidString)
+        )
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentModificationDateLookup, lookupState) }
         let fullPath = fullPath(forRelativePath: relativePath)
         let attributes = try fm.attributesOfItem(atPath: fullPath)
         return attributes[.modificationDate] as? Date ?? Date()

@@ -27,7 +27,8 @@ enum StoreBackedWorkspaceSearch {
         store: WorkspaceFileContextStore,
         searchService _: WorkspaceSearchService,
         workspaceManager: WorkspaceManagerViewModel?,
-        admissionCoordinator: StoreBackedWorkspaceSearchAdmissionCoordinator = .shared
+        admissionCoordinator: StoreBackedWorkspaceSearchAdmissionCoordinator = .shared,
+        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared
     ) async throws -> SearchResults {
         try await search(
             pattern: pattern,
@@ -47,7 +48,8 @@ enum StoreBackedWorkspaceSearch {
             rootScope: rootScope,
             store: store,
             workspaceManager: workspaceManager,
-            admissionCoordinator: admissionCoordinator
+            admissionCoordinator: admissionCoordinator,
+            contentFetchCoordinator: contentFetchCoordinator
         )
     }
 
@@ -69,7 +71,8 @@ enum StoreBackedWorkspaceSearch {
         rootScope: WorkspaceLookupRootScope = .allLoaded,
         store: WorkspaceFileContextStore,
         workspaceManager: WorkspaceManagerViewModel?,
-        admissionCoordinator: StoreBackedWorkspaceSearchAdmissionCoordinator = .shared
+        admissionCoordinator: StoreBackedWorkspaceSearchAdmissionCoordinator = .shared,
+        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared
     ) async throws -> SearchResults {
         try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
         let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
@@ -91,13 +94,15 @@ enum StoreBackedWorkspaceSearch {
                 fuzzySpaceMatching: fuzzySpaceMatching,
                 allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
                 rootScope: rootScope,
-                store: store
+                store: store,
+                contentFetchCoordinator: contentFetchCoordinator
             )
         }
-        if requiresBroadSearchAdmission(pattern: pattern, mode: mode, paths: paths) {
+        if let admissionClass = broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths) {
             return try await admissionCoordinator.withBroadSearchPermit(
                 for: store,
                 searchMode: effectiveMode,
+                admissionClass: admissionClass,
                 operation: operation
             )
         }
@@ -109,12 +114,27 @@ enum StoreBackedWorkspaceSearch {
         mode: SearchMode,
         paths: [String]?
     ) -> Bool {
+        broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths) != nil
+    }
+
+    static func broadSearchAdmissionClass(
+        pattern: String,
+        mode: SearchMode,
+        paths: [String]?
+    ) -> BroadSearchAdmissionClass? {
         let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
-        let isContentCapable = effectiveMode == .content || effectiveMode == .both
         let hasExplicitScope = paths?.contains {
             !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         } == true
-        return isContentCapable && !hasExplicitScope
+        guard !hasExplicitScope else { return nil }
+        switch effectiveMode {
+        case .content:
+            return .unscopedContent
+        case .both:
+            return .unscopedBoth
+        case .auto, .path:
+            return nil
+        }
     }
 
     private static func performSearch(
@@ -134,9 +154,12 @@ enum StoreBackedWorkspaceSearch {
         fuzzySpaceMatching: Bool,
         allowLiteralUnescapeFallback: Bool,
         rootScope: WorkspaceLookupRootScope,
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator
     ) async throws -> SearchResults {
+        let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
         _ = await store.awaitAppliedIngress(rootScope: rootScope)
+        EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
 
         let entryPerfState = EditFlowPerf.begin(
             EditFlowPerf.Stage.Search.entrypoint,
@@ -233,6 +256,7 @@ enum StoreBackedWorkspaceSearch {
             ? .validateDiskMetadata
             : .cachedMetadata
         let aliasByRootPath = pathSearchAliasByRootPath(roots: visibleRootRecords)
+        let searchID = UUID()
         var wasAutoCorrected: Bool? = nil
         var results: SearchResults
         do {
@@ -269,6 +293,8 @@ enum StoreBackedWorkspaceSearch {
                     in: filesToSearch,
                     rootsByID: rootsByID,
                     store: store,
+                    contentFetchCoordinator: contentFetchCoordinator,
+                    searchID: searchID,
                     aliasByRootPath: aliasByRootPath
                 )
             }

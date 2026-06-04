@@ -42,6 +42,26 @@ extension FileSystemService {
     }
 
     public func regularFileExistsOnDisk(relativePath rawRelativePath: String) -> Bool {
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.Search.contentFreshnessRootEntered,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(rootToken: diagnosticRootToken.uuidString)
+        )
+        let validationState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.contentFreshnessValidationRootActorBody)
+        var outcome = "missing"
+        defer {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Search.contentFreshnessValidationRootActorBody,
+                validationState,
+                EditFlowPerf.Dimensions(outcome: outcome, rootToken: diagnosticRootToken.uuidString)
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.contentFreshnessRootReturned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(outcome: outcome, rootToken: diagnosticRootToken.uuidString)
+            )
+        }
         let relativePath = (rawRelativePath as NSString).standardizingPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !relativePath.isEmpty, !relativePath.hasPrefix("../"), relativePath != ".." else { return false }
         let absolutePath = fullPath(forRelativePath: relativePath)
@@ -56,6 +76,7 @@ extension FileSystemService {
             if values.isRegularFile == false { return false }
         }
         if skipSymlinks, pathContainsSymlinkComponent(relativePath: relativePath) { return false }
+        outcome = "current"
         return true
     }
 

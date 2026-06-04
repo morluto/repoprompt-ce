@@ -569,11 +569,18 @@ actor BootstrapSocketServer {
             let handshakeSocket = BootstrapHandshakeSocket(fd: clientFD)
             let generation = listenerGeneration
             inFlightHandshakeSockets[handshakeID] = handshakeSocket
+            let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Bootstrap.socketAccepted,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
+            )
             Task {
                 await self.handleNewConnectionWithBackpressure(
                     handshakeID: handshakeID,
                     handshakeSocket: handshakeSocket,
-                    generation: generation
+                    generation: generation,
+                    lifecycleCorrelation: lifecycleCorrelation
                 )
             }
         }
@@ -648,7 +655,8 @@ actor BootstrapSocketServer {
     private func handleNewConnectionWithBackpressure(
         handshakeID: UUID,
         handshakeSocket: BootstrapHandshakeSocket,
-        generation: UInt64
+        generation: UInt64,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) async {
         defer {
             handshakeSocket.shutdownAndCloseIfServerOwned()
@@ -658,11 +666,23 @@ actor BootstrapSocketServer {
                 resumeAcceptSourceIfNeeded()
             }
         }
-        await handleNewConnection(
-            handshakeID: handshakeID,
-            handshakeSocket: handshakeSocket,
-            generation: generation
-        )
+        if let lifecycleCorrelation {
+            await EditFlowPerf.$currentLifecycleCorrelation.withValue(lifecycleCorrelation) {
+                await handleNewConnection(
+                    handshakeID: handshakeID,
+                    handshakeSocket: handshakeSocket,
+                    generation: generation,
+                    lifecycleCorrelation: lifecycleCorrelation
+                )
+            }
+        } else {
+            await handleNewConnection(
+                handshakeID: handshakeID,
+                handshakeSocket: handshakeSocket,
+                generation: generation,
+                lifecycleCorrelation: nil
+            )
+        }
     }
 
     private func isActiveHandshake(_ handshakeSocket: BootstrapHandshakeSocket, generation: UInt64) -> Bool {
@@ -678,7 +698,8 @@ actor BootstrapSocketServer {
     private func handleNewConnection(
         handshakeID: UUID,
         handshakeSocket: BootstrapHandshakeSocket,
-        generation: UInt64
+        generation: UInt64,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) async {
         let clientFD = handshakeSocket.fd
         bootstrapSocketServerLog("BootstrapSocketServer: new connection on fd \(clientFD)")
@@ -693,7 +714,10 @@ actor BootstrapSocketServer {
         setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
 
         // Read handshake request (with timeout)
-        guard let request = await readHandshakeRequestAsync(from: handshakeSocket) else {
+        guard let request = await readHandshakeRequestAsync(
+            from: handshakeSocket,
+            lifecycleCorrelation: lifecycleCorrelation
+        ) else {
             if isActiveHandshake(handshakeSocket, generation: generation) {
                 logger.warning("BootstrapSocketServer: failed to read handshake from fd \(clientFD)")
             }
@@ -725,7 +749,32 @@ actor BootstrapSocketServer {
         }
 
         bootstrapSocketServerLog("BootstrapSocketServer: invoking handler for '\(request.clientName ?? "unknown")'...")
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.Bootstrap.admissionBegan,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
+        )
+        let admissionState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.Bootstrap.admission,
+            EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
+        )
         let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName)
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Bootstrap.admission,
+            admissionState,
+            EditFlowPerf.Dimensions(
+                outcome: admission.accepted ? "accepted" : "rejected",
+                activeCount: inFlightHandshakeSockets.count
+            )
+        )
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.Bootstrap.admissionEnded,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(
+                outcome: admission.accepted ? "accepted" : "rejected",
+                activeCount: inFlightHandshakeSockets.count
+            )
+        )
         bootstrapSocketServerLog("BootstrapSocketServer: handler returned accepted=\(admission.accepted) for '\(request.clientName ?? "unknown")'")
 
         guard isActiveHandshake(handshakeSocket, generation: generation) else {
@@ -751,6 +800,11 @@ actor BootstrapSocketServer {
                 return
             }
             bootstrapSocketServerLog("BootstrapSocketServer: accepted connection from '\(request.clientName ?? "unknown")'")
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Bootstrap.acceptedResponseSent,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
+            )
 
             // NOW it's safe to transfer ownership and start the MCP server. The CLI
             // has received "accepted". Handshake ownership and full-shutdown-visible
@@ -762,6 +816,11 @@ actor BootstrapSocketServer {
                 return
             }
             inFlightHandshakeSockets.removeValue(forKey: handshakeID)
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Bootstrap.ownershipTransferred,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
+            )
             if inFlightHandshakeSockets.count < maxInFlightHandshakes {
                 resumeAcceptSourceIfNeeded()
             }
@@ -777,12 +836,46 @@ actor BootstrapSocketServer {
 
     /// Reads the handshake request from the client socket.
     /// Format: newline-delimited JSON (same as MCP protocol)
-    private func readHandshakeRequestAsync(from handshakeSocket: BootstrapHandshakeSocket) async -> MCPBootstrapRequest? {
-        await withCheckedContinuation { continuation in
+    private func readHandshakeRequestAsync(
+        from handshakeSocket: BootstrapHandshakeSocket,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
+    ) async -> MCPBootstrapRequest? {
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.Bootstrap.handshakeIOQueued,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
+        )
+        let queueEnvelopeState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.Bootstrap.handshakeIOQueueEnvelope,
+            EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
+        )
+        let request = await withCheckedContinuation { continuation in
             handshakeIOQueue.async {
-                continuation.resume(returning: Self.readHandshakeRequestBlocking(from: handshakeSocket))
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.Bootstrap.handshakeIOBegan,
+                    correlation: lifecycleCorrelation
+                )
+                let blockingReadState = EditFlowPerf.begin(EditFlowPerf.Stage.Bootstrap.handshakeIOBlockingRead)
+                let request = Self.readHandshakeRequestBlocking(from: handshakeSocket)
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.Bootstrap.handshakeIOBlockingRead,
+                    blockingReadState,
+                    EditFlowPerf.Dimensions(outcome: request == nil ? "failed" : "completed")
+                )
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.Bootstrap.handshakeIOEnded,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(outcome: request == nil ? "failed" : "completed")
+                )
+                continuation.resume(returning: request)
             }
         }
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Bootstrap.handshakeIOQueueEnvelope,
+            queueEnvelopeState,
+            EditFlowPerf.Dimensions(outcome: request == nil ? "failed" : "completed")
+        )
+        return request
     }
 
     private nonisolated static func readHandshakeRequestBlocking(from handshakeSocket: BootstrapHandshakeSocket) -> MCPBootstrapRequest? {

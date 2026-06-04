@@ -3246,11 +3246,31 @@ actor ServerNetworkManager {
         manager: BootstrapSocketConnectionManager
     ) {
         // Spawn the MCP server task - this runs after CLI has received "accepted"
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
         connectionTasks[connectionID] = Task {
+            let startupState = EditFlowPerf.begin(EditFlowPerf.Stage.Bootstrap.postAcceptStartup)
+            var startupOutcome = "cancelled"
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Bootstrap.postAcceptStartupBegan,
+                correlation: lifecycleCorrelation
+            )
             defer {
                 self.connectionTasks.removeValue(forKey: connectionID)
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.Bootstrap.postAcceptStartup,
+                    startupState,
+                    EditFlowPerf.Dimensions(outcome: startupOutcome)
+                )
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.Bootstrap.postAcceptStartupEnded,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(outcome: startupOutcome)
+                )
             }
-            guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
+            guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else {
+                startupOutcome = "stale"
+                return
+            }
             do {
                 guard let approvalHandler = self.connectionApprovalHandler else {
                     log.error("No connection approval handler set, rejecting bootstrap connection")
@@ -3355,8 +3375,10 @@ actor ServerNetworkManager {
                     self.identityContextByConnection[connectionID] = ctx
                 }
                 self.emitDashboardUpdate()
+                startupOutcome = "started"
 
             } catch {
+                startupOutcome = error is CancellationError ? "cancelled" : "error"
                 log.error("Bootstrap connection \(connectionID) start failed: \(error)")
                 guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                 await removeConnection(connectionID)
@@ -7283,9 +7305,51 @@ actor ServerNetworkManager {
                                     }
                                 }
 
-                                // ────────────────────────────────────────────────────────
-                                // Tool dispatch with window filtering
-                                // ────────────────────────────────────────────────────────
+                                @Sendable func dispatchResolvedProvider(_ operation: @Sendable () async throws -> Value) async throws -> Value {
+                                    EditFlowPerf.lifecycleEvent(
+                                        EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderBegan,
+                                        correlation: lifecycleCorrelation,
+                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                    )
+                                    do {
+                                        let value = try await EditFlowPerf.measure(
+                                            EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                            EditFlowPerf.Dimensions(toolName: toolName),
+                                            operation: operation
+                                        )
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
+                                        )
+                                        return value
+                                    } catch {
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(
+                                                toolName: toolName,
+                                                outcome: error is CancellationError ? "cancelled" : "error"
+                                            )
+                                        )
+                                        throw error
+                                    }
+                                }
+
+                                @Sendable func handlerResult(_ result: CallTool.Result, outcome: String) -> CallTool.Result {
+                                    EditFlowPerf.lifecycleEvent(
+                                        EditFlowPerf.Lifecycle.MCPToolCall.handlerResultReady,
+                                        correlation: lifecycleCorrelation,
+                                        EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
+                                    )
+                                    return EditFlowPerf.measure(
+                                        EditFlowPerf.Stage.MCPToolCall.handlerResultHandoff,
+                                        EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
+                                    ) {
+                                        result
+                                    }
+                                }
+
                                 let serviceToolLookupState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.serviceToolLookup,
                                     EditFlowPerf.Dimensions(toolName: toolName)
@@ -7381,7 +7445,9 @@ actor ServerNetworkManager {
                                                     EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                     EditFlowPerf.Dimensions(toolName: toolName)
                                                 ) {
-                                                    try await toolDef.callAsFunction(effectiveArgs)
+                                                    try await dispatchResolvedProvider {
+                                                        try await toolDef.callAsFunction(effectiveArgs)
+                                                    }
                                                 }
                                                 let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                     EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
@@ -7400,6 +7466,10 @@ actor ServerNetworkManager {
                                                         value: value
                                                     )
                                                 }
+                                                EditFlowPerf.lifecycleEvent(
+                                                    EditFlowPerf.Lifecycle.MCPToolCall.formatResultReturned,
+                                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                                )
 
                                                 // Fire completion observer with result for detailed UI rendering
                                                 await EditFlowPerf.measure(
@@ -7407,8 +7477,18 @@ actor ServerNetworkManager {
                                                     EditFlowPerf.Dimensions(toolName: toolName)
                                                 ) {
                                                     if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped success") {
-                                                        let resultJSON = ToolOutputFormatter.rawJSONString(value)
-                                                        let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                        let resultJSON = EditFlowPerf.measure(
+                                                            EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
+                                                            EditFlowPerf.Dimensions(toolName: toolName)
+                                                        ) {
+                                                            ToolOutputFormatter.rawJSONString(value)
+                                                        }
+                                                        let eventObserverCount = await EditFlowPerf.measure(
+                                                            EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
+                                                            EditFlowPerf.Dimensions(toolName: toolName)
+                                                        ) {
+                                                            await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                        }
                                                         #if DEBUG
                                                             if toolName == "agent_run" {
                                                                 print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=false resultChars=\(resultJSON.count)")
@@ -7426,7 +7506,10 @@ actor ServerNetworkManager {
                                                 // when the run completes. This prevents killing the host MCP client
                                                 // (e.g., Claude Desktop) that invoked context_builder.
 
-                                                return CallTool.Result(content: contentBlocks, isError: false)
+                                                return handlerResult(
+                                                    CallTool.Result(content: contentBlocks, isError: false),
+                                                    outcome: "success"
+                                                )
                                             }
                                         } catch {
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -7440,8 +7523,18 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
                                                 if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped error") {
-                                                    let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
-                                                    let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
+                                                    let errorJSON = EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    ) {
+                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
+                                                    }
+                                                    let eventObserverCount = await EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    ) {
+                                                        await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
+                                                    }
                                                     #if DEBUG
                                                         if toolName == "agent_run" {
                                                             print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
@@ -7453,7 +7546,10 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
-                                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
+                                            return handlerResult(
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
+                                                outcome: "dispatchError"
+                                            )
                                         }
                                     } else {
                                         // Not window-scoped → no ownership tracking needed
@@ -7462,7 +7558,9 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
-                                                try await toolDef.callAsFunction(effectiveArgs)
+                                                try await dispatchResolvedProvider {
+                                                    try await toolDef.callAsFunction(effectiveArgs)
+                                                }
                                             }
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
@@ -7481,6 +7579,10 @@ actor ServerNetworkManager {
                                                     value: value
                                                 )
                                             }
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.formatResultReturned,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            )
 
                                             // Fire completion observer with result for detailed UI rendering
                                             await EditFlowPerf.measure(
@@ -7488,8 +7590,18 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
                                                 if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global success") {
-                                                    let resultJSON = ToolOutputFormatter.rawJSONString(value)
-                                                    let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                    let resultJSON = EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    ) {
+                                                        ToolOutputFormatter.rawJSONString(value)
+                                                    }
+                                                    let eventObserverCount = await EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    ) {
+                                                        await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                    }
                                                     #if DEBUG
                                                         if toolName == "agent_run" {
                                                             print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=false resultChars=\(resultJSON.count)")
@@ -7505,7 +7617,10 @@ actor ServerNetworkManager {
                                             // Note: context_builder caller termination is NOT done here.
                                             // See comment in window-scoped branch above.
 
-                                            return CallTool.Result(content: contentBlocks, isError: false)
+                                            return handlerResult(
+                                                CallTool.Result(content: contentBlocks, isError: false),
+                                                outcome: "success"
+                                            )
                                         } catch {
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
@@ -7518,8 +7633,18 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
                                                 if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global error") {
-                                                    let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
-                                                    let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
+                                                    let errorJSON = EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    ) {
+                                                        ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
+                                                    }
+                                                    let eventObserverCount = await EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
+                                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                                    ) {
+                                                        await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
+                                                    }
                                                     #if DEBUG
                                                         if toolName == "agent_run" {
                                                             print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
@@ -7531,7 +7656,10 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
-                                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
+                                            return handlerResult(
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
+                                                outcome: "dispatchError"
+                                            )
                                         }
                                     }
                                 }
@@ -7547,16 +7675,26 @@ actor ServerNetworkManager {
                                     EditFlowPerf.Stage.MCPToolCall.completionObservers,
                                     EditFlowPerf.Dimensions(toolName: toolName)
                                 ) {
-                                    let finalToolNotFoundErrorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(toolName)"), "tool": .string(toolName)]))
+                                    let finalToolNotFoundErrorJSON = EditFlowPerf.measure(
+                                        EditFlowPerf.Stage.MCPToolCall.completionObserverResultEncoding,
+                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                    ) {
+                                        ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(toolName)"), "tool": .string(toolName)]))
+                                    }
                                     if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "final tool-not-found fallthrough") {
-                                        let eventObserverCount = await self.fireToolCompletedObservers(
-                                            runID: runID,
-                                            invocationID: invocationID,
-                                            toolName: toolName,
-                                            args: capturedArguments,
-                                            resultJSON: finalToolNotFoundErrorJSON,
-                                            isError: true
-                                        )
+                                        let eventObserverCount = await EditFlowPerf.measure(
+                                            EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
+                                            EditFlowPerf.Dimensions(toolName: toolName)
+                                        ) {
+                                            await self.fireToolCompletedObservers(
+                                                runID: runID,
+                                                invocationID: invocationID,
+                                                toolName: toolName,
+                                                args: capturedArguments,
+                                                resultJSON: finalToolNotFoundErrorJSON,
+                                                isError: true
+                                            )
+                                        }
                                         mcpToolTrackingDiagnostic(
                                             "MCP observer completion final tool-not-found fallthrough conn=\(connectionID.uuidString) " +
                                                 "runID=\(runID.uuidString) tool=\(toolName) invocation=\(invocationID.uuidString) " +
@@ -7569,7 +7707,10 @@ actor ServerNetworkManager {
                                     EditFlowPerf.Dimensions(toolName: toolName, status: "toolNotFound")
                                 )
                                 log.error("Tool not found: \(toolName)")
-                                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)")
+                                return handlerResult(
+                                    Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)"),
+                                    outcome: "toolNotFound"
+                                )
                             } // TabContextHint TaskLocal wrapper
                         } // ConnectionID + LifecycleCorrelation TaskLocal wrapper
                     } // PermitBodyEnvelope wrapper

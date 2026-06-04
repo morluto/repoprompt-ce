@@ -43,6 +43,7 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
         XCTAssertEqual(plan.createRequest.mainWorktreeRoot, mainRoot.standardizedFileURL)
         XCTAssertEqual(plan.createRequest.appManagedContainer, expectedContainer)
         XCTAssertFalse(plan.createRequest.allowExternalPath)
+        XCTAssertTrue(plan.createRequest.copyWorktreeIncludeFiles)
     }
 
     func testAgentStartDefaultsToAgentBranchAndReadablePathPrefix() throws {
@@ -90,6 +91,7 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
             purpose: .standaloneCreate(now: Date(timeIntervalSince1970: 0))
         ))
         XCTAssertEqual(allowed.path, externalPath.standardizedFileURL)
+        XCTAssertFalse(allowed.createRequest.copyWorktreeIncludeFiles)
     }
 
     func testRejectsRelativeExplicitPathAndExpandsHomePath() throws {
@@ -132,6 +134,7 @@ final class GitWorktreeDefaultPathPlannerTests: XCTestCase {
         ))
 
         XCTAssertEqual(plan.path, managedPath.standardizedFileURL)
+        XCTAssertTrue(plan.createRequest.copyWorktreeIncludeFiles)
     }
 
     func testRejectsExplicitPathInsideRepoOrGitDirectory() throws {
