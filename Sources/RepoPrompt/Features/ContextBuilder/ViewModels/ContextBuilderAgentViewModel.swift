@@ -95,6 +95,12 @@ enum ContextBuilderFollowUpType: String, CaseIterable, Codable {
 
 @MainActor
 final class ContextBuilderAgentViewModel: ObservableObject {
+    typealias ProviderFactory = (
+        _ agent: AgentProviderKind,
+        _ modelString: String?,
+        _ workspacePath: String?
+    ) -> HeadlessAgentProvider
+
     private func debugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
             if AgentRuntimeProviderService.enableDebugLogging {
@@ -387,6 +393,28 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Owns active and terminal-cleanup Context Builder attempts.
     private let runRegistry = ContextBuilderRunRegistry()
+
+    #if DEBUG
+        struct RunTestHooks {
+            let beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?
+            let providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?
+            let teardownCompleted: ((_ runID: UUID) -> Void)?
+        }
+
+        private var runTestHooks: RunTestHooks?
+
+        func installRunTestHooks(_ hooks: RunTestHooks?) {
+            runTestHooks = hooks
+        }
+
+        func activeRunIDForTesting(tabID: UUID) -> UUID? {
+            runRegistry.activeRecord(tabID: tabID)?.runID
+        }
+
+        func isRunTeardownPendingForTesting(runID: UUID) -> Bool {
+            runRegistry.record(runID: runID)?.isTeardownPending == true
+        }
+    #endif
 
     // MARK: - Published session-scoped proxies
 
@@ -748,6 +776,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private let promptManager: PromptViewModel
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private let mcpServer: MCPServerViewModel
+    private let providerFactory: ProviderFactory
     /// Chat VM used for headless plan generation from discovery.
     /// Weak to avoid accidental strong cycles with the view layer.
     private weak var oracleViewModel: OracleViewModel?
@@ -779,12 +808,20 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         promptManager: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
-        oracleViewModel: OracleViewModel
+        oracleViewModel: OracleViewModel,
+        providerFactory: ProviderFactory? = nil
     ) {
         self.promptManager = promptManager
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
         self.oracleViewModel = oracleViewModel
+        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath in
+            AgentRuntimeProviderService.shared.makeProvider(
+                for: agent,
+                modelString: modelString,
+                workspacePath: workspacePath
+            )
+        }
         refreshAvailableAgents()
 
         handleWorkspaceSwitch(workspaceManager.activeWorkspace)
@@ -1876,6 +1913,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             if runRegistry.removeAfterTeardown(record) {
                 #if DEBUG
                     AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
+                    runTestHooks?.teardownCompleted?(record.runID)
                 #endif
             }
         }
@@ -2064,11 +2102,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
             activeAgentRuns.insert(runID)
             let modelString = record.modelRaw == AgentModel.defaultModel.rawValue ? nil : record.modelRaw
-            let provider = AgentRuntimeProviderService.shared.makeProvider(
-                for: record.agentKind,
-                modelString: modelString,
-                workspacePath: currentWorkspacePath
-            )
+            let provider = providerFactory(record.agentKind, modelString, currentWorkspacePath)
             guard record.installProvider(provider) else {
                 await provider.dispose()
                 await lease.failAndCleanup()
@@ -2086,7 +2120,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 debugLog("System prompt length: \(message.systemPrompt.count)")
                 debugLog("User message length: \(message.userMessage.count)")
                 let stream = try await provider.streamAgentMessage(message, runID: runID)
-                guard acceptsEvents(from: record) else {
+                guard !Task.isCancelled, acceptsEvents(from: record) else {
                     await lease.failAndCleanup()
                     return .cancelled
                 }
@@ -2116,48 +2150,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 )
                 updateRuntimeBindings(from: session)
 
-                do {
-                    for try await result in stream {
-                        guard !Task.isCancelled, acceptsEvents(from: record) else {
-                            return .cancelled
-                        }
-                        if case .rejected = session.recordRunProgress(
-                            ownership: record.ownership,
-                            kind: .providerEvent,
-                            stage: .running
-                        ) {
-                            return .cancelled
-                        }
-
-                        debugLog("Received stream result type: \(result.type)")
-                        if result.type == "content" {
-                            if record.output.append(result.text ?? "", messageID: result.contentMessageID) {
-                                noteAssistantPreviewChanged(for: record)
-                            }
-                            continue
-                        }
-
-                        if result.type == "final_content" {
-                            if let finalContent = result.text,
-                               record.output.replace(with: finalContent)
-                            {
-                                noteAssistantPreviewChanged(for: record)
-                            }
-                            continue
-                        }
-
-                        flushAssistantPreview(for: record)
-                        if let mapping = mapStreamResultToLogEntry(result),
-                           session.appendLogEntry(mapping.entry, dedupeKey: mapping.dedupeKey)
-                        {
-                            updateAgentLogBinding(from: session)
-                        }
-                    }
-                } catch is CancellationError {
-                    return .cancelled
-                } catch {
-                    guard acceptsEvents(from: record) else { return .cancelled }
-                    return .failed(extractVerboseErrorMessage(from: error))
+                let streamOutcome = await consumeContextBuilderProviderStream(
+                    stream,
+                    record: record
+                )
+                guard streamOutcome == .completed else {
+                    return streamOutcome
                 }
             } catch is CancellationError {
                 await lease.failAndCleanup()
@@ -2173,6 +2171,77 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard committed, acceptsEvents(from: record) else { return .cancelled }
             return .completed
         }
+    }
+
+    private func consumeContextBuilderProviderStream(
+        _ stream: AsyncThrowingStream<AIStreamResult, Error>,
+        record: ContextBuilderRunRecord
+    ) async -> ContextBuilderRunTerminalOutcome {
+        let session = record.session
+
+        do {
+            for try await result in stream {
+                #if DEBUG
+                    await runTestHooks?.beforeProcessingProviderEvent?(result, record.runID)
+                #endif
+                guard !Task.isCancelled, acceptsEvents(from: record) else {
+                    #if DEBUG
+                        runTestHooks?.providerEventDisposition?(result, record.runID, false)
+                    #endif
+                    return .cancelled
+                }
+                if case .rejected = session.recordRunProgress(
+                    ownership: record.ownership,
+                    kind: .providerEvent,
+                    stage: .running
+                ) {
+                    #if DEBUG
+                        runTestHooks?.providerEventDisposition?(result, record.runID, false)
+                    #endif
+                    return .cancelled
+                }
+
+                debugLog("Received stream result type: \(result.type)")
+                if result.type == "content" {
+                    if record.output.append(result.text ?? "", messageID: result.contentMessageID) {
+                        noteAssistantPreviewChanged(for: record)
+                    }
+                    #if DEBUG
+                        runTestHooks?.providerEventDisposition?(result, record.runID, true)
+                    #endif
+                    continue
+                }
+
+                if result.type == "final_content" {
+                    if let finalContent = result.text,
+                       record.output.replace(with: finalContent)
+                    {
+                        noteAssistantPreviewChanged(for: record)
+                    }
+                    #if DEBUG
+                        runTestHooks?.providerEventDisposition?(result, record.runID, true)
+                    #endif
+                    continue
+                }
+
+                flushAssistantPreview(for: record)
+                if let mapping = mapStreamResultToLogEntry(result),
+                   session.appendLogEntry(mapping.entry, dedupeKey: mapping.dedupeKey)
+                {
+                    updateAgentLogBinding(from: session)
+                }
+                #if DEBUG
+                    runTestHooks?.providerEventDisposition?(result, record.runID, true)
+                #endif
+            }
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            guard acceptsEvents(from: record) else { return .cancelled }
+            return .failed(extractVerboseErrorMessage(from: error))
+        }
+
+        return .completed
     }
 
     func cancelAgentRun() async {

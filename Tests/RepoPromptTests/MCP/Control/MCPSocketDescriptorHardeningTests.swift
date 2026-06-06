@@ -562,7 +562,65 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         XCTAssertTrue(transport.contains("POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)"))
     }
 
-    func testNonImportableCLITransportRetainsPendingReaderUntilDelayedFinalClose() throws {
+    func testAppAndCLIReadersShareFairOneShotTerminalCancellationLifecycle() throws {
+        let root = try RepoRoot.url()
+        let appReader = try Self.sourceText(
+            "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
+            relativeTo: root
+        )
+        let cliReader = try Self.sourceText(
+            "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift",
+            relativeTo: root
+        )
+
+        XCTAssertEqual(appReader, cliReader)
+        Self.assertSourceContains(
+            [
+                "public enum NewlineDelimitedSocketReaderTerminal: @unchecked Sendable",
+                "onTerminal: @escaping (NewlineDelimitedSocketReaderTerminal) -> Void",
+                "onEOF: { onTerminal(.eof(hasResidualData: $0)) }",
+                "onError: { onTerminal(.error($0)) }",
+                "private enum Lifecycle: Equatable",
+                "private var generation: UInt64 = 0",
+                "private var pendingCancelledSources: [ObjectIdentifier: ReadEventSource] = [:]",
+                "finishTerminalOnQueue(.failure(posixError), generation: pumpGeneration)",
+                "finishTerminalOnQueue(.success(!buffer.isEmpty), generation: pumpGeneration)",
+                "guard terminalGeneration == generation, lifecycle == .running else { return }",
+                "cancelCurrentSourceOnQueue()",
+                "guard pendingCancelledSources.removeValue(forKey: sourceID) != nil else { return }"
+            ],
+            in: appReader
+        )
+    }
+
+    func testAppTransportReplacesTerminalInboundChannelsBeforeReconnect() throws {
+        let root = try RepoRoot.url()
+        let transport = try Self.sourceText(
+            "Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift",
+            relativeTo: root
+        )
+
+        Self.assertSourceContains(
+            [
+                "private struct InboundChannel {",
+                "private struct CloseChannel {",
+                "private let receiveBufferCapacity: Int",
+                "private var inboundChannel: InboundChannel",
+                "private var closeChannel: CloseChannel",
+                "prepareForConnectionAttempt()",
+                "if streamFinished || closeSignaled {",
+                "inboundChannel = InboundChannel(capacity: receiveBufferCapacity)",
+                "closeChannel = CloseChannel()",
+                "let inboundChannel = inboundChannel",
+                "inboundChannel.gate.offer(frame, to: inboundChannel.continuation)",
+                "inboundChannel.continuation.finish",
+                "closeChannel.continuation.finish()"
+            ],
+            in: transport
+        )
+    }
+
+    func testNonImportableCLITransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce() throws {
         let root = try RepoRoot.url()
         let transport = try Self.sourceText(
             "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
@@ -571,13 +629,27 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
         Self.assertSourceContains(
             [
+                "private struct ReaderIdentity: Hashable {",
+                "private struct ActiveReaderOwnership {",
                 "private struct PendingReaderCancellation {",
                 "let reader: NewlineDelimitedSocketReader",
                 "let transportRetainer: BootstrapSocketMCPTransport",
+                "private var activeReaderOwnership: ActiveReaderOwnership?",
                 "private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]",
-                "pendingReaderCancellations[token] = PendingReaderCancellation(",
+                "private var earlyReaderCancellations: Set<ReaderIdentity> = []",
+                "activeReaderOwnership = ActiveReaderOwnership(identity: identity, reader: newReader)",
+                "activeReaderOwnership = nil\n\n        let identity = activeOwnership.identity",
+                "pendingReaderCancellations[identity.token] = PendingReaderCancellation(",
                 "transportRetainer: self",
-                "guard let ownership = pendingReaderCancellations.removeValue(forKey: token) else { return }",
+                "activeOwnership.reader.stop()",
+                "if earlyReaderCancellations.contains(identity) {\n            finalizeReaderCancellation(identity)",
+                "if pendingReaderCancellations[identity.token]?.identity == identity {",
+                "if activeReaderOwnership?.identity == identity {\n            earlyReaderCancellations.insert(identity)",
+                "let ownership = pendingReaderCancellations.removeValue(forKey: identity.token)",
+                "earlyReaderCancellations.remove(identity)",
+                "withExtendedLifetime(ownership) {",
+                "Task { await transport.handleReaderTerminal(terminal, from: identity) }",
+                "guard activeReaderOwnership?.identity == identity else {",
                 "if !pendingReaderCancellationOwnsCurrentSocket() {",
                 "closeSocketIfNeeded()"
             ],
@@ -585,8 +657,16 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         )
 
         XCTAssertTrue(
-            transport.contains("onCancel: { [weak self] in\n                Task { await self?.readSourceDidCancel(fd: fd, token: token) }"),
-            "Delayed DispatchSource cancellation must route through the tokenized final-close handler."
+            transport.contains(
+                "onTerminal: { [weak self] terminal in\n                guard let transport = self else { return }"
+            ),
+            "Reader terminal delivery must avoid a permanent reader/transport cycle."
+        )
+        XCTAssertTrue(
+            transport.contains(
+                "transport.scheduleReaderCancellationCallback {\n                    Task { await transport.readSourceDidCancel(identity) }"
+            ),
+            "Cancellation delivery must strongly retain the transport until the actor claims the identity."
         )
     }
 

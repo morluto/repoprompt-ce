@@ -8400,6 +8400,24 @@ actor ServerNetworkManager {
         return await limiter.activeCount() > 0
     }
 
+    #if DEBUG
+        func connectionLimiterSnapshotForTesting(
+            connectionID: UUID
+        ) async -> AsyncLimiter.DebugSnapshot? {
+            guard let limiter = callLimiters[connectionID] else { return nil }
+            return await limiter.debugSnapshot()
+        }
+
+        func setConnectionLimiterStateObserverForTesting(
+            connectionID: UUID,
+            observer: ((AsyncLimiter.DebugSnapshot) -> Void)?
+        ) async -> Bool {
+            guard let limiter = callLimiters[connectionID] else { return false }
+            await limiter.setDebugStateObserver(observer)
+            return true
+        }
+    #endif
+
     private func oldestEvictableConnectionID() async -> UUID? {
         let threshold = pressureEvictIdleSeconds
         guard threshold > 0 else { return nil }
@@ -8587,6 +8605,16 @@ actor AsyncLimiter {
     /// Tracks the number of tasks currently inside withPermit (including queued ones)
     private var inFlight: Int = 0
 
+    #if DEBUG
+        struct DebugSnapshot: Equatable {
+            let permits: Int
+            let waiterCount: Int
+            let inFlight: Int
+        }
+
+        private var debugStateObserver: ((DebugSnapshot) -> Void)?
+    #endif
+
     init(limit: Int) {
         self.limit = max(1, limit)
         permits = max(1, limit)
@@ -8596,9 +8624,13 @@ actor AsyncLimiter {
     private func acquirePermit() async {
         if permits > 0 {
             permits -= 1
+            notifyDebugStateChanged()
             return
         }
-        await withCheckedContinuation { waiters.append($0) }
+        await withCheckedContinuation {
+            waiters.append($0)
+            notifyDebugStateChanged()
+        }
         // When resumed, the caller now has a permit (recycled from a release)
     }
 
@@ -8611,6 +8643,7 @@ actor AsyncLimiter {
         } else {
             permits = min(permits + 1, limit)
         }
+        notifyDebugStateChanged()
     }
 
     /// Number of in-flight operations (0 means idle).
@@ -8619,12 +8652,43 @@ actor AsyncLimiter {
         inFlight
     }
 
+    #if DEBUG
+        func debugSnapshot() -> DebugSnapshot {
+            makeDebugSnapshot()
+        }
+
+        func setDebugStateObserver(
+            _ observer: ((DebugSnapshot) -> Void)?
+        ) {
+            debugStateObserver = observer
+            observer?(makeDebugSnapshot())
+        }
+
+        private func makeDebugSnapshot() -> DebugSnapshot {
+            DebugSnapshot(
+                permits: permits,
+                waiterCount: waiters.count,
+                inFlight: inFlight
+            )
+        }
+
+        private func notifyDebugStateChanged() {
+            debugStateObserver?(makeDebugSnapshot())
+        }
+    #else
+        private func notifyDebugStateChanged() {}
+    #endif
+
     /// Executes an operation with a permit, limiting concurrency.
     func withPermit<T>(
         _ op: @Sendable () async throws -> T
     ) async rethrows -> T {
         inFlight += 1
-        defer { inFlight -= 1 }
+        notifyDebugStateChanged()
+        defer {
+            inFlight -= 1
+            notifyDebugStateChanged()
+        }
         await acquirePermit()
         defer { releasePermit() }
         return try await op()

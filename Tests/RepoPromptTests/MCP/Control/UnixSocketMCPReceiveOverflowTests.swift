@@ -89,6 +89,19 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
 
             let peerSawEOF = await Self.waitUntil { Self.peerObservedEOF(on: descriptors[1]) }
             XCTAssertTrue(peerSawEOF)
+            let cleanupCompleted = await Self.waitUntil {
+                let cleanup = await transport.debugCleanupSnapshot()
+                return !cleanup.hasActiveReader
+                    && cleanup.pendingReaderCancellationCount == 0
+                    && cleanup.earlyReaderCancellationCount == 0
+                    && !cleanup.readerIsRetained
+                    && cleanup.terminalCallbackCount == 0
+                    && cleanup.cancellationCallbackCount == 1
+                    && cleanup.finalizationCount == 1
+                    && cleanup.descriptorCloseCount == 1
+                    && !cleanup.socketIsOwned
+            }
+            XCTAssertTrue(cleanupCompleted)
             await transport.disconnect()
             await transport.disconnect()
         #else
@@ -133,6 +146,15 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
 
             let peerSawEOF = await Self.waitUntil { Self.peerObservedEOF(on: descriptors[1]) }
             XCTAssertTrue(peerSawEOF)
+            let cleanupCompleted = await Self.waitUntil {
+                let cleanup = await transport.debugCleanupSnapshot()
+                return cleanup.pendingReaderCancellationCount == 0
+                    && cleanup.earlyReaderCancellationCount == 0
+                    && !cleanup.readerIsRetained
+                    && cleanup.finalizationCount == 1
+                    && cleanup.descriptorCloseCount == 1
+            }
+            XCTAssertTrue(cleanupCompleted)
         #else
             throw XCTSkip("Overflow teardown race seam requires a DEBUG build")
         #endif
@@ -188,6 +210,20 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
 
         let firstPeerSawEOF = await Self.waitUntil { Self.peerObservedEOF(on: firstDescriptors[1]) }
         XCTAssertTrue(firstPeerSawEOF)
+        #if DEBUG
+            let firstCleanupCompleted = await Self.waitUntil {
+                let cleanup = await firstTransport.debugCleanupSnapshot()
+                return cleanup.pendingReaderCancellationCount == 0
+                    && cleanup.earlyReaderCancellationCount == 0
+                    && !cleanup.readerIsRetained
+                    && cleanup.finalizationCount == 1
+                    && cleanup.descriptorCloseCount == 1
+            }
+            XCTAssertTrue(firstCleanupCompleted)
+            let secondCleanupBeforeDisconnect = await secondTransport.debugCleanupSnapshot()
+            XCTAssertTrue(secondCleanupBeforeDisconnect.hasActiveReader)
+            XCTAssertEqual(secondCleanupBeforeDisconnect.descriptorCloseCount, 0)
+        #endif
         XCTAssertFalse(Self.peerObservedEOF(on: secondDescriptors[1]))
         await firstTransport.disconnect()
         await secondTransport.disconnect()

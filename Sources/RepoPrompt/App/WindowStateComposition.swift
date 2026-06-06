@@ -28,7 +28,8 @@ enum WindowStateCompositionFactory {
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
-        sharedMCPService: MCPService
+        sharedMCPService: MCPService,
+        contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil
     ) -> WindowStateComposition {
         // 1) Workspace file context store + visible file-tree UI adapter
         let workspaceFileContextStore = WorkspaceFileContextStore()
@@ -120,7 +121,8 @@ enum WindowStateCompositionFactory {
             promptManager: promptManager,
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
-            oracleViewModel: oracleViewModel
+            oracleViewModel: oracleViewModel,
+            providerFactory: contextBuilderProviderFactory
         )
 
         // 13) Agent mode (for minimal agent UI)

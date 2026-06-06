@@ -19,6 +19,44 @@ import SystemPackage
     import Glibc
 #endif
 
+#if DEBUG
+    private final class BootstrapSocketMCPTransportCallbackGate: @unchecked Sendable {
+        enum Kind: Hashable {
+            case terminal
+            case cancellation
+        }
+
+        private let lock = NSLock()
+        private var heldKinds: Set<Kind> = []
+        private var pendingCallbacks: [Kind: [@Sendable () -> Void]] = [:]
+
+        func hold(_ kind: Kind) {
+            lock.lock()
+            heldKinds.insert(kind)
+            lock.unlock()
+        }
+
+        func submit(_ kind: Kind, callback: @escaping @Sendable () -> Void) {
+            lock.lock()
+            guard heldKinds.contains(kind) else {
+                lock.unlock()
+                callback()
+                return
+            }
+            pendingCallbacks[kind, default: []].append(callback)
+            lock.unlock()
+        }
+
+        func release(_ kind: Kind) {
+            lock.lock()
+            heldKinds.remove(kind)
+            let callbacks = pendingCallbacks.removeValue(forKey: kind) ?? []
+            lock.unlock()
+            callbacks.forEach { $0() }
+        }
+    }
+#endif
+
 /// MCP Transport implementation for CLI that wraps an already-connected UNIX socket FD.
 /// This is used after the bootstrap handshake completes to run MCP.Client over the socket.
 public actor BootstrapSocketMCPTransport: Transport {
@@ -33,22 +71,42 @@ public actor BootstrapSocketMCPTransport: Transport {
     private nonisolated let messageStream: AsyncThrowingStream<Data, Swift.Error>
     private var messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
 
-    private var reader: NewlineDelimitedSocketReader?
     private let readQueue = DispatchQueue(label: "com.repoprompt.ce.mcp.cli.socket.read", qos: .userInitiated)
-    private var readSourceFD: Int32?
-    private var readSourceToken: UInt64?
     private var nextReadSourceToken: UInt64 = 0
+
+    private struct ReaderIdentity: Hashable {
+        let fd: Int32
+        let token: UInt64
+    }
+
+    private struct ActiveReaderOwnership {
+        let identity: ReaderIdentity
+        let reader: NewlineDelimitedSocketReader
+    }
 
     /// Retains cancelled readers until their delayed cancel handlers perform final close.
     /// The transport retainer intentionally forms a temporary cycle so cleanup does not
     /// depend on an external owner keeping this actor alive after disconnect returns.
     private struct PendingReaderCancellation {
-        let fd: Int32
+        let identity: ReaderIdentity
         let reader: NewlineDelimitedSocketReader
         let transportRetainer: BootstrapSocketMCPTransport
     }
 
+    private var activeReaderOwnership: ActiveReaderOwnership?
     private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]
+    private var earlyReaderCancellations: Set<ReaderIdentity> = []
+
+    #if DEBUG
+        private nonisolated let callbackGate = BootstrapSocketMCPTransportCallbackGate()
+        private weak var debugLastReader: NewlineDelimitedSocketReader?
+        private var debugTerminalCallbackCount = 0
+        private var debugCancellationCallbackCount = 0
+        private var debugReaderFinalizationCount = 0
+        private var debugDescriptorCloseCount = 0
+        private var debugStaleCancellationCount = 0
+        private var debugStaleTerminalCount = 0
+    #endif
 
     /// Maximum time a write may make no forward progress before the connection is failed closed.
     private let writeStallTimeout: TimeInterval
@@ -298,6 +356,40 @@ public actor BootstrapSocketMCPTransport: Transport {
         }
     }
 
+    #if DEBUG
+        func debugHoldReaderTerminalCallback() {
+            callbackGate.hold(.terminal)
+        }
+
+        func debugReleaseReaderTerminalCallbacks() {
+            callbackGate.release(.terminal)
+        }
+
+        func debugHoldReaderCancellationCallback() {
+            callbackGate.hold(.cancellation)
+        }
+
+        func debugReleaseReaderCancellationCallbacks() {
+            callbackGate.release(.cancellation)
+        }
+    #endif
+
+    private nonisolated func scheduleReaderTerminalCallback(_ callback: @escaping @Sendable () -> Void) {
+        #if DEBUG
+            callbackGate.submit(.terminal, callback: callback)
+        #else
+            callback()
+        #endif
+    }
+
+    private nonisolated func scheduleReaderCancellationCallback(_ callback: @escaping @Sendable () -> Void) {
+        #if DEBUG
+            callbackGate.submit(.cancellation, callback: callback)
+        #else
+            callback()
+        #endif
+    }
+
     // MARK: - Private
 
     /// Starts the DispatchSourceRead to receive data without blocking the actor executor.
@@ -306,9 +398,7 @@ public actor BootstrapSocketMCPTransport: Transport {
         stopReadSource()
 
         nextReadSourceToken &+= 1
-        let token = nextReadSourceToken
-        readSourceFD = fd
-        readSourceToken = token
+        let identity = ReaderIdentity(fd: fd, token: nextReadSourceToken)
 
         let cont = messageContinuation
         let log = logger
@@ -320,74 +410,116 @@ public actor BootstrapSocketMCPTransport: Transport {
             onFrame: { frame in
                 cont.yield(frame)
             },
-            onEOF: { [weak self] hasResidual in
-                Task { await self?.handleReadEOF(hasResidualData: hasResidual) }
-            },
-            onError: { [weak self] error in
-                Task { await self?.handleReadError(error: error) }
+            onTerminal: { [weak self] terminal in
+                guard let transport = self else { return }
+                transport.scheduleReaderTerminalCallback {
+                    Task { await transport.handleReaderTerminal(terminal, from: identity) }
+                }
             },
             onCancel: { [weak self] in
-                Task { await self?.readSourceDidCancel(fd: fd, token: token) }
+                guard let transport = self else { return }
+                transport.scheduleReaderCancellationCallback {
+                    Task { await transport.readSourceDidCancel(identity) }
+                }
             }
         )
 
-        reader = newReader
+        activeReaderOwnership = ActiveReaderOwnership(identity: identity, reader: newReader)
+        #if DEBUG
+            debugLastReader = newReader
+        #endif
         do {
             try newReader.start()
         } catch {
-            reader = nil
-            readSourceFD = nil
-            readSourceToken = nil
+            if activeReaderOwnership?.identity == identity {
+                activeReaderOwnership = nil
+            }
             throw error
         }
     }
 
-    /// Stops the read source. FD is closed in cancel handler to avoid races.
+    /// Moves active reader ownership to the cancellation finalizer before requesting cancellation.
     private func stopReadSource() {
-        guard let reader else { return }
-        guard let fd = readSourceFD, let token = readSourceToken else {
-            self.reader = nil
-            readSourceFD = nil
-            readSourceToken = nil
-            reader.stop()
-            return
-        }
+        guard let activeOwnership = activeReaderOwnership else { return }
+        activeReaderOwnership = nil
 
-        pendingReaderCancellations[token] = PendingReaderCancellation(
-            fd: fd,
-            reader: reader,
+        let identity = activeOwnership.identity
+        pendingReaderCancellations[identity.token] = PendingReaderCancellation(
+            identity: identity,
+            reader: activeOwnership.reader,
             transportRetainer: self
         )
-        self.reader = nil
-        readSourceFD = nil
-        readSourceToken = nil
-        reader.stop()
-        // Note: retained reader cleanup happens in readSourceDidCancel.
+        activeOwnership.reader.stop()
+
+        if earlyReaderCancellations.contains(identity) {
+            finalizeReaderCancellation(identity)
+        }
     }
 
     private func pendingReaderCancellationOwnsCurrentSocket() -> Bool {
-        pendingReaderCancellations.values.contains { $0.fd == socketFD }
+        pendingReaderCancellations.values.contains { $0.identity.fd == socketFD }
     }
 
-    private func readSourceDidCancel(fd: Int32, token: UInt64) {
-        guard let ownership = pendingReaderCancellations.removeValue(forKey: token) else { return }
-        guard ownership.fd == fd else {
-            logger.error("BootstrapSocketMCPTransport reader cancellation fd mismatch for token=\(token)")
+    private func readSourceDidCancel(_ identity: ReaderIdentity) {
+        #if DEBUG
+            debugCancellationCallbackCount += 1
+        #endif
+
+        if pendingReaderCancellations[identity.token]?.identity == identity {
+            finalizeReaderCancellation(identity)
             return
         }
-        closeSocketIfNeeded()
+
+        if activeReaderOwnership?.identity == identity {
+            earlyReaderCancellations.insert(identity)
+            return
+        }
+
+        #if DEBUG
+            debugStaleCancellationCount += 1
+        #endif
     }
 
-    private func handleReadError(error: Swift.Error) {
-        tearDownSocket(error: error)
+    private func finalizeReaderCancellation(_ identity: ReaderIdentity) {
+        guard pendingReaderCancellations[identity.token]?.identity == identity,
+              let ownership = pendingReaderCancellations.removeValue(forKey: identity.token)
+        else {
+            return
+        }
+        earlyReaderCancellations.remove(identity)
+        withExtendedLifetime(ownership) {
+            #if DEBUG
+                debugReaderFinalizationCount += 1
+            #endif
+            closeSocketIfNeeded()
+        }
     }
 
-    private func handleReadEOF(hasResidualData: Bool) {
-        if hasResidualData {
+    private func handleReaderTerminal(
+        _ terminal: NewlineDelimitedSocketReaderTerminal,
+        from identity: ReaderIdentity
+    ) {
+        #if DEBUG
+            debugTerminalCallbackCount += 1
+        #endif
+
+        guard activeReaderOwnership?.identity == identity else {
+            #if DEBUG
+                debugStaleTerminalCount += 1
+            #endif
+            return
+        }
+
+        switch terminal {
+        case let .error(error):
+            tearDownSocket(error: error)
+        case let .eof(hasResidualData):
+            guard hasResidualData else {
+                tearDownSocket()
+                return
+            }
             let truncationError = MCPError.internalError("Connection closed with incomplete frame data")
             tearDownSocket(error: truncationError)
-        } else {
-            tearDownSocket()
         }
     }
 
@@ -420,5 +552,8 @@ public actor BootstrapSocketMCPTransport: Transport {
         socketClosed = true
         POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)
         Darwin.close(socketFD)
+        #if DEBUG
+            debugDescriptorCloseCount += 1
+        #endif
     }
 }
