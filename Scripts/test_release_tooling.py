@@ -1717,11 +1717,16 @@ fi
             [
                 sys.executable,
                 "-c",
-                "import os, socket, sys; "
-                "listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); "
-                "listener.bind(sys.argv[1]); listener.listen(8); "
-                "open(sys.argv[2], 'w', encoding='utf-8').close(); "
-                "[(client.close()) for client, _ in iter(listener.accept, None)]",
+                "import socket, sys\n"
+                "listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+                "listener.bind(sys.argv[1])\n"
+                "listener.listen(8)\n"
+                "open(sys.argv[2], 'w', encoding='utf-8').close()\n"
+                "while True:\n"
+                "    client, _ = listener.accept()\n"
+                "    with client:\n"
+                "        while client.recv(4096):\n"
+                "            pass\n",
                 os.fspath(socket_path),
                 os.fspath(ready),
             ],
