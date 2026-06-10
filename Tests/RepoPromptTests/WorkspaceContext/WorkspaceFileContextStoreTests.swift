@@ -1393,7 +1393,17 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
 
-            for _ in 0 ..< 40 {
+            // Keep publisher ingress attached for synthetic publications while excluding live
+            // FSEvents from the measurement window.
+            let loadedFileSystemService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let fileSystemService = try XCTUnwrap(loadedFileSystemService)
+            await fileSystemService.stopWatchingForChanges()
+            _ = await store.awaitAppliedIngressForAllRoots()
+            let baselineSnapshots = await store.readSearchRootDiagnosticsSnapshot(recentPublicationLimit: 32)
+            let baselineSnapshot = try XCTUnwrap(baselineSnapshots.first { $0.rootID == record.id })
+            let publicationCount = 40
+
+            for _ in 0 ..< publicationCount {
                 try await store.publishSyntheticFileSystemDeltasForTesting(
                     rootID: record.id,
                     deltas: [.fileModified("Seed.swift", nil)]
@@ -1403,16 +1413,27 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             let rootSnapshots = await store.readSearchRootDiagnosticsSnapshot(recentPublicationLimit: 32)
             let rootSnapshot = try XCTUnwrap(rootSnapshots.first { $0.rootID == record.id })
-            XCTAssertEqual(rootSnapshot.invalidation.retainedSampleLimit, 32)
-            XCTAssertEqual(rootSnapshot.invalidation.totalObservedPublicationCount, 40)
-            XCTAssertEqual(rootSnapshot.invalidation.droppedPublicationSampleCount, 8)
-            XCTAssertEqual(rootSnapshot.invalidation.samples.count, 32)
-            XCTAssertTrue(rootSnapshot.invalidation.samples.allSatisfy { $0.preparedDeltaCount == 1 })
-            let retainedSequences = rootSnapshot.invalidation.samples.map(\.servicePublicationSequence)
+            let invalidation = rootSnapshot.invalidation
+            XCTAssertEqual(invalidation.retainedSampleLimit, 32)
+            XCTAssertEqual(
+                invalidation.totalObservedPublicationCount,
+                baselineSnapshot.invalidation.totalObservedPublicationCount + publicationCount
+            )
+            XCTAssertEqual(
+                invalidation.droppedPublicationSampleCount,
+                invalidation.totalObservedPublicationCount - invalidation.samples.count
+            )
+            XCTAssertEqual(invalidation.samples.count, 32)
+            XCTAssertTrue(invalidation.samples.allSatisfy {
+                $0.watcherAcceptedWatermark == nil && $0.preparedDeltaCount == 1
+            })
+            let retainedSequences = invalidation.samples.map(\.servicePublicationSequence)
             XCTAssertTrue(retainedSequences.allSatisfy { $0 > 0 })
             XCTAssertTrue(zip(retainedSequences, retainedSequences.dropFirst()).allSatisfy { pair in
                 pair.0 < pair.1
             })
+
+            await store.stopWatchingRoot(id: record.id)
         }
 
         func testSearchCatalogSnapshotCacheReusesUnchangedScopeAndPreservesOrderingDiagnostics() async throws {
