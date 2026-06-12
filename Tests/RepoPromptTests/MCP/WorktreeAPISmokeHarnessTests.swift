@@ -148,23 +148,32 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             "session_id": .string(sessionID.uuidString)
         ])
 
-        let contextHint = MCPServerViewModel.TabContextHint(
+        let staleConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: staleConnectionID,
+            clientName: "stale-one-shot-selection-client",
             tabID: tabID,
             workspaceID: workspaceID,
             windowID: window.windowID
         )
-        let firstConnectionID = UUID()
-        let setValue = try await ServerNetworkManager.withConnectionID(firstConnectionID) {
-            try await ServerNetworkManager.$currentTabContextHint.withValue(contextHint) {
-                try await manageSelection([
-                    "op": .string("set"),
-                    "paths": .array([.string("WorktreeOnly.swift")]),
-                    "mode": .string("full"),
-                    "view": .string("files"),
-                    "path_display": .string("full"),
-                    "strict": .bool(true)
-                ])
-            }
+
+        let setterConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: setterConnectionID,
+            clientName: "setter-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        let setValue = try await ServerNetworkManager.withConnectionID(setterConnectionID) {
+            try await manageSelection([
+                "op": .string("set"),
+                "paths": .array([.string("WorktreeOnly.swift")]),
+                "mode": .string("full"),
+                "view": .string("files"),
+                "path_display": .string("full"),
+                "strict": .bool(true)
+            ])
         }
 
         let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
@@ -173,15 +182,41 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: logicalPath))
 
-        let secondConnectionID = UUID()
-        let getValue = try await ServerNetworkManager.withConnectionID(secondConnectionID) {
-            try await ServerNetworkManager.$currentTabContextHint.withValue(contextHint) {
-                try await manageSelection([
-                    "op": .string("get"),
-                    "view": .string("files"),
-                    "path_display": .string("full")
-                ])
-            }
+        // Exec-mode CLI disconnect is asynchronous. Exercise the stale cleanup ordering where
+        // an older bound snapshot commits after the setter has persisted newer canonical state.
+        let staleCommitSucceeded = await window.mcpServer.commitAndClearTabContext(
+            connectionID: staleConnectionID
+        )
+        XCTAssertTrue(staleCommitSucceeded)
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+        window.mcpServer.removeTabContext(
+            forConnectionID: setterConnectionID,
+            clientName: "setter-one-shot-selection-client",
+            windowID: window.windowID
+        )
+
+        let getterConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: getterConnectionID,
+            clientName: "getter-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        defer {
+            window.mcpServer.removeTabContext(
+                forConnectionID: getterConnectionID,
+                clientName: "getter-one-shot-selection-client",
+                windowID: window.windowID
+            )
+        }
+        let getValue = try await ServerNetworkManager.withConnectionID(getterConnectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
         }
         XCTAssertEqual(try Self.selectionPaths(getValue), [logicalPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])

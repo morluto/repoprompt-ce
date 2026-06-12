@@ -40,6 +40,9 @@ extension MCPServerViewModel {
         let workspaceID: UUID?
         var promptText: String
         var selection: StoredSelection
+        /// Canonical selection observed when this snapshot last synchronized with the tab store.
+        /// A final commit uses this baseline to avoid overwriting selection persisted by a newer connection.
+        var selectionBaseline: StoredSelection
         /// Selected stored prompt IDs for computing meta tokens in tab-context snapshots.
         var selectedMetaPromptIDs: [UUID]
         /// Tab name for MCP metadata block generation.
@@ -63,6 +66,7 @@ extension MCPServerViewModel {
             workspaceID: UUID?,
             promptText: String,
             selection: StoredSelection,
+            selectionBaseline: StoredSelection? = nil,
             selectedMetaPromptIDs: [UUID],
             tabName: String,
             runID: UUID?,
@@ -76,6 +80,7 @@ extension MCPServerViewModel {
             self.workspaceID = workspaceID
             self.promptText = promptText
             self.selection = selection
+            self.selectionBaseline = selectionBaseline ?? selection
             self.selectedMetaPromptIDs = selectedMetaPromptIDs
             self.tabName = tabName
             self.runID = runID
@@ -540,6 +545,7 @@ extension MCPServerViewModel {
                     let nameChanged = bound.tabName != snapshot.name
                     if selectionChanged || promptChanged || metaChanged || nameChanged {
                         bound.selection = incomingSelection
+                        bound.selectionBaseline = incomingSelection
                         bound.promptText = snapshot.promptText
                         bound.selectedMetaPromptIDs = snapshot.selectedMetaPromptIDs
                         bound.tabName = snapshot.name
@@ -2563,8 +2569,14 @@ extension MCPServerViewModel {
 
         var updatedTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
         let isActive = (manager.workspaces[workspaceIndex].activeComposeTabID == updatedTab.id)
+        let canonicalSelectionAdvanced = updatedTab.selection != context.selection
+            && updatedTab.selection != context.selectionBaseline
 
-        updatedTab.selection = context.selection
+        if canonicalSelectionAdvanced {
+            tabContextLog("commitTabContext preserving newer canonical selection tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil")")
+        } else {
+            updatedTab.selection = context.selection
+        }
         updatedTab.promptText = context.promptText
         updatedTab.selectedMetaPromptIDs = context.selectedMetaPromptIDs
         updatedTab.lastModified = Date()
@@ -2585,6 +2597,10 @@ extension MCPServerViewModel {
         // 2) Apply to live UI ONLY if this tab is the active tab and the run still owns commit.
         guard isActive else {
             tabContextLog("commitTabContext skipping live UI apply (tab not active) tab=\(updatedTab.id)")
+            return true
+        }
+        guard !canonicalSelectionAdvanced else {
+            tabContextLog("commitTabContext skipping stale live UI apply tab=\(updatedTab.id)")
             return true
         }
         guard isStillCurrent(), !Task.isCancelled else { return false }
