@@ -290,6 +290,34 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         ])
     }
 
+    func testDeferredMCPSelectionFencesQueuedUISnapshotUntilNewUIRevision() async {
+        let initial = StoredSelection()
+        let canonical = StoredSelection(selectedPaths: ["/tmp/worktree-only.swift"], codemapAutoEnabled: false)
+        let staleUI = StoredSelection()
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.advanceLiveUISelectionRevision()
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        _ = await coordinator.persistActiveSelection(
+            canonical,
+            source: .mcpTabContext,
+            mirrorToUI: false
+        )
+
+        XCTAssertEqual(harness.manager.presentedSelection, canonical)
+        XCTAssertEqual(coordinator.selectionForActiveUISnapshot(staleUI, tabID: harness.tabID), canonical)
+
+        // Programmatic tab restore may mutate the UI owner; refreshing the fence keeps its
+        // delayed publisher from looking like a manual edit.
+        harness.manager.advanceLiveUISelectionRevision()
+        coordinator.refreshDeferredUISelectionFence(forTabID: harness.tabID)
+        XCTAssertEqual(coordinator.selectionForActiveUISnapshot(staleUI, tabID: harness.tabID), canonical)
+
+        // A later UI mutation wins even if its value returns to the pre-MCP baseline (ABA).
+        harness.manager.advanceLiveUISelectionRevision()
+        XCTAssertEqual(coordinator.selectionForActiveUISnapshot(staleUI, tabID: harness.tabID), staleUI)
+    }
+
     func testPersistActiveSelectionNoOpsWhenSelectionIsUnchanged() async {
         let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
         let harness = CoordinatorHarness(initialSelection: initial)
@@ -547,6 +575,7 @@ private actor SelectionMirrorCompletion {
 private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
     private(set) var selectionMirrorContextRevision: UInt64 = 0
+    private(set) var liveUISelectionRevision: UInt64 = 0
     let fileManager: WorkspaceFilesViewModel
     var pendingUISelection: StoredSelection?
     private(set) var publishSnapshotCallCount = 0
@@ -556,6 +585,7 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
     private(set) var mirrorStartedSelections: [StoredSelection] = []
     private(set) var mirrorCompletedSelections: [StoredSelection] = []
     var mirroredSelection: StoredSelection?
+    private(set) var presentedSelection: StoredSelection?
 
     init(workspace: WorkspaceModel, fileManager: WorkspaceFilesViewModel) {
         activeWorkspace = workspace
@@ -614,6 +644,14 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
         workspace.activeComposeTabID = tabID
         activeWorkspace = workspace
         selectionMirrorContextRevision &+= 1
+    }
+
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID _: UUID) {
+        presentedSelection = selection
+    }
+
+    func advanceLiveUISelectionRevision() {
+        liveUISelectionRevision &+= 1
     }
 
     func updateComposeTabStoredOnly(_ tab: ComposeTabState) {

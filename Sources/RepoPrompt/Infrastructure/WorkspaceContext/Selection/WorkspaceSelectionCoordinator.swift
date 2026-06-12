@@ -12,14 +12,24 @@ private struct WorkspaceSelectionMirrorTarget: Equatable {
 protocol WorkspaceSelectionHost: AnyObject {
     var activeWorkspace: WorkspaceModel? { get }
     var selectionMirrorContextRevision: UInt64 { get }
+    var liveUISelectionRevision: UInt64 { get }
     func composeTab(with id: UUID) -> ComposeTabState?
     func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool)
     func updateComposeTabStoredOnly(_ tab: ComposeTabState)
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID)
     func applySelectionMirrorAttempt(
         _ selection: StoredSelection,
         forTabID tabID: UUID,
         workspaceID: UUID
     ) async
+}
+
+extension WorkspaceSelectionHost {
+    var liveUISelectionRevision: UInt64 {
+        0
+    }
+
+    func updateComposeTabSelectionPresentation(_: StoredSelection, forTabID _: UUID) {}
 }
 
 private extension WorkspaceSelectionHost {
@@ -75,8 +85,14 @@ final class WorkspaceSelectionCoordinator {
         let task: Task<Void, Never>
     }
 
+    private struct DeferredUISelectionFence {
+        let selection: StoredSelection
+        let liveUISelectionRevision: UInt64
+    }
+
     private var nextSelectionRevision: UInt64 = 0
     private var selectionRevisionByTabID: [UUID: UInt64] = [:]
+    private var deferredUISelectionFenceByTabID: [UUID: DeferredUISelectionFence] = [:]
     private var nextSelectionMirrorTaskID: UInt64 = 0
     private var mcpSelectionMirrorTail: MCPSelectionMirrorTail?
 
@@ -126,6 +142,40 @@ final class WorkspaceSelectionCoordinator {
         Snapshot(tabID: tabID, selection: selection, isVirtual: true)
     }
 
+    /// Keeps a canonical MCP selection authoritative while an already-enqueued UI snapshot
+    /// still reflects the pre-mutation file-tree state. A genuinely newer UI mutation advances
+    /// `liveUISelectionRevision` and is allowed to become canonical, including ABA transitions.
+    func selectionForActiveUISnapshot(_ liveUISelection: StoredSelection, tabID: UUID) -> StoredSelection {
+        guard let workspaceManager,
+              let fence = deferredUISelectionFenceByTabID[tabID]
+        else { return liveUISelection }
+
+        guard workspaceManager.composeTab(with: tabID)?.selection == fence.selection else {
+            deferredUISelectionFenceByTabID.removeValue(forKey: tabID)
+            return liveUISelection
+        }
+
+        guard workspaceManager.liveUISelectionRevision == fence.liveUISelectionRevision else {
+            deferredUISelectionFenceByTabID.removeValue(forKey: tabID)
+            return liveUISelection
+        }
+
+        return fence.selection
+    }
+
+    /// Advances an existing fence after the app programmatically reapplies tab UI state.
+    /// This keeps tab-switch/restore work from masquerading as a newer manual UI mutation.
+    func refreshDeferredUISelectionFence(forTabID tabID: UUID) {
+        guard let workspaceManager,
+              let fence = deferredUISelectionFenceByTabID[tabID],
+              workspaceManager.composeTab(with: tabID)?.selection == fence.selection
+        else { return }
+        deferredUISelectionFenceByTabID[tabID] = DeferredUISelectionFence(
+            selection: fence.selection,
+            liveUISelectionRevision: workspaceManager.liveUISelectionRevision
+        )
+    }
+
     func selectionSnapshot(for tabID: UUID, flushPendingUIIfActive: Bool = true) -> Snapshot? {
         if tabID == activeTabID() {
             return activeSelectionSnapshot(flushPendingUI: flushPendingUIIfActive)
@@ -155,6 +205,14 @@ final class WorkspaceSelectionCoordinator {
     ) async -> StoredSelection {
         guard let workspaceManager, let tabID = activeTabID() else { return selection }
         if workspaceManager.composeTab(with: tabID)?.selection == selection {
+            if source == .mcpTabContext {
+                updateMCPSelectionPresentation(
+                    selection,
+                    forTabID: tabID,
+                    mirrorToUI: mirrorToUI,
+                    workspaceManager: workspaceManager
+                )
+            }
             if mirrorToUI, source == .mcpTabContext {
                 let revision = recordSelectionRevision(for: tabID)
                 await enqueueMCPSelectionMirror(selection, forTabID: tabID, revision: revision)
@@ -163,6 +221,14 @@ final class WorkspaceSelectionCoordinator {
         }
 
         guard let revision = persist(selection, for: tabID, markDirty: true) else { return selection }
+        if source == .mcpTabContext {
+            updateMCPSelectionPresentation(
+                selection,
+                forTabID: tabID,
+                mirrorToUI: mirrorToUI,
+                workspaceManager: workspaceManager
+            )
+        }
         let change = Change(tabID: tabID, selection: selection, source: source)
         if mirrorToUI, source == .mcpTabContext {
             changeSubject.send(change)
@@ -359,6 +425,23 @@ final class WorkspaceSelectionCoordinator {
         } else if mcpSelectionMirrorTail?.id == taskID {
             mcpSelectionMirrorTail = nil
         }
+    }
+
+    private func updateMCPSelectionPresentation(
+        _ selection: StoredSelection,
+        forTabID tabID: UUID,
+        mirrorToUI: Bool,
+        workspaceManager: any WorkspaceSelectionHost
+    ) {
+        if mirrorToUI {
+            deferredUISelectionFenceByTabID.removeValue(forKey: tabID)
+        } else {
+            deferredUISelectionFenceByTabID[tabID] = DeferredUISelectionFence(
+                selection: selection,
+                liveUISelectionRevision: workspaceManager.liveUISelectionRevision
+            )
+        }
+        workspaceManager.updateComposeTabSelectionPresentation(selection, forTabID: tabID)
     }
 
     private func allocateSelectionMirrorTaskID() -> UInt64 {

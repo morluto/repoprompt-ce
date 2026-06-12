@@ -474,6 +474,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     )
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
 
+    var liveUISelectionRevision: UInt64 {
+        fileManager.selectionStateRevision
+    }
+
     @Published var isChatBusy: Bool = false
     @Published private(set) var tabsWithActiveChat: Set<UUID> = []
     @Published private(set) var pendingSwitchConfirmation: WorkspaceSwitchConfirmation?
@@ -3143,7 +3147,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             // StoredSelection is already authoritative; re-snapshotting the UI can
             // create selection feedback loops.
             if selectionCoordinator?.isApplyingSelectionMirror != true {
-                snapshot.selection = fileManager.snapshotSelection()
+                let liveUISelection = fileManager.snapshotSelection()
+                snapshot.selection = selectionCoordinator?.selectionForActiveUISnapshot(
+                    liveUISelection,
+                    tabID: snapshot.id
+                ) ?? liveUISelection
             }
             snapshot.expandedFolders = fileManager.snapshotExpandedFolderFullPaths()
             snapshot.promptText = promptViewModel.promptText
@@ -3404,6 +3412,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let active = activeWorkspace, active.activeComposeTabID == tab.id else { return }
         await fileManager.restoreExpansionState(from: tab.expandedFolders)
         await fileManager.onActiveTabChangedHeavy(for: tab.id, selection: tab.selection)
+        selectionCoordinator?.refreshDeferredUISelectionFence(forTabID: tab.id)
     }
 
     @MainActor
@@ -3873,6 +3882,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaceID: active.id
             )
         }
+    }
+
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID) {
+        promptViewModel.updateComposeTabSelectionPresentation(selection, forTabID: tabID)
     }
 
     /// Silent "stored-only" update: updates the compose tab in the backing store

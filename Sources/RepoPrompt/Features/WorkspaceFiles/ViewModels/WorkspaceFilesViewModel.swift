@@ -600,12 +600,27 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
-    @Published private(set) var selectedFiles: [FileViewModel] = []
-    @Published private(set) var autoCodemapFiles: [FileViewModel] = []
+    private(set) var selectionStateRevision: UInt64 = 0
+
+    @Published private(set) var selectedFiles: [FileViewModel] = [] {
+        didSet {
+            guard selectedFiles.map(\.id) != oldValue.map(\.id) else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
+    @Published private(set) var autoCodemapFiles: [FileViewModel] = [] {
+        didSet {
+            guard autoCodemapFiles.map(\.id) != oldValue.map(\.id) else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
     private var autoCodemapFileIDs: Set<UUID> = []
     @Published var codemapAutoEnabled: Bool = true {
         didSet {
             guard codemapAutoEnabled != oldValue else { return }
+            selectionStateRevision &+= 1
             if codemapAutoEnabled {
                 scheduleAutoCodemapSync()
             } else {
@@ -647,7 +662,13 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     private let selectionSliceCoordinator = SelectionSliceCoordinator()
     private var currentSlicesByRoot: [String: [String: PartitionStore.StoredSlices]] = [:]
-    @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:]
+    @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:] {
+        didSet {
+            guard selectionSlicesByFileID != oldValue else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
     private var sliceSnapshotRebuildDeferralDepth = 0
     private var sliceSnapshotRebuildPending = false
     #if DEBUG

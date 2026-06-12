@@ -913,9 +913,26 @@ final class MCPServerViewModel: ObservableObject {
             return await applyReadFileAutoSelectionBatch(batch, for: key)
         },
         applyMirror: { [weak self] key in
-            await self?.workspaceManager?.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
+            await self?.applyReadFileAutoSelectionMirror(for: key)
         }
     )
+    @MainActor
+    private func applyReadFileAutoSelectionMirror(
+        for key: MCPReadFileAutoSelectionCoordinator.TabMirrorKey
+    ) async {
+        if let sessionID = workspaceManager?.activeAgentSessionID(
+            forTabID: key.tabID,
+            inWorkspaceID: key.workspaceID
+        ),
+            agentWorktreeBindingsProvider?(sessionID, key.tabID).isEmpty == false
+        {
+            // Worktree-only paths cannot be represented by the logical base file tree. Their
+            // canonical selection and badge presentation are already updated by persistence.
+            return
+        }
+        await workspaceManager?.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
+    }
+
     @MainActor
     var tabContextByConnectionID: [UUID: TabScopedContext] = [:]
     @MainActor

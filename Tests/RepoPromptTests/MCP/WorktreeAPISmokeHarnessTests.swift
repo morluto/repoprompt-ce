@@ -121,6 +121,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
         let manageSelection = try await Self.windowTool(named: MCPWindowToolName.manageSelection, in: window)
+        let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
         let createValue = try await manageWorktree([
             "op": .string("create"),
             "branch": .string("feature/selection-\(fixture.suffix)"),
@@ -199,8 +200,22 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             )
         #endif
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: logicalPath))
+
+        // Reproduce the app-only race absent from direct provider tests: a debounced file-tree
+        // publisher captured the empty logical-base UI before MCP persistence and fires later.
+        window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
 
         // Exec-mode CLI disconnect is asynchronous. Exercise the stale cleanup ordering where
         // an older bound snapshot commits after the setter has persisted newer canonical state.
@@ -225,13 +240,6 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             workspaceID: workspaceID,
             windowID: window.windowID
         )
-        defer {
-            window.mcpServer.removeTabContext(
-                forConnectionID: getterConnectionID,
-                clientName: "getter-one-shot-selection-client",
-                windowID: window.windowID
-            )
-        }
         let getValue = try await ServerNetworkManager.withConnectionID(getterConnectionID) {
             try await manageSelection([
                 "op": .string("get"),
@@ -242,6 +250,100 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertEqual(try Self.selectionPaths(getValue), [logicalPath])
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+        window.mcpServer.removeTabContext(
+            forConnectionID: getterConnectionID,
+            clientName: "getter-one-shot-selection-client",
+            windowID: window.windowID
+        )
+
+        // A worktree-bound Agent Mode read auto-selects canonically without attempting to
+        // project a physical-only file into the logical base file tree.
+        let readConnectionID = UUID()
+        let readRunID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: readConnectionID,
+            clientName: "read-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID,
+            runID: readRunID,
+            explicitlyBound: false
+        )
+        await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: readConnectionID)
+        _ = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+            try await manageSelection(["op": .string("clear")])
+        }
+        _ = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+            try await readFile(["path": .string("WorktreeOnly.swift")])
+        }
+        let readSelection = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
+        }
+        XCTAssertEqual(try Self.selectionPaths(readSelection), [logicalPath])
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+        window.mcpServer.removeTabContext(
+            forConnectionID: readConnectionID,
+            clientName: "read-one-shot-selection-client",
+            windowID: window.windowID,
+            runID: readRunID
+        )
+        await ServerNetworkManager.shared.setRunPurpose(.unknown, for: readConnectionID)
+
+        window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
+        try await Task.sleep(for: .milliseconds(250))
+
+        let finalConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: finalConnectionID,
+            clientName: "final-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        defer {
+            window.mcpServer.removeTabContext(
+                forConnectionID: finalConnectionID,
+                clientName: "final-one-shot-selection-client",
+                windowID: window.windowID
+            )
+        }
+        let finalSelection = try await ServerNetworkManager.withConnectionID(finalConnectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
+        }
+        XCTAssertEqual(try Self.selectionPaths(finalSelection), [logicalPath])
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
+
+        // A genuinely newer manual UI mutation advances the live-owner revision and supersedes
+        // the worktree fence rather than leaving canonical selection permanently pinned.
+        let manualUISelection = StoredSelection(
+            selectedPaths: [fixture.trackedFile.path],
+            codemapAutoEnabled: false
+        )
+        await window.workspaceFilesViewModel.applyStoredSelection(manualUISelection)
+        window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection, manualUISelection)
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection,
+            manualUISelection
+        )
     }
 
     func testContextBuilderExportUsesResolvedWorktreeContextAndIsReadableFromFreshConnection() async throws {
