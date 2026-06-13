@@ -187,6 +187,12 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             store: store,
             rootScope: projectionB.lookupRootScope
         )
+        // Materialization starts codemap scans asynchronously. Prime both snapshots so this test isolates scope filtering;
+        // active-scan pending behavior is covered separately.
+        let snapshotA = try await waitForCodemapSnapshot(store: store, fileID: fileA.id, timeout: .seconds(12))
+        let snapshotB = try await waitForCodemapSnapshot(store: store, fileID: fileB.id, timeout: .seconds(12))
+        XCTAssertTrue(snapshotA.fileAPI?.apiDescription.contains("WorktreeAType") == true)
+        XCTAssertTrue(snapshotB.fileAPI?.apiDescription.contains("WorktreeBType") == true)
 
         let dtoA = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [fileA],
@@ -210,10 +216,6 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertFalse(dtoB.content.contains("WorktreeAType"), dtoB.content)
         XCTAssertFalse(dtoB.content.contains("CanonicalSwitchType"), dtoB.content)
         XCTAssertEqual(dtoB.worktreeScope?.rootMappings.first?.worktreeID, "B")
-        let snapshotA = await store.codemapSnapshot(fileID: fileA.id)
-        let snapshotB = await store.codemapSnapshot(fileID: fileB.id)
-        XCTAssertNotNil(snapshotA)
-        XCTAssertNotNil(snapshotB)
     }
 
     func testDeletedMaterializedWorktreeFailsClosedInsteadOfReturningCachedStructure() async throws {
