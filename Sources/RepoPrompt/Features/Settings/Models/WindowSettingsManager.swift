@@ -12,6 +12,7 @@ protocol SettingsManaging {
     func updateCopySettings(_ settings: CopyGlobalSettings, commit: Bool?)
     func updateChatSettings(_ settings: ChatGlobalSettings, commit: Bool?)
     func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?)
+    func persistedGlobalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?)
     func setGlobalContextBuilderAgentSelection(agentRaw: String, modelRaw: String, markUserDefined: Bool)
     func promptSectionsOrderRaw() -> String
     func setPromptSectionsOrderRaw(_ raw: String, commit: Bool)
@@ -109,6 +110,10 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
 
     func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
         store.globalContextBuilderAgentSelection()
+    }
+
+    func persistedGlobalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
+        store.persistedGlobalContextBuilderAgentSelection()
     }
 
     func setGlobalContextBuilderAgentSelection(agentRaw: String, modelRaw: String, markUserDefined: Bool = true) {

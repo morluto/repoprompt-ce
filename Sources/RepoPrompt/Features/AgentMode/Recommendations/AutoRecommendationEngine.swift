@@ -295,12 +295,19 @@ final class AutoRecommendationEngine {
 
     private func computeContextBuilderRecommendation(
         status: ProviderStatusSnapshot,
-        settings: ChatGlobalSettings
+        settings _: ChatGlobalSettings
+    ) -> ContextBuilderRecommendation? {
+        Self.contextBuilderRecommendation(status: status)
+    }
+
+    /// Shared Context Builder recommendation ranking used by both the wizard and startup restore.
+    /// Keeping this pure prevents startup fallback behavior from drifting from the recommendation UI.
+    static func contextBuilderRecommendation(
+        status: ProviderStatusSnapshot
     ) -> ContextBuilderRecommendation? {
         // Priority: Codex CLI (requires CLI) > Claude Code > Cursor CLI
         // Cursor is a fallback only; it does not take priority over existing recommended providers.
         // Note: codexExec agent requires Codex CLI specifically, not just OpenAI API key
-
         if status.codexCLI == .ready {
             return ContextBuilderRecommendation(
                 recommendedAgent: .codexExec,
@@ -324,6 +331,51 @@ final class AutoRecommendationEngine {
         }
 
         return nil
+    }
+
+    /// Restores a saved Context Builder selection only when both provider and model are currently usable.
+    /// Invalid or unavailable persisted values fall back through the same recommendation ranking as the wizard.
+    static func resolveContextBuilderSelection(
+        persistedAgentRaw: String?,
+        persistedModelRaw: String?,
+        availability: AgentModelCatalog.AvailabilityContext
+    ) -> AgentModelCatalog.NormalizedAgentSelection? {
+        if let agentRaw = persistedAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let modelRaw = persistedModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let agent = AgentProviderKind(rawValue: agentRaw),
+           !modelRaw.isEmpty,
+           AgentModelCatalog.isAgentAvailable(agent, availability: availability),
+           AgentModelCatalog.isValid(rawModel: modelRaw, for: agent, availability: availability)
+        {
+            return AgentModelCatalog.normalizeSelection(
+                agentRaw: agent.rawValue,
+                modelRaw: modelRaw,
+                availability: availability
+            )
+        }
+
+        let status = ProviderStatusSnapshot(
+            claudeCodeCLI: availability.claudeCodeAvailable ? .ready : .notConfigured,
+            codexCLI: availability.codexAvailable ? .ready : .notConfigured,
+            cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
+            openAI: .notConfigured
+        )
+        if let recommendation = contextBuilderRecommendation(status: status) {
+            return AgentModelCatalog.normalizeSelection(
+                agentRaw: recommendation.recommendedAgent.rawValue,
+                modelRaw: recommendation.recommendedModel.rawValue,
+                availability: availability
+            )
+        }
+
+        guard let availableAgent = AgentModelCatalog.selectableAgents(availability: availability).first else {
+            return nil
+        }
+        return AgentModelCatalog.normalizeSelection(
+            agentRaw: availableAgent.rawValue,
+            modelRaw: nil,
+            availability: availability
+        )
     }
 
     // MARK: - MCP Preset Exposure Recommendation
