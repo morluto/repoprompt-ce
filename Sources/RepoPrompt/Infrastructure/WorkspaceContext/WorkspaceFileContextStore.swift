@@ -904,6 +904,24 @@ actor WorkspaceFileContextStore {
             let state = try state(for: rootID)
             await state.service.setContentReadChunkHandlerForTesting(handler)
         }
+
+        func resetSearchContentFingerprintRequestCountForTesting(rootID: UUID) async throws {
+            let state = try state(for: rootID)
+            await state.service.resetContentFingerprintRequestCountForTesting()
+        }
+
+        func searchContentFingerprintRequestCountForTesting(rootID: UUID) async throws -> Int {
+            let state = try state(for: rootID)
+            return await state.service.contentFingerprintRequestCountSnapshotForTesting()
+        }
+
+        func setCachedSearchContentWatcherActiveOverrideForTesting(
+            rootID: UUID,
+            _ isActive: Bool?
+        ) async throws {
+            let state = try state(for: rootID)
+            await state.service.setCachedSearchContentWatcherActiveOverrideForTesting(isActive)
+        }
     #endif
 
     private enum ExplicitDiskLookupCandidatesResult {
@@ -2604,6 +2622,32 @@ actor WorkspaceFileContextStore {
         await awaitAppliedIngress(rootIDs: rootsForPathLookup(scope: rootScope).map(\.id))
     }
 
+    func contentSearchFreshnessPolicy(
+        rootScope: WorkspaceLookupRootScope,
+        appliedIngressSamples: [WorkspaceIngressBarrierSample]
+    ) async -> FileContentFreshnessPolicy {
+        let scopedRoots = rootsForPathLookup(scope: rootScope)
+        guard !scopedRoots.isEmpty,
+              appliedIngressSamples.count == scopedRoots.count
+        else {
+            return .validateDiskMetadata
+        }
+        let samplesByRootID = Dictionary(uniqueKeysWithValues: appliedIngressSamples.map { ($0.rootID, $0) })
+        for root in scopedRoots {
+            guard let state = rootStatesByID[root.id],
+                  let sample = samplesByRootID[root.id],
+                  await state.service.canUseCachedSearchContent(
+                      afterAppliedWatcherWatermark: sample.appliedWatcherWatermark
+                  ),
+                  publisherIngressCoordinator.appliedSnapshot(rootID: root.id)
+                  .acceptedServicePublicationSequence <= sample.appliedServicePublicationSequence
+            else {
+                return .validateDiskMetadata
+            }
+        }
+        return .cachedMetadata
+    }
+
     /// Resolves the narrowest safe workspace freshness scope for an explicit request.
     /// Absolute paths await only their containing loaded root. Absolute paths outside all
     /// loaded roots (including always-readable support files) do not pay a workspace barrier.
@@ -4253,7 +4297,10 @@ actor WorkspaceFileContextStore {
         return foldersByID[folderID]
     }
 
-    func searchContentSnapshot(for expectedRecord: WorkspaceFileRecord) async throws -> FileSearchContentSnapshot {
+    func searchContentSnapshot(
+        for expectedRecord: WorkspaceFileRecord,
+        freshnessPolicy: FileContentFreshnessPolicy = .validateDiskMetadata
+    ) async throws -> FileSearchContentSnapshot {
         for attempt in 0 ..< 2 {
             try Task.checkCancellation()
             guard let state = rootStatesByID[expectedRecord.rootID],
@@ -4270,6 +4317,23 @@ actor WorkspaceFileContextStore {
                 fileID: current.id,
                 standardizedRelativePath: current.standardizedRelativePath
             )
+            if case .cachedMetadata = freshnessPolicy,
+               let cached = await searchDecodedContentCache.cachedSnapshot(
+                   for: cacheKey,
+                   invalidationEpoch: epoch
+               )
+            {
+                guard searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
+                    if attempt == 0 { continue }
+                    return staleSearchContentSnapshot(for: current)
+                }
+                return FileSearchContentSnapshot(
+                    content: cached.content,
+                    contentRevision: cached.revision,
+                    modificationDate: cached.modificationDate,
+                    isFresh: true
+                )
+            }
             let fingerprint: FileContentFingerprint
             do {
                 fingerprint = try await service.contentFingerprint(
