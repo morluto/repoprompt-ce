@@ -1600,7 +1600,16 @@ class DaemonState:
                         if root_alive or descendants_alive:
                             self._kill_process_group_locked(job, reason="SIGKILL after timeout grace period")
                     if root_alive:
-                        exit_code = process.wait(timeout=KILL_GRACE_SECONDS)
+                        try:
+                            exit_code = process.wait(timeout=KILL_GRACE_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            exit_code = 124
+                            with self.condition:
+                                job.error = (
+                                    f"timed out after {effective_timeout:.1f}s; "
+                                    "root process did not exit after SIGKILL escalation"
+                                )
+                                self._append_system_line_locked(job, job.error + "\n")
                     with self.condition:
                         descendants_alive = self._wait_for_process_tree_exit_locked(
                             job,
@@ -1608,7 +1617,11 @@ class DaemonState:
                             signal_for_new=signal.SIGKILL,
                         )
                         if descendants_alive:
-                            raise ConductorError("timed-out job descendants remained alive after SIGKILL escalation")
+                            job.error = (
+                                f"timed out after {effective_timeout:.1f}s; "
+                                "job processes remained alive after SIGKILL escalation"
+                            )
+                            self._append_system_line_locked(job, job.error + "\n")
                     if exit_code == 0:
                         exit_code = 124
                 if job.cancel_requested:

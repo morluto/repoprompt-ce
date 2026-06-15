@@ -289,6 +289,41 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(job_launch.kwargs["stderr"], subprocess.STDOUT)
         self.assertEqual(state.jobs[job.ticket].state, "completed")
 
+    def test_daemon_timeout_preserves_timeout_result_when_root_resists_sigkill(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "job-timeout-sigkill", "build", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        fake_stdout = mock.Mock()
+        fake_stdout.readline.side_effect = [b""]
+        fake_process = mock.Mock()
+        fake_process.pid = os.getpid()
+        fake_process.stdout = fake_stdout
+        fake_process.wait.side_effect = [
+            subprocess.TimeoutExpired(["fixture"], 1.0),
+            subprocess.TimeoutExpired(["fixture"], conductor.TERMINATE_GRACE_SECONDS),
+            subprocess.TimeoutExpired(["fixture"], conductor.KILL_GRACE_SECONDS),
+        ]
+
+        with mock.patch.object(conductor.subprocess, "Popen", return_value=fake_process), mock.patch.object(
+            conductor, "process_table_snapshot", return_value={os.getpid(): (os.getppid(), "fixture-start")}
+        ), mock.patch.object(state, "_terminate_process_group_locked"), mock.patch.object(
+            state, "_kill_process_group_locked"
+        ), mock.patch.object(
+            state, "_wait_for_process_tree_exit_locked", side_effect=[False, True]
+        ), mock.patch.object(
+            state, "_schedule_locked"
+        ), mock.patch.object(
+            state, "_refresh_output_summary"
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, 124)
+        self.assertTrue(job.timed_out)
+        self.assertIn("job processes remained alive after SIGKILL escalation", job.error or "")
+        self.assertNotIn("daemon runner error", job.result_summary or "")
+
     def test_run_operation_command_uses_devnull_stdin(self) -> None:
         completed = subprocess.CompletedProcess(["echo", "ok"], 0, "ok\n", "")
         with mock.patch.object(conductor.subprocess, "run", return_value=completed) as run, contextlib.redirect_stdout(io.StringIO()):
