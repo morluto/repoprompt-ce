@@ -176,13 +176,26 @@ enum ToolOutputFormatter {
         let isBackpressure = dto.errorCode == "search_backpressure" && dto.retryable == true
         let isWorktreeUnavailable = dto.errorCode == "worktree_scope_unavailable" && dto.retryable == true
         let isFreshnessTimeout = dto.errorCode == "workspace_freshness_timeout" && dto.retryable == true
-        lines.append((isBackpressure || isWorktreeUnavailable || isFreshnessTimeout) ? "## Search Results ⚠️" : "## Search Results ❌")
+        let readinessStatus: String? = switch dto.errorCode {
+        case "workspace_readiness_unavailable":
+            "Workspace readiness unavailable"
+        case "workspace_readiness_timeout":
+            "Workspace readiness timed out"
+        case "workspace_readiness_superseded":
+            "Workspace changed during search"
+        default:
+            nil
+        }
+        let isReadinessFailure = readinessStatus != nil && dto.retryable == true
+        lines.append((isBackpressure || isWorktreeUnavailable || isFreshnessTimeout || isReadinessFailure) ? "## Search Results ⚠️" : "## Search Results ❌")
         if isBackpressure {
             lines.append("- **Status**: Temporarily busy")
         } else if isWorktreeUnavailable {
             lines.append("- **Status**: Worktree unavailable")
         } else if isFreshnessTimeout {
             lines.append("- **Status**: Workspace freshness timed out")
+        } else if isReadinessFailure, let readinessStatus {
+            lines.append("- **Status**: \(readinessStatus)")
         }
         lines.append("- **Error**: \(error)")
         if let errorCode = dto.errorCode, !errorCode.isEmpty {
@@ -4851,6 +4864,7 @@ extension ToolOutputFormatter {
         let interaction = object["interaction"]?.objectValue
         let meta = object["_meta"]?.objectValue
         let sessionID = object["session_id"]?.stringValue ?? session?["id"]?.stringValue
+        let runID = object["run_id"]?.stringValue
         let status = prettifiedAgentStatus(object["status"]?.stringValue)
         let statusText = object["status_text"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionName = session?["name"]?.stringValue
@@ -4894,6 +4908,9 @@ extension ToolOutputFormatter {
         }
         if let sessionID, !sessionID.isEmpty {
             lines.append("- Session ID: `\(sessionID)`")
+        }
+        if let runID, !runID.isEmpty {
+            lines.append("- Run ID: `\(runID)`")
         }
         lines.append(contentsOf: formattedAgentRunWorktreeLines(worktrees))
         // Multi-wait metadata

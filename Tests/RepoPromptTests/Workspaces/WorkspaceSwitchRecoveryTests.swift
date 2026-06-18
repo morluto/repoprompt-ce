@@ -850,6 +850,236 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertEqual(composition.workspaceFilesViewModel.snapshotSelection(), newerSelection)
     }
 
+    func testWorkspaceSearchReadinessWaitsForExactSwitchGenerationAndRejectsStaleTicket() async throws {
+        let composition = makeComposition()
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+
+        let readinessGate = WorkspaceSwitchRecoveryGate()
+        manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+            await readinessGate.arriveAndWait()
+        }
+        let target = manager.createWorkspace(
+            name: "Readiness Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let switchTask = Task { @MainActor in
+            await manager.switchWorkspace(to: target, saveState: false, reason: "readinessExactGeneration")
+        }
+        addTeardownBlock {
+            await MainActor.run {
+                manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            }
+            await readinessGate.release()
+            _ = await switchTask.value
+        }
+        await readinessGate.waitUntilArrived()
+
+        guard case let .activating(workspaceID, generation) = manager.workspaceSearchReadinessState else {
+            await readinessGate.release()
+            _ = await switchTask.value
+            return XCTFail("Expected target-bound activating readiness")
+        }
+        XCTAssertEqual(workspaceID, target.id)
+        let expectedTicket = WorkspaceSearchReadinessTicket(workspaceID: target.id, generation: generation)
+        let readinessTask = Task { @MainActor in
+            try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+        }
+        try await waitUntil {
+            manager.workspaceSearchReadinessWaiterCountForTesting == 1
+        }
+
+        await readinessGate.release()
+        let switchResult = await switchTask.value
+        XCTAssertEqual(switchResult, .switched)
+        let ticket = try await readinessTask.value
+        XCTAssertEqual(ticket, expectedTicket)
+        XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+        XCTAssertNoThrow(try manager.validateWorkspaceSearchReadiness(ticket))
+        manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+
+        let nextTarget = manager.createWorkspace(
+            name: "Next Readiness Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let nextSwitchResult = await manager.switchWorkspace(
+            to: nextTarget,
+            saveState: false,
+            reason: "supersedeReadinessTicket"
+        )
+        XCTAssertEqual(nextSwitchResult, .switched)
+        do {
+            try manager.validateWorkspaceSearchReadiness(ticket)
+            XCTFail("Expected the previous readiness ticket to be superseded")
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            XCTAssertEqual(error, .superseded)
+        }
+    }
+
+    func testWorkspaceSearchReadinessCancellationAndTimeoutRemoveWaiters() async throws {
+        let composition = makeComposition()
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+
+        let readinessGate = WorkspaceSwitchRecoveryGate()
+        manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+            await readinessGate.arriveAndWait()
+        }
+        let target = manager.createWorkspace(
+            name: "Bounded Readiness Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let switchTask = Task { @MainActor in
+            await manager.switchWorkspace(to: target, saveState: false, reason: "boundedReadiness")
+        }
+        addTeardownBlock {
+            await MainActor.run {
+                manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            }
+            await readinessGate.release()
+            _ = await switchTask.value
+        }
+        await readinessGate.waitUntilArrived()
+
+        let cancelledWaiter = Task { @MainActor in
+            do {
+                _ = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+                XCTFail("Expected readiness wait cancellation")
+                return false
+            } catch is CancellationError {
+                return true
+            } catch {
+                XCTFail("Expected CancellationError, got \(error)")
+                return false
+            }
+        }
+        try await waitUntil {
+            manager.workspaceSearchReadinessWaiterCountForTesting == 1
+        }
+        cancelledWaiter.cancel()
+        let wasCancelled = await cancelledWaiter.value
+        XCTAssertTrue(wasCancelled)
+        try await waitUntil {
+            manager.workspaceSearchReadinessWaiterCountForTesting == 0
+        }
+
+        do {
+            _ = try await manager.awaitWorkspaceSearchReadiness(timeout: .milliseconds(20))
+            XCTFail("Expected readiness wait timeout")
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            XCTAssertEqual(error, .timedOut)
+        }
+        XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+
+        switchTask.cancel()
+        manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+        await readinessGate.release()
+        let switchResult = await switchTask.value
+        guard case .cancelled = switchResult else {
+            return XCTFail("Expected pre-hydration switch cancellation")
+        }
+        XCTAssertEqual(manager.workspaceSearchReadinessState, .idle)
+        XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+    }
+
+    func testSwitchPublishesTargetTicketBeforeOldRootUnloadAndCancellationRejectsIdle() async throws {
+        let root = try makeTemporaryDirectory(named: "ReadinessInvalidation")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "let oldWorkspaceValue = true\n".write(
+            to: root.appendingPathComponent("OldWorkspace.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let store = WorkspaceFileContextStore()
+        let composition = makeComposition(store: store)
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+        let source = manager.createWorkspace(
+            name: "Readiness Source \(UUID().uuidString.prefix(8))",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+        XCTAssertEqual(sourceSwitchResult, .switched)
+        let sourceTicket = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(1))
+
+        let readinessGate = WorkspaceSwitchRecoveryGate()
+        manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+            await readinessGate.arriveAndWait()
+        }
+        let target = manager.createWorkspace(
+            name: "Readiness Cancellation Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let switchTask = Task { @MainActor in
+            await manager.switchWorkspace(to: target, saveState: true, reason: "readinessCancellation")
+        }
+        addTeardownBlock {
+            await MainActor.run {
+                manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            }
+            await readinessGate.release()
+            _ = await switchTask.value
+        }
+        await readinessGate.waitUntilArrived()
+
+        XCTAssertEqual(manager.activeWorkspaceID, source.id)
+        guard case let .activating(workspaceID, generation) = manager.workspaceSearchReadinessState else {
+            await readinessGate.release()
+            _ = await switchTask.value
+            return XCTFail("Expected target-bound readiness before old-root unload")
+        }
+        XCTAssertEqual(workspaceID, target.id)
+        let targetTicket = WorkspaceSearchReadinessTicket(workspaceID: target.id, generation: generation)
+        let pendingTargetWaiter = Task { @MainActor in
+            try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+        }
+        try await waitUntil {
+            manager.workspaceSearchReadinessWaiterCountForTesting == 1
+        }
+        let rootsBeforeUnload = await store.roots()
+        XCTAssertTrue(rootsBeforeUnload.contains { $0.standardizedFullPath == root.path })
+        do {
+            try manager.validateWorkspaceSearchReadiness(sourceTicket)
+            XCTFail("Expected the source readiness ticket to be superseded")
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            XCTAssertEqual(error, .superseded)
+        }
+
+        await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+        XCTAssertEqual(manager.workspaceSearchReadinessState, .idle)
+        do {
+            _ = try await pendingTargetWaiter.value
+            XCTFail("Expected the pending target readiness wait to be superseded")
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            XCTAssertEqual(error, .superseded)
+        }
+        XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+        let rootsAfterCancellation = await store.roots()
+        XCTAssertTrue(rootsAfterCancellation.contains { $0.standardizedFullPath == root.path })
+        do {
+            _ = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(1))
+            XCTFail("Expected idle readiness to be unavailable")
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            XCTAssertEqual(error, .unavailable)
+        }
+
+        manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+        await readinessGate.release()
+        _ = await switchTask.value
+        XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+        guard let finalTicket = manager.workspaceSearchReadinessState.ticket else {
+            return XCTFail("Expected recovery to publish a new readiness ticket")
+        }
+        XCTAssertNotEqual(finalTicket, targetTicket)
+        XCTAssertEqual(finalTicket.workspaceID, manager.activeWorkspaceID)
+    }
+
     func testWatcherActivationFailureDegradesWorkspaceReadiness() async throws {
         let root = try makeTemporaryDirectory(named: "WatcherActivationFailure")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -879,6 +1109,9 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertEqual(failures.count, 1)
         XCTAssertEqual(failures.first?.standardizedRootPath, root.path)
         XCTAssertTrue(failures.first?.errorDescription.contains("Failed to start FSEvent stream") == true)
+        let ticket = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(1))
+        XCTAssertEqual(ticket.workspaceID, target.id)
+        XCTAssertNoThrow(try manager.validateWorkspaceSearchReadiness(ticket))
 
         let roots = await store.roots()
         let loadedRoot = try XCTUnwrap(roots.first)

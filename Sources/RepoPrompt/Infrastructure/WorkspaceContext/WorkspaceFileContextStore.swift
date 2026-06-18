@@ -136,14 +136,152 @@ actor WorkspaceFileContextStore {
         let enableHierarchicalIgnores: Bool
     }
 
+    private struct RootLoadCompletionIdentity {
+        let rootID: UUID
+        let lifetimeID: UUID
+    }
+
+    private final class RootLoadFlightCompletion: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completionIdentity: RootLoadCompletionIdentity?
+
+        func record(rootID: UUID, lifetimeID: UUID) {
+            lock.lock()
+            completionIdentity = RootLoadCompletionIdentity(
+                rootID: rootID,
+                lifetimeID: lifetimeID
+            )
+            lock.unlock()
+        }
+
+        func identity() -> RootLoadCompletionIdentity? {
+            lock.lock()
+            let identity = completionIdentity
+            lock.unlock()
+            return identity
+        }
+    }
+
+    private struct RootLoadFlight {
+        let id: UUID
+        let task: Task<WorkspaceRootRecord, Error>
+        let completion: RootLoadFlightCompletion
+    }
+
     private struct SessionWorktreeRootLifetimeKey: Hashable {
         let rootID: UUID
         let lifetimeID: UUID
     }
 
+    private struct WatcherInfrastructureKey: Hashable {
+        let rootID: UUID
+        let lifetimeID: UUID
+    }
+
+    private struct WatcherPublisherAttachment {
+        let subscription: WorkspaceFileSystemIngressCoordinator.Subscription
+        let cancellable: AnyCancellable
+    }
+
+    private struct WatcherInfrastructureFlight {
+        let id: UUID
+        let task: Task<Void, Error>
+    }
+
     private struct SessionWorktreeOwnershipRecord {
         let bindingFingerprint: String
         let roots: [WorkspaceSessionWorktreeOwnedRoot]
+    }
+
+    private struct SessionWorktreeReservedLoadFlight {
+        let standardizedPath: String
+        let flight: RootLoadFlight
+    }
+
+    private struct SessionWorktreeOwnershipRemoval {
+        var ownedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        var reservedLoadFlights: [SessionWorktreeReservedLoadFlight] = []
+
+        mutating func append(_ other: SessionWorktreeOwnershipRemoval) {
+            ownedRoots.append(contentsOf: other.ownedRoots)
+            reservedLoadFlights.append(contentsOf: other.reservedLoadFlights)
+        }
+    }
+
+    private final class RootLoadTaskWaitRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resolution: Result<WorkspaceRootRecord, Error>?
+        private var continuation: CheckedContinuation<WorkspaceRootRecord, Error>?
+
+        func value() async throws -> WorkspaceRootRecord {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if let resolution {
+                    lock.unlock()
+                    continuation.resume(with: resolution)
+                } else {
+                    precondition(self.continuation == nil)
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func resolve(_ resolution: Result<WorkspaceRootRecord, Error>) {
+            let continuation: CheckedContinuation<WorkspaceRootRecord, Error>?
+            lock.lock()
+            guard self.resolution == nil else {
+                lock.unlock()
+                return
+            }
+            self.resolution = resolution
+            continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(with: resolution)
+        }
+
+        func cancel() {
+            resolve(.failure(CancellationError()))
+        }
+    }
+
+    private final class WatcherInfrastructureTaskWaitRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resolution: Result<Void, Error>?
+        private var continuation: CheckedContinuation<Void, Error>?
+
+        func value() async throws {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if let resolution {
+                    lock.unlock()
+                    continuation.resume(with: resolution)
+                } else {
+                    precondition(self.continuation == nil)
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func resolve(_ resolution: Result<Void, Error>) {
+            let continuation: CheckedContinuation<Void, Error>?
+            lock.lock()
+            guard self.resolution == nil else {
+                lock.unlock()
+                return
+            }
+            self.resolution = resolution
+            continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(with: resolution)
+        }
+
+        func cancel() {
+            resolve(.failure(CancellationError()))
+        }
     }
 
     private struct SliceRebaseSourceCacheKey: Hashable {
@@ -501,6 +639,8 @@ actor WorkspaceFileContextStore {
         private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
         private var storeEditDeferredPublicationDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var publisherIngressWillWaitHandler: (@Sendable (Set<UUID>) async -> Void)?
+        private var watcherPublisherIngressDidOpenHandler: (@Sendable (UUID, UUID) async -> Void)?
+        private var watcherInfrastructureDidJoinFlightHandler: (@Sendable (UUID, UUID) async -> Void)?
         private var watcherServiceStateWillReconcileHandler: (@Sendable (UUID, Bool) async -> Void)?
         private var watcherStopWillBeginHandler: (@Sendable (UUID) async -> Void)?
         private var rootUnloadTerminationDidCompleteHandler: (@Sendable (WorkspaceRootUnloadTerminationDiagnostics) async -> Void)?
@@ -559,6 +699,18 @@ actor WorkspaceFileContextStore {
 
         func setPublisherIngressWillWaitHandler(_ handler: (@Sendable (Set<UUID>) async -> Void)?) {
             publisherIngressWillWaitHandler = handler
+        }
+
+        func setWatcherPublisherIngressDidOpenHandler(_ handler: (@Sendable (UUID, UUID) async -> Void)?) {
+            watcherPublisherIngressDidOpenHandler = handler
+        }
+
+        func setWatcherInfrastructureDidJoinFlightHandler(_ handler: (@Sendable (UUID, UUID) async -> Void)?) {
+            watcherInfrastructureDidJoinFlightHandler = handler
+        }
+
+        func watcherInfrastructureFlightCountForTesting(rootID: UUID) -> Int {
+            watcherInfrastructureFlightsByKey.keys.count(where: { $0.rootID == rootID })
         }
 
         func setWatcherServiceStateWillReconcileHandler(_ handler: (@Sendable (UUID, Bool) async -> Void)?) {
@@ -1152,7 +1304,7 @@ actor WorkspaceFileContextStore {
     private var rootLoadOrder: [UUID] = []
     private var unloadingRootPaths: Set<String> = []
     private var unloadWaitersByRootPath: [String: [UUID: CheckedContinuation<Void, Error>]] = [:]
-    private var rootLoadTasksByPath: [String: Task<WorkspaceRootRecord, Error>] = [:]
+    private var rootLoadFlightsByPath: [String: RootLoadFlight] = [:]
     private var rootLoadConfigurationsByPath: [String: RootLoadConfiguration] = [:]
     private var catalogGenerationsByScope: [WorkspaceLookupRootScope: UInt64] = [
         .visibleWorkspace: 0,
@@ -1215,12 +1367,17 @@ actor WorkspaceFileContextStore {
     private static let maxSliceRebaseSourceEntryCount = 64
     private static let maxSliceRebaseSourceTotalBytes = 32 * 1024 * 1024
     private static let maxSliceRebaseSourceEntryBytes = 8 * 1024 * 1024
-    private var watcherCancellablesByRootID: [UUID: AnyCancellable] = [:]
+    private var watcherPublisherAttachmentsByKey: [WatcherInfrastructureKey: WatcherPublisherAttachment] = [:]
+    private var watcherInfrastructureFlightsByKey: [WatcherInfrastructureKey: WatcherInfrastructureFlight] = [:]
     private var explicitWatcherDemandRootIDs = Set<UUID>()
+    private var explicitWatcherDemandGenerationByKey: [WatcherInfrastructureKey: UInt64] = [:]
     private var latestSessionWorktreeOwnershipGenerationByOwnerID: [UUID: UInt64] = [:]
     private var installedSessionWorktreeOwnershipTokenByOwnerID: [UUID: WorkspaceSessionWorktreeOwnershipToken] = [:]
     private var sessionWorktreeOwnershipRecordsByToken: [WorkspaceSessionWorktreeOwnershipToken: SessionWorktreeOwnershipRecord] = [:]
     private var sessionWorktreeOwnershipTokensByRootLifetime: [SessionWorktreeRootLifetimeKey: Set<WorkspaceSessionWorktreeOwnershipToken>] = [:]
+    private var sessionWorktreeReservationTokensByStandardizedPath: [String: Set<WorkspaceSessionWorktreeOwnershipToken>] = [:]
+    private var sessionWorktreeReservedPathsByToken: [WorkspaceSessionWorktreeOwnershipToken: Set<String>] = [:]
+    private var sessionWorktreeReservationLoadFlightsByToken: [WorkspaceSessionWorktreeOwnershipToken: [String: RootLoadFlight]] = [:]
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
     private let unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy
     private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
@@ -1282,8 +1439,11 @@ actor WorkspaceFileContextStore {
             searchContentMemoryPressureSource.cancel()
         #endif
         codeScanResultTask?.cancel()
-        for cancellable in watcherCancellablesByRootID.values {
-            cancellable.cancel()
+        for attachment in watcherPublisherAttachmentsByKey.values {
+            attachment.cancellable.cancel()
+        }
+        for flight in watcherInfrastructureFlightsByKey.values {
+            flight.task.cancel()
         }
         for continuation in codemapUpdateContinuations.values {
             continuation.finish()
@@ -1343,44 +1503,147 @@ actor WorkspaceFileContextStore {
     }
 
     func startWatchingRoot(id rootID: UUID) async throws {
-        _ = try state(for: rootID)
+        let state = try state(for: rootID)
+        let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+        let demandGeneration = (explicitWatcherDemandGenerationByKey[key] ?? 0) &+ 1
+        explicitWatcherDemandGenerationByKey[key] = demandGeneration
         explicitWatcherDemandRootIDs.insert(rootID)
         do {
             try await reconcileAggregateWatcherDemand(rootID: rootID)
         } catch {
-            explicitWatcherDemandRootIDs.remove(rootID)
-            try? await reconcileAggregateWatcherDemand(rootID: rootID)
+            if explicitWatcherDemandGenerationByKey[key] == demandGeneration,
+               isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: key.lifetimeID)
+            {
+                explicitWatcherDemandRootIDs.remove(rootID)
+                try? await reconcileAggregateWatcherDemand(rootID: rootID)
+            }
             throw error
         }
     }
 
     private func ensureWatcherInfrastructure(state: RootState, rootID: UUID) async throws {
-        if watcherCancellablesByRootID[rootID] != nil {
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            await waitForCurrentPublisherIngress(rootIDs: [rootID])
-            return
-        }
-        guard try await attachPublisherIngress(state: state, rootID: rootID) else {
+        let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: key.lifetimeID) else {
             throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(state.root.standardizedFullPath)
         }
-        do {
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            await waitForCurrentPublisherIngress(rootIDs: [rootID])
-        } catch {
-            watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
-            publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
-            try? await reconcileWatcherServiceState(state.service, rootID: rootID)
-            await waitForCurrentPublisherIngress(rootIDs: [rootID])
-            throw error
+        if let flight = watcherInfrastructureFlightsByKey[key] {
+            #if DEBUG
+                if let watcherInfrastructureDidJoinFlightHandler {
+                    await watcherInfrastructureDidJoinFlightHandler(rootID, key.lifetimeID)
+                }
+            #endif
+            try await awaitWatcherInfrastructureFlight(flight)
+            return
+        }
+
+        let flightID = UUID()
+        let rootPath = state.root.standardizedFullPath
+        let task = Task { [weak self] in
+            guard let self else { throw CancellationError() }
+            do {
+                try await performWatcherInfrastructureSetup(key: key, rootPath: rootPath)
+                await clearWatcherInfrastructureFlight(key: key, expectedID: flightID)
+            } catch {
+                await clearWatcherInfrastructureFlight(key: key, expectedID: flightID)
+                throw error
+            }
+        }
+        let flight = WatcherInfrastructureFlight(id: flightID, task: task)
+        watcherInfrastructureFlightsByKey[key] = flight
+        try await awaitWatcherInfrastructureFlight(flight)
+    }
+
+    private func awaitWatcherInfrastructureFlight(_ flight: WatcherInfrastructureFlight) async throws {
+        let race = WatcherInfrastructureTaskWaitRace()
+        Task {
+            let result = await flight.task.result
+            race.resolve(result)
+        }
+        try await withTaskCancellationHandler {
+            try await race.value()
+        } onCancel: {
+            race.cancel()
         }
     }
 
-    private func attachPublisherIngress(state: RootState, rootID: UUID) async throws -> Bool {
+    private func clearWatcherInfrastructureFlight(key: WatcherInfrastructureKey, expectedID: UUID) {
+        guard watcherInfrastructureFlightsByKey[key]?.id == expectedID else { return }
+        watcherInfrastructureFlightsByKey.removeValue(forKey: key)
+    }
+
+    private func performWatcherInfrastructureSetup(
+        key: WatcherInfrastructureKey,
+        rootPath: String
+    ) async throws {
+        while true {
+            guard let state = rootStatesByID[key.rootID],
+                  state.lifetimeID == key.lifetimeID,
+                  hasAggregateWatcherDemand(rootID: key.rootID, lifetimeID: key.lifetimeID)
+            else {
+                throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(rootPath)
+            }
+
+            let subscription: WorkspaceFileSystemIngressCoordinator.Subscription
+            if let attachment = watcherPublisherAttachmentsByKey[key],
+               publisherIngressCoordinator.isPublisherIngressOpen(attachment.subscription)
+            {
+                subscription = attachment.subscription
+            } else {
+                watcherPublisherAttachmentsByKey.removeValue(forKey: key)?.cancellable.cancel()
+                guard let attachedSubscription = try await attachPublisherIngress(
+                    state: state,
+                    key: key
+                ) else {
+                    guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
+                          hasAggregateWatcherDemand(rootID: key.rootID, lifetimeID: key.lifetimeID)
+                    else {
+                        throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(rootPath)
+                    }
+                    continue
+                }
+                subscription = attachedSubscription
+            }
+
+            do {
+                try await reconcileWatcherServiceState(state.service, rootID: key.rootID)
+                await waitForCurrentPublisherIngress(rootIDs: [key.rootID])
+            } catch {
+                removeWatcherPublisherAttachment(key: key, subscription: subscription)
+                if isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID) {
+                    try? await reconcileWatcherServiceState(state.service, rootID: key.rootID)
+                    await waitForCurrentPublisherIngress(rootIDs: [key.rootID])
+                }
+                throw error
+            }
+
+            guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
+                  hasAggregateWatcherDemand(rootID: key.rootID, lifetimeID: key.lifetimeID)
+            else {
+                removeWatcherPublisherAttachment(key: key, subscription: subscription)
+                if isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID) {
+                    try? await reconcileWatcherServiceState(state.service, rootID: key.rootID)
+                    await waitForCurrentPublisherIngress(rootIDs: [key.rootID])
+                }
+                throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(rootPath)
+            }
+            guard watcherPublisherAttachmentsByKey[key]?.subscription == subscription,
+                  publisherIngressCoordinator.isPublisherIngressOpen(subscription)
+            else {
+                continue
+            }
+            return
+        }
+    }
+
+    private func attachPublisherIngress(
+        state: RootState,
+        key: WatcherInfrastructureKey
+    ) async throws -> WorkspaceFileSystemIngressCoordinator.Subscription? {
+        guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID) else { return nil }
         let root = state.root
-        let lifetimeID = state.lifetimeID
         let diagnosticRootToken = state.service.diagnosticRootToken
         let publisherIngressCoordinator = publisherIngressCoordinator
-        let subscription = publisherIngressCoordinator.openPublisherIngress(rootID: rootID) { [weak self] publication, publicationCorrelation in
+        let subscription = publisherIngressCoordinator.openPublisherIngress(rootID: key.rootID) { [weak self] publication, publicationCorrelation in
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkBegan,
                 correlation: publicationCorrelation,
@@ -1394,17 +1657,22 @@ actor WorkspaceFileContextStore {
             await self?.handleObservedPublisherFileSystemPublication(
                 publication,
                 root: root,
-                expectedLifetimeID: lifetimeID,
+                expectedLifetimeID: key.lifetimeID,
                 publicationCorrelation: publicationCorrelation,
                 diagnosticRootToken: diagnosticRootToken
             )
         }
+        #if DEBUG
+            if let watcherPublisherIngressDidOpenHandler {
+                await watcherPublisherIngressDidOpenHandler(key.rootID, key.lifetimeID)
+            }
+        #endif
         let publisher = await state.service.publisherForChanges()
-        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: lifetimeID),
+        guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
               publisherIngressCoordinator.isPublisherIngressOpen(subscription)
         else {
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            return false
+            publisherIngressCoordinator.closePublisherIngress(subscription)
+            return nil
         }
         let cancellable = publisher.sink { publication in
             #if DEBUG || EDIT_FLOW_PERF
@@ -1428,26 +1696,48 @@ actor WorkspaceFileContextStore {
                 lifecycleCorrelation: publicationCorrelation
             )
         }
-        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: lifetimeID),
+        guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
               publisherIngressCoordinator.isPublisherIngressOpen(subscription)
         else {
             cancellable.cancel()
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            return false
+            publisherIngressCoordinator.closePublisherIngress(subscription)
+            return nil
         }
-        watcherCancellablesByRootID[rootID] = cancellable
-        return true
+        watcherPublisherAttachmentsByKey[key] = WatcherPublisherAttachment(
+            subscription: subscription,
+            cancellable: cancellable
+        )
+        return subscription
+    }
+
+    private func removeWatcherPublisherAttachment(
+        key: WatcherInfrastructureKey,
+        subscription: WorkspaceFileSystemIngressCoordinator.Subscription
+    ) {
+        if watcherPublisherAttachmentsByKey[key]?.subscription == subscription {
+            watcherPublisherAttachmentsByKey.removeValue(forKey: key)?.cancellable.cancel()
+        }
+        publisherIngressCoordinator.closePublisherIngress(subscription)
     }
 
     #if DEBUG
         func attachPublisherIngressWithoutStartingWatcherForTesting(rootID: UUID) async throws -> Bool {
-            if watcherCancellablesByRootID[rootID] != nil { return true }
             let state = try state(for: rootID)
-            return try await attachPublisherIngress(state: state, rootID: rootID)
+            let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+            if let attachment = watcherPublisherAttachmentsByKey[key],
+               publisherIngressCoordinator.isPublisherIngressOpen(attachment.subscription)
+            {
+                return true
+            }
+            return try await attachPublisherIngress(state: state, key: key) != nil
         }
     #endif
 
     func stopWatchingRoot(id rootID: UUID) async {
+        if let state = rootStatesByID[rootID] {
+            let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+            explicitWatcherDemandGenerationByKey[key, default: 0] &+= 1
+        }
         explicitWatcherDemandRootIDs.remove(rootID)
         try? await reconcileAggregateWatcherDemand(rootID: rootID)
     }
@@ -1481,11 +1771,11 @@ actor WorkspaceFileContextStore {
         let supersededTokens = sessionWorktreeOwnershipRecordsByToken.keys.filter {
             $0.ownerID == ownerID && $0 != installedToken
         }
-        var supersededRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        var supersededResources = SessionWorktreeOwnershipRemoval()
         for supersededToken in supersededTokens {
-            supersededRoots.append(contentsOf: removeSessionWorktreeOwnershipToken(supersededToken))
+            supersededResources.append(removeSessionWorktreeOwnershipToken(supersededToken))
         }
-        await cleanupOrphanedSessionWorktreeRoots(supersededRoots)
+        await cleanupOrphanedSessionWorktreeResources(supersededResources)
         guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
             throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
         }
@@ -1494,20 +1784,31 @@ actor WorkspaceFileContextStore {
             bindingFingerprint: bindingFingerprint,
             roots: []
         )
+        reserveSessionWorktreePaths(standardizedPaths, for: token)
         do {
             var preparedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
             for path in standardizedPaths {
+                try Task.checkCancellation()
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
+                    throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                }
                 let root = try await loadRoot(
                     path: path,
                     kind: .sessionWorktree,
                     respectGitignore: true,
                     respectRepoIgnore: true,
-                    respectCursorignore: true
+                    respectCursorignore: true,
+                    sessionWorktreeReservationToken: token
                 )
-                guard let state = rootStatesByID[root.id],
+                try Task.checkCancellation()
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
+                      let state = rootStatesByID[root.id],
                       state.root.kind == .sessionWorktree,
                       state.root.standardizedFullPath == path
                 else {
+                    if latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] != generation {
+                        throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                    }
                     throw WorkspaceSessionWorktreeOwnershipError.invalidRootKind(path)
                 }
                 let ownedRoot = WorkspaceSessionWorktreeOwnedRoot(
@@ -1515,18 +1816,15 @@ actor WorkspaceFileContextStore {
                     lifetimeID: state.lifetimeID,
                     standardizedPhysicalPath: path
                 )
-                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
-                    await cleanupOrphanedSessionWorktreeRoots([ownedRoot])
-                    throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
-                }
                 preparedRoots.append(ownedRoot)
-                sessionWorktreeOwnershipRecordsByToken[token] = SessionWorktreeOwnershipRecord(
+                try convertSessionWorktreeReservationToClaim(
+                    token: token,
                     bindingFingerprint: bindingFingerprint,
-                    roots: preparedRoots
+                    preparedRoots: preparedRoots,
+                    ownedRoot: ownedRoot
                 )
-                let rootKey = SessionWorktreeRootLifetimeKey(rootID: root.id, lifetimeID: state.lifetimeID)
-                sessionWorktreeOwnershipTokensByRootLifetime[rootKey, default: []].insert(token)
                 try await reconcileAggregateWatcherDemand(rootID: root.id)
+                try Task.checkCancellation()
                 guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
                       isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID)
                 else {
@@ -1540,8 +1838,8 @@ actor WorkspaceFileContextStore {
                 reusesInstalledOwnership: false
             )
         } catch {
-            let roots = removeSessionWorktreeOwnershipToken(token)
-            await cleanupOrphanedSessionWorktreeRoots(roots)
+            let resources = removeSessionWorktreeOwnershipToken(token)
+            await cleanupOrphanedSessionWorktreeResources(resources)
             throw error
         }
     }
@@ -1570,14 +1868,14 @@ actor WorkspaceFileContextStore {
 
         if record.roots.isEmpty {
             installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: preparation.token.ownerID)
-            var releasedRoots = removeSessionWorktreeOwnershipToken(preparation.token)
+            var releasedResources = removeSessionWorktreeOwnershipToken(preparation.token)
             let previousTokens = sessionWorktreeOwnershipRecordsByToken.keys.filter {
                 $0.ownerID == preparation.token.ownerID
             }
             for previousToken in previousTokens {
-                releasedRoots.append(contentsOf: removeSessionWorktreeOwnershipToken(previousToken))
+                releasedResources.append(removeSessionWorktreeOwnershipToken(previousToken))
             }
-            scheduleOrphanedSessionWorktreeRootCleanup(releasedRoots)
+            scheduleOrphanedSessionWorktreeResourceCleanup(releasedResources)
             return []
         }
 
@@ -1585,11 +1883,11 @@ actor WorkspaceFileContextStore {
             preparation.token,
             forKey: preparation.token.ownerID
         )
-        var previousRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        var previousResources = SessionWorktreeOwnershipRemoval()
         if let previousToken, previousToken != preparation.token {
-            previousRoots = removeSessionWorktreeOwnershipToken(previousToken)
+            previousResources = removeSessionWorktreeOwnershipToken(previousToken)
         }
-        scheduleOrphanedSessionWorktreeRootCleanup(previousRoots)
+        scheduleOrphanedSessionWorktreeResourceCleanup(previousResources)
         return record.roots
     }
 
@@ -1599,19 +1897,19 @@ actor WorkspaceFileContextStore {
         guard !preparation.reusesInstalledOwnership,
               installedSessionWorktreeOwnershipTokenByOwnerID[preparation.token.ownerID] != preparation.token
         else { return }
-        let roots = removeSessionWorktreeOwnershipToken(preparation.token)
-        await cleanupOrphanedSessionWorktreeRoots(roots)
+        let resources = removeSessionWorktreeOwnershipToken(preparation.token)
+        await cleanupOrphanedSessionWorktreeResources(resources)
     }
 
     func releaseSessionWorktreeOwnership(ownerID: UUID) async {
         latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID, default: 0] &+= 1
         installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: ownerID)
         let tokens = sessionWorktreeOwnershipRecordsByToken.keys.filter { $0.ownerID == ownerID }
-        var roots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        var resources = SessionWorktreeOwnershipRemoval()
         for token in tokens {
-            roots.append(contentsOf: removeSessionWorktreeOwnershipToken(token))
+            resources.append(removeSessionWorktreeOwnershipToken(token))
         }
-        await cleanupOrphanedSessionWorktreeRoots(roots)
+        await cleanupOrphanedSessionWorktreeResources(resources)
     }
 
     func sessionWorktreeOwnershipCovers(
@@ -1651,6 +1949,7 @@ actor WorkspaceFileContextStore {
             let installedOwnerCount: Int
             let provisionalOwnerCount: Int
             let rootClaimCount: Int
+            let pathReservationCount: Int
             let explicitWatcherDemandCount: Int
         }
 
@@ -1660,6 +1959,7 @@ actor WorkspaceFileContextStore {
                 installedOwnerCount: installedTokens.count,
                 provisionalOwnerCount: sessionWorktreeOwnershipRecordsByToken.keys.count(where: { !installedTokens.contains($0) }),
                 rootClaimCount: sessionWorktreeOwnershipTokensByRootLifetime.values.reduce(0) { $0 + $1.count },
+                pathReservationCount: sessionWorktreeReservationTokensByStandardizedPath.values.reduce(0) { $0 + $1.count },
                 explicitWatcherDemandCount: explicitWatcherDemandRootIDs.count
             )
         }
@@ -1667,37 +1967,135 @@ actor WorkspaceFileContextStore {
 
     private func sessionWorktreeOwnershipRecordIsCurrent(_ record: SessionWorktreeOwnershipRecord) -> Bool {
         record.roots.allSatisfy { root in
+            let watcherKey = WatcherInfrastructureKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
             guard let state = rootStatesByID[root.rootID],
                   state.lifetimeID == root.lifetimeID,
                   state.root.kind == .sessionWorktree,
                   state.root.standardizedFullPath == root.standardizedPhysicalPath,
-                  watcherCancellablesByRootID[root.rootID] != nil,
-                  publisherIngressCoordinator.hasOpenPublisherIngress(rootID: root.rootID)
+                  let attachment = watcherPublisherAttachmentsByKey[watcherKey],
+                  publisherIngressCoordinator.isPublisherIngressOpen(attachment.subscription)
             else { return false }
             let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
             return sessionWorktreeOwnershipTokensByRootLifetime[key]?.isEmpty == false
         }
     }
 
+    private func reserveSessionWorktreePaths(
+        _ standardizedPaths: [String],
+        for token: WorkspaceSessionWorktreeOwnershipToken
+    ) {
+        guard !standardizedPaths.isEmpty else { return }
+        let paths = Set(standardizedPaths)
+        sessionWorktreeReservedPathsByToken[token] = paths
+        for path in paths {
+            sessionWorktreeReservationTokensByStandardizedPath[path, default: []].insert(token)
+        }
+    }
+
+    private func registerSessionWorktreeReservationLoadFlight(
+        _ flight: RootLoadFlight,
+        standardizedPath: String,
+        token: WorkspaceSessionWorktreeOwnershipToken
+    ) {
+        guard sessionWorktreeReservedPathsByToken[token]?.contains(standardizedPath) == true else { return }
+        sessionWorktreeReservationLoadFlightsByToken[token, default: [:]][standardizedPath] = flight
+    }
+
+    private func convertSessionWorktreeReservationToClaim(
+        token: WorkspaceSessionWorktreeOwnershipToken,
+        bindingFingerprint: String,
+        preparedRoots: [WorkspaceSessionWorktreeOwnedRoot],
+        ownedRoot: WorkspaceSessionWorktreeOwnedRoot
+    ) throws {
+        guard let record = sessionWorktreeOwnershipRecordsByToken[token],
+              record.bindingFingerprint == bindingFingerprint,
+              record.roots == Array(preparedRoots.dropLast()),
+              preparedRoots.last == ownedRoot,
+              sessionWorktreeReservedPathsByToken[token]?.contains(ownedRoot.standardizedPhysicalPath) == true,
+              sessionWorktreeReservationTokensByStandardizedPath[
+                  ownedRoot.standardizedPhysicalPath
+              ]?.contains(token) == true
+        else {
+            throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+        }
+
+        sessionWorktreeOwnershipRecordsByToken[token] = SessionWorktreeOwnershipRecord(
+            bindingFingerprint: bindingFingerprint,
+            roots: preparedRoots
+        )
+        let rootKey = SessionWorktreeRootLifetimeKey(
+            rootID: ownedRoot.rootID,
+            lifetimeID: ownedRoot.lifetimeID
+        )
+        sessionWorktreeOwnershipTokensByRootLifetime[rootKey, default: []].insert(token)
+        removeSessionWorktreeReservation(
+            standardizedPath: ownedRoot.standardizedPhysicalPath,
+            token: token
+        )
+    }
+
+    private func removeSessionWorktreeReservation(
+        standardizedPath: String,
+        token: WorkspaceSessionWorktreeOwnershipToken
+    ) {
+        sessionWorktreeReservationTokensByStandardizedPath[standardizedPath]?.remove(token)
+        if sessionWorktreeReservationTokensByStandardizedPath[standardizedPath]?.isEmpty == true {
+            sessionWorktreeReservationTokensByStandardizedPath.removeValue(forKey: standardizedPath)
+        }
+        sessionWorktreeReservedPathsByToken[token]?.remove(standardizedPath)
+        sessionWorktreeReservationLoadFlightsByToken[token]?.removeValue(forKey: standardizedPath)
+        if sessionWorktreeReservedPathsByToken[token]?.isEmpty == true {
+            sessionWorktreeReservedPathsByToken.removeValue(forKey: token)
+        }
+        if sessionWorktreeReservationLoadFlightsByToken[token]?.isEmpty == true {
+            sessionWorktreeReservationLoadFlightsByToken.removeValue(forKey: token)
+        }
+    }
+
     private func removeSessionWorktreeOwnershipToken(
         _ token: WorkspaceSessionWorktreeOwnershipToken
-    ) -> [WorkspaceSessionWorktreeOwnedRoot] {
-        guard let record = sessionWorktreeOwnershipRecordsByToken.removeValue(forKey: token) else { return [] }
-        for root in record.roots {
+    ) -> SessionWorktreeOwnershipRemoval {
+        let record = sessionWorktreeOwnershipRecordsByToken.removeValue(forKey: token)
+        let reservedPaths = sessionWorktreeReservedPathsByToken.removeValue(forKey: token) ?? []
+        let reservedLoadFlightsByPath =
+            sessionWorktreeReservationLoadFlightsByToken.removeValue(forKey: token) ?? [:]
+        for path in reservedPaths {
+            sessionWorktreeReservationTokensByStandardizedPath[path]?.remove(token)
+            if sessionWorktreeReservationTokensByStandardizedPath[path]?.isEmpty == true {
+                sessionWorktreeReservationTokensByStandardizedPath.removeValue(forKey: path)
+            }
+        }
+        for root in record?.roots ?? [] {
             let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
             sessionWorktreeOwnershipTokensByRootLifetime[key]?.remove(token)
             if sessionWorktreeOwnershipTokensByRootLifetime[key]?.isEmpty == true {
                 sessionWorktreeOwnershipTokensByRootLifetime.removeValue(forKey: key)
             }
         }
-        return record.roots
+        return SessionWorktreeOwnershipRemoval(
+            ownedRoots: record?.roots ?? [],
+            reservedLoadFlights: reservedLoadFlightsByPath.compactMap { path, flight in
+                guard reservedPaths.contains(path) else { return nil }
+                return SessionWorktreeReservedLoadFlight(
+                    standardizedPath: path,
+                    flight: flight
+                )
+            }
+        )
     }
 
-    private func scheduleOrphanedSessionWorktreeRootCleanup(
-        _ roots: [WorkspaceSessionWorktreeOwnedRoot]
+    private func scheduleOrphanedSessionWorktreeResourceCleanup(
+        _ resources: SessionWorktreeOwnershipRemoval
     ) {
-        guard !roots.isEmpty else { return }
-        Task { await cleanupOrphanedSessionWorktreeRoots(roots) }
+        guard !resources.ownedRoots.isEmpty || !resources.reservedLoadFlights.isEmpty else { return }
+        Task { await cleanupOrphanedSessionWorktreeResources(resources) }
+    }
+
+    private func cleanupOrphanedSessionWorktreeResources(
+        _ resources: SessionWorktreeOwnershipRemoval
+    ) async {
+        await cleanupOrphanedSessionWorktreeRoots(resources.ownedRoots)
+        scheduleOrphanedSessionWorktreeLoadFlightCleanup(resources.reservedLoadFlights)
     }
 
     private func cleanupOrphanedSessionWorktreeRoots(
@@ -1708,14 +2106,38 @@ actor WorkspaceFileContextStore {
             let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
             guard seen.insert(key).inserted,
                   isRootLifetimeCurrent(rootID: root.rootID, expectedLifetimeID: root.lifetimeID),
+                  rootStatesByID[root.rootID]?.root.standardizedFullPath == root.standardizedPhysicalPath,
                   !hasAggregateWatcherDemand(rootID: root.rootID, lifetimeID: root.lifetimeID)
             else { continue }
             try? await reconcileAggregateWatcherDemand(rootID: root.rootID)
             guard isRootLifetimeCurrent(rootID: root.rootID, expectedLifetimeID: root.lifetimeID),
                   !hasAggregateWatcherDemand(rootID: root.rootID, lifetimeID: root.lifetimeID),
-                  rootStatesByID[root.rootID]?.root.kind == .sessionWorktree
+                  rootStatesByID[root.rootID]?.root.kind == .sessionWorktree,
+                  rootStatesByID[root.rootID]?.root.standardizedFullPath == root.standardizedPhysicalPath
             else { continue }
             await unloadRoot(id: root.rootID)
+        }
+    }
+
+    private func scheduleOrphanedSessionWorktreeLoadFlightCleanup(
+        _ reservations: [SessionWorktreeReservedLoadFlight]
+    ) {
+        var scheduledFlightIDs = Set<UUID>()
+        for reservation in reservations where scheduledFlightIDs.insert(reservation.flight.id).inserted {
+            let flight = reservation.flight
+            Task { [weak self] in
+                guard let root = try? await flight.task.value,
+                      let identity = flight.completion.identity(),
+                      root.id == identity.rootID
+                else { return }
+                await self?.cleanupOrphanedSessionWorktreeRoots([
+                    WorkspaceSessionWorktreeOwnedRoot(
+                        rootID: identity.rootID,
+                        lifetimeID: identity.lifetimeID,
+                        standardizedPhysicalPath: reservation.standardizedPath
+                    )
+                ])
+            }
         }
     }
 
@@ -1726,8 +2148,16 @@ actor WorkspaceFileContextStore {
     }
 
     private func hasAggregateWatcherDemand(rootID: UUID, lifetimeID: UUID) -> Bool {
-        explicitWatcherDemandRootIDs.contains(rootID)
+        let hasPathReservation: Bool = if let state = rootStatesByID[rootID], state.lifetimeID == lifetimeID {
+            sessionWorktreeReservationTokensByStandardizedPath[
+                state.root.standardizedFullPath
+            ]?.isEmpty == false
+        } else {
+            false
+        }
+        return explicitWatcherDemandRootIDs.contains(rootID)
             || sessionWorktreeOwnerCount(rootID: rootID, lifetimeID: lifetimeID) > 0
+            || hasPathReservation
     }
 
     private func reconcileAggregateWatcherDemand(rootID: UUID) async throws {
@@ -1739,7 +2169,8 @@ actor WorkspaceFileContextStore {
             try await ensureWatcherInfrastructure(state: state, rootID: rootID)
             return
         }
-        watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
+        let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+        watcherPublisherAttachmentsByKey.removeValue(forKey: key)?.cancellable.cancel()
         publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
         try await reconcileWatcherServiceState(state.service, rootID: rootID)
         await waitForCurrentPublisherIngress(rootIDs: [rootID])
@@ -4179,7 +4610,8 @@ actor WorkspaceFileContextStore {
         respectCursorignore: Bool = true,
         skipSymlinks: Bool = true,
         enableHierarchicalIgnores: Bool = true,
-        cancelUnderlyingLoadOnCallerCancellation: Bool = false
+        cancelUnderlyingLoadOnCallerCancellation: Bool = false,
+        sessionWorktreeReservationToken: WorkspaceSessionWorktreeOwnershipToken? = nil
     ) async throws -> WorkspaceRootRecord {
         let standardizedPath = (path as NSString).standardizingPath
         #if DEBUG
@@ -4189,6 +4621,13 @@ actor WorkspaceFileContextStore {
         try Task.checkCancellation()
         try await waitForRootUnloadIfNeeded(standardizedPath: standardizedPath)
         try Task.checkCancellation()
+        if let sessionWorktreeReservationToken {
+            guard sessionWorktreeReservedPathsByToken[
+                sessionWorktreeReservationToken
+            ]?.contains(standardizedPath) == true else {
+                throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+            }
+        }
         let loadConfiguration = RootLoadConfiguration(
             kind: kind ?? (isSystemRoot ? .supplementalSystem : .primaryWorkspace),
             respectGitignore: respectGitignore,
@@ -4216,9 +4655,16 @@ actor WorkspaceFileContextStore {
             #endif
             return existing
         }
-        if let inFlight = rootLoadTasksByPath[standardizedPath] {
+        if let inFlight = rootLoadFlightsByPath[standardizedPath] {
             guard rootLoadConfigurationsByPath[standardizedPath] == loadConfiguration else {
                 throw WorkspaceFileContextStoreError.rootLoadInFlightWithDifferentConfiguration(standardizedPath)
+            }
+            if let sessionWorktreeReservationToken {
+                registerSessionWorktreeReservationLoadFlight(
+                    inFlight,
+                    standardizedPath: standardizedPath,
+                    token: sessionWorktreeReservationToken
+                )
             }
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
@@ -4233,7 +4679,8 @@ actor WorkspaceFileContextStore {
                 }
             #endif
             return try await awaitRootLoadTask(
-                inFlight,
+                inFlight.task,
+                flightID: inFlight.id,
                 standardizedPath: standardizedPath,
                 cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
             )
@@ -4248,6 +4695,7 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+        let completion = RootLoadFlightCompletion()
         let task = Task { [weak self] in
             guard let self else { throw WorkspaceFileContextStoreError.storeDeallocated }
             return try await performLoadRoot(
@@ -4258,17 +4706,35 @@ actor WorkspaceFileContextStore {
                 respectRepoIgnore: respectRepoIgnore,
                 respectCursorignore: respectCursorignore,
                 skipSymlinks: skipSymlinks,
-                enableHierarchicalIgnores: enableHierarchicalIgnores
+                enableHierarchicalIgnores: enableHierarchicalIgnores,
+                completion: completion
             )
         }
-        rootLoadTasksByPath[standardizedPath] = task
+        let flightID = UUID()
+        let flight = RootLoadFlight(
+            id: flightID,
+            task: task,
+            completion: completion
+        )
+        rootLoadFlightsByPath[standardizedPath] = flight
         rootLoadConfigurationsByPath[standardizedPath] = loadConfiguration
+        if let sessionWorktreeReservationToken {
+            registerSessionWorktreeReservationLoadFlight(
+                flight,
+                standardizedPath: standardizedPath,
+                token: sessionWorktreeReservationToken
+            )
+        }
         Task { [weak self] in
             _ = try? await task.value
-            await self?.clearCompletedRootLoadTask(standardizedPath: standardizedPath)
+            await self?.clearCompletedRootLoadTask(
+                standardizedPath: standardizedPath,
+                expectedFlightID: flightID
+            )
         }
         return try await awaitRootLoadTask(
             task,
+            flightID: flightID,
             standardizedPath: standardizedPath,
             cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
         )
@@ -4276,29 +4742,71 @@ actor WorkspaceFileContextStore {
 
     private func awaitRootLoadTask(
         _ task: Task<WorkspaceRootRecord, Error>,
+        flightID: UUID,
         standardizedPath: String,
         cancelUnderlyingLoadOnCallerCancellation: Bool
     ) async throws -> WorkspaceRootRecord {
-        try await withTaskCancellationHandler {
-            try await task.value
+        let race = RootLoadTaskWaitRace()
+        Task {
+            await race.resolve(task.result)
+        }
+        let root = try await withTaskCancellationHandler {
+            try await race.value()
         } onCancel: {
+            race.cancel()
             guard cancelUnderlyingLoadOnCallerCancellation else { return }
             task.cancel()
-            Task { await self.cancelRootLoad(path: standardizedPath) }
+            Task {
+                await self.cancelRootLoad(
+                    standardizedPath: standardizedPath,
+                    expectedFlightID: flightID
+                )
+            }
         }
+        try Task.checkCancellation()
+        return root
     }
 
     func cancelRootLoad(path: String) {
         let standardizedPath = (path as NSString).standardizingPath
-        rootLoadTasksByPath[standardizedPath]?.cancel()
-        rootLoadTasksByPath.removeValue(forKey: standardizedPath)
-        if rootIDsByStandardizedPath[standardizedPath] == nil {
-            rootLoadConfigurationsByPath.removeValue(forKey: standardizedPath)
-        }
+        guard let flight = rootLoadFlightsByPath[standardizedPath] else { return }
+        flight.task.cancel()
+        removeRootLoadFlight(
+            standardizedPath: standardizedPath,
+            expectedFlightID: flight.id
+        )
     }
 
-    private func clearCompletedRootLoadTask(standardizedPath: String) {
-        rootLoadTasksByPath.removeValue(forKey: standardizedPath)
+    private func cancelRootLoad(
+        standardizedPath: String,
+        expectedFlightID: UUID
+    ) {
+        guard let flight = rootLoadFlightsByPath[standardizedPath],
+              flight.id == expectedFlightID
+        else { return }
+        flight.task.cancel()
+        removeRootLoadFlight(
+            standardizedPath: standardizedPath,
+            expectedFlightID: expectedFlightID
+        )
+    }
+
+    private func clearCompletedRootLoadTask(
+        standardizedPath: String,
+        expectedFlightID: UUID
+    ) {
+        removeRootLoadFlight(
+            standardizedPath: standardizedPath,
+            expectedFlightID: expectedFlightID
+        )
+    }
+
+    private func removeRootLoadFlight(
+        standardizedPath: String,
+        expectedFlightID: UUID
+    ) {
+        guard rootLoadFlightsByPath[standardizedPath]?.id == expectedFlightID else { return }
+        rootLoadFlightsByPath.removeValue(forKey: standardizedPath)
         if rootIDsByStandardizedPath[standardizedPath] == nil {
             rootLoadConfigurationsByPath.removeValue(forKey: standardizedPath)
         }
@@ -4312,12 +4820,17 @@ actor WorkspaceFileContextStore {
         respectRepoIgnore: Bool,
         respectCursorignore: Bool,
         skipSymlinks: Bool,
-        enableHierarchicalIgnores: Bool
+        enableHierarchicalIgnores: Bool,
+        completion: RootLoadFlightCompletion
     ) async throws -> WorkspaceRootRecord {
         if let existingID = rootIDsByStandardizedPath[standardizedPath],
-           let existing = rootStatesByID[existingID]?.root
+           let existingState = rootStatesByID[existingID]
         {
-            return existing
+            completion.record(
+                rootID: existingState.root.id,
+                lifetimeID: existingState.lifetimeID
+            )
+            return existingState.root
         }
 
         #if DEBUG
@@ -4452,6 +4965,7 @@ actor WorkspaceFileContextStore {
         #endif
         rootIDsByStandardizedPath[root.standardizedFullPath] = root.id
         rootStatesByID[root.id] = state
+        completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
         rootLoadOrder.append(root.id)
         appliedIndexGenerationsByRootID[root.id] = 0
         catalogGenerationsByRootID[root.id] = 0
@@ -4521,18 +5035,24 @@ actor WorkspaceFileContextStore {
         guard !orderedRootIDs.isEmpty else { return }
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
-        var ownershipRootsReleasedByUnload: [WorkspaceSessionWorktreeOwnedRoot] = []
+        var ownershipResourcesReleasedByUnload = SessionWorktreeOwnershipRemoval()
+        var invalidatedOwnershipTokens = Set<WorkspaceSessionWorktreeOwnershipToken>()
         for rootID in orderedRootIDs {
             explicitWatcherDemandRootIDs.remove(rootID)
             if let state = rootStatesByID[rootID] {
+                let watcherKey = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+                explicitWatcherDemandGenerationByKey.removeValue(forKey: watcherKey)
+            }
+            if let state = rootStatesByID[rootID], state.root.kind == .sessionWorktree {
                 let lifetimeKey = SessionWorktreeRootLifetimeKey(rootID: rootID, lifetimeID: state.lifetimeID)
-                let ownershipTokens = sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey] ?? []
-                for token in ownershipTokens {
+                let ownershipTokens = (sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey] ?? [])
+                    .union(sessionWorktreeReservationTokensByStandardizedPath[state.root.standardizedFullPath] ?? [])
+                for token in ownershipTokens where invalidatedOwnershipTokens.insert(token).inserted {
                     latestSessionWorktreeOwnershipGenerationByOwnerID[token.ownerID, default: 0] &+= 1
                     if installedSessionWorktreeOwnershipTokenByOwnerID[token.ownerID] == token {
                         installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: token.ownerID)
                     }
-                    ownershipRootsReleasedByUnload.append(contentsOf: removeSessionWorktreeOwnershipToken(token))
+                    ownershipResourcesReleasedByUnload.append(removeSessionWorktreeOwnershipToken(token))
                 }
             }
             if let flightState = scopedIngressBarrierFlightStatesByRootID.removeValue(forKey: rootID) {
@@ -4541,7 +5061,11 @@ actor WorkspaceFileContextStore {
                 flightState.pending?.join.complete(with: nil)
             }
             completedScopedIngressBarrierCutsByRootID.removeValue(forKey: rootID)
-            watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
+            if let state = rootStatesByID[rootID] {
+                let watcherKey = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+                watcherPublisherAttachmentsByKey.removeValue(forKey: watcherKey)?.cancellable.cancel()
+                watcherInfrastructureFlightsByKey.removeValue(forKey: watcherKey)?.task.cancel()
+            }
             publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             statesToUnload.append((rootID, state))
@@ -4726,9 +5250,17 @@ actor WorkspaceFileContextStore {
         let removedLifetimeKeys = Set(statesToUnload.map {
             SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.state.lifetimeID)
         })
-        await cleanupOrphanedSessionWorktreeRoots(ownershipRootsReleasedByUnload.filter {
-            !removedLifetimeKeys.contains(SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.lifetimeID))
-        })
+        let removedStandardizedPaths = Set(statesToUnload.map(\.state.root.standardizedFullPath))
+        await cleanupOrphanedSessionWorktreeResources(SessionWorktreeOwnershipRemoval(
+            ownedRoots: ownershipResourcesReleasedByUnload.ownedRoots.filter {
+                !removedLifetimeKeys.contains(
+                    SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.lifetimeID)
+                )
+            },
+            reservedLoadFlights: ownershipResourcesReleasedByUnload.reservedLoadFlights.filter {
+                !removedStandardizedPaths.contains($0.standardizedPath)
+            }
+        ))
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.end",

@@ -1247,12 +1247,46 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let ownerA = UUID()
             let ownerB = UUID()
             let fingerprint = "shared-binding"
+            let startGate = AsyncGate()
+            let joinGate = AsyncGate()
+            await store.setRootLoadWillStartHandler { _ in
+                await startGate.markStartedAndWaitForRelease()
+            }
+            await store.setRootLoadDidJoinInFlightHandler { _ in
+                await joinGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await startGate.release()
+                await joinGate.release()
+                await store.setRootLoadWillStartHandler(nil)
+                await store.setRootLoadDidJoinInFlightHandler(nil)
+            }
 
-            let first = try await store.prepareSessionWorktreeOwnership(
-                ownerID: ownerA,
-                bindingFingerprint: fingerprint,
-                physicalRootPaths: [root.path]
-            )
+            let firstPreparationTask = Task {
+                try await store.prepareSessionWorktreeOwnership(
+                    ownerID: ownerA,
+                    bindingFingerprint: fingerprint,
+                    physicalRootPaths: [root.path]
+                )
+            }
+            await startGate.waitUntilStarted()
+            let secondPreparationTask = Task {
+                try await store.prepareSessionWorktreeOwnership(
+                    ownerID: ownerB,
+                    bindingFingerprint: fingerprint,
+                    physicalRootPaths: [root.path]
+                )
+            }
+            await joinGate.waitUntilStarted()
+
+            let joinedOwnership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(joinedOwnership.installedOwnerCount, 0)
+            XCTAssertEqual(joinedOwnership.provisionalOwnerCount, 2)
+            XCTAssertEqual(joinedOwnership.rootClaimCount, 0)
+            XCTAssertEqual(joinedOwnership.pathReservationCount, 2)
+
+            await startGate.release()
+            let first = try await firstPreparationTask.value
             let firstRoots = try await store.commitSessionWorktreeOwnership(first)
             let rootID = try XCTUnwrap(firstRoots.first?.rootID)
             let firstWatcherActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
@@ -1267,28 +1301,37 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let repeatedRoots = try await store.commitSessionWorktreeOwnership(repeated)
             XCTAssertEqual(repeatedRoots, firstRoots)
 
-            let second = try await store.prepareSessionWorktreeOwnership(
-                ownerID: ownerB,
-                bindingFingerprint: fingerprint,
-                physicalRootPaths: [root.path]
-            )
-            let secondRoots = try await store.commitSessionWorktreeOwnership(second)
-            XCTAssertEqual(secondRoots.map(\.rootID), [rootID])
-
-            let sharedDiagnostics = await store.readSearchRootDiagnosticsSnapshot()
-            let sharedRoot = try XCTUnwrap(sharedDiagnostics.first { $0.rootID == rootID })
-            XCTAssertEqual(sharedRoot.crawlCount, 1)
-            XCTAssertTrue(sharedRoot.watcherActive)
-            XCTAssertFalse(sharedRoot.explicitWatcherDemand)
-            XCTAssertEqual(sharedRoot.sessionWorktreeOwnerCount, 2)
-
             await store.releaseSessionWorktreeOwnership(ownerID: ownerA)
             let rootsAfterFirstRelease = await store.roots()
             XCTAssertTrue(rootsAfterFirstRelease.contains { $0.id == rootID })
             let watcherAfterFirstRelease = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
             XCTAssertTrue(watcherAfterFirstRelease)
-            let oneOwnerDiagnostics = await store.readSearchRootDiagnosticsSnapshot()
-            XCTAssertEqual(oneOwnerDiagnostics.first { $0.rootID == rootID }?.sessionWorktreeOwnerCount, 1)
+            let reservedRootDiagnostics = await store.readSearchRootDiagnosticsSnapshot()
+            let reservedRoot = try XCTUnwrap(reservedRootDiagnostics.first { $0.rootID == rootID })
+            XCTAssertEqual(reservedRoot.crawlCount, 1)
+            XCTAssertTrue(reservedRoot.watcherActive)
+            XCTAssertFalse(reservedRoot.explicitWatcherDemand)
+            XCTAssertEqual(reservedRoot.sessionWorktreeOwnerCount, 0)
+            let ownershipWhileSecondJoinerIsHeld = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipWhileSecondJoinerIsHeld.installedOwnerCount, 0)
+            XCTAssertEqual(ownershipWhileSecondJoinerIsHeld.provisionalOwnerCount, 1)
+            XCTAssertEqual(ownershipWhileSecondJoinerIsHeld.rootClaimCount, 0)
+            XCTAssertEqual(ownershipWhileSecondJoinerIsHeld.pathReservationCount, 1)
+
+            await joinGate.release()
+            let second = try await secondPreparationTask.value
+            let secondRoots = try await store.commitSessionWorktreeOwnership(second)
+            XCTAssertEqual(secondRoots.map(\.rootID), [rootID])
+
+            let sharedOwnership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(sharedOwnership.installedOwnerCount, 1)
+            XCTAssertEqual(sharedOwnership.provisionalOwnerCount, 0)
+            XCTAssertEqual(sharedOwnership.rootClaimCount, 1)
+            XCTAssertEqual(sharedOwnership.pathReservationCount, 0)
+            let startCount = await startGate.startCount()
+            let joinCount = await joinGate.startCount()
+            XCTAssertEqual(startCount, 1)
+            XCTAssertEqual(joinCount, 1)
 
             await store.releaseSessionWorktreeOwnership(ownerID: ownerB)
             let rootsAfterLastRelease = await store.roots()
@@ -1297,6 +1340,92 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(finalOwnership.installedOwnerCount, 0)
             XCTAssertEqual(finalOwnership.provisionalOwnerCount, 0)
             XCTAssertEqual(finalOwnership.rootClaimCount, 0)
+            XCTAssertEqual(finalOwnership.pathReservationCount, 0)
+
+            let explicitUnloadRoot = try makeTemporaryRoot(name: "SessionWorktreeOwnershipExplicitUnload")
+            try write("seed", to: explicitUnloadRoot.appendingPathComponent("Seed.swift"))
+            let explicitUnloadStore = WorkspaceFileContextStore()
+            let loadedOwnerID = UUID()
+            let suspendedOwnerID = UUID()
+            let unloadStartGate = AsyncGate()
+            let unloadJoinGate = AsyncGate()
+            let unloadStartObserved = expectation(description: "explicit-unload creator starts root load")
+            let unloadJoinObserved = expectation(description: "explicit-unload owner joins root load")
+            await explicitUnloadStore.setRootLoadWillStartHandler { _ in
+                unloadStartObserved.fulfill()
+                await unloadStartGate.markStartedAndWaitForRelease()
+            }
+            await explicitUnloadStore.setRootLoadDidJoinInFlightHandler { _ in
+                unloadJoinObserved.fulfill()
+                await unloadJoinGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await unloadStartGate.release()
+                await unloadJoinGate.release()
+                await explicitUnloadStore.setRootLoadWillStartHandler(nil)
+                await explicitUnloadStore.setRootLoadDidJoinInFlightHandler(nil)
+            }
+
+            let loadedOwnerPreparationTask = Task {
+                try await explicitUnloadStore.prepareSessionWorktreeOwnership(
+                    ownerID: loadedOwnerID,
+                    bindingFingerprint: "loaded-owner",
+                    physicalRootPaths: [explicitUnloadRoot.path]
+                )
+            }
+            await fulfillment(of: [unloadStartObserved], timeout: 1)
+            let unloadStartCount = await unloadStartGate.startCount()
+            XCTAssertEqual(unloadStartCount, 1)
+
+            let suspendedOwnerPreparationTask = Task {
+                try await explicitUnloadStore.prepareSessionWorktreeOwnership(
+                    ownerID: suspendedOwnerID,
+                    bindingFingerprint: "suspended-owner",
+                    physicalRootPaths: [explicitUnloadRoot.path]
+                )
+            }
+            await fulfillment(of: [unloadJoinObserved], timeout: 1)
+            let unloadJoinCount = await unloadJoinGate.startCount()
+            XCTAssertEqual(unloadJoinCount, 1)
+
+            await unloadStartGate.release()
+            let loadedOwnerPreparation = try await loadedOwnerPreparationTask.value
+            let loadedOwnerRoots = try await explicitUnloadStore.commitSessionWorktreeOwnership(
+                loadedOwnerPreparation
+            )
+            let explicitlyUnloadedRootID = try XCTUnwrap(loadedOwnerRoots.first?.rootID)
+            if unloadJoinCount == 1 {
+                let ownershipBeforeExplicitUnload =
+                    await explicitUnloadStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+                XCTAssertEqual(ownershipBeforeExplicitUnload.installedOwnerCount, 1)
+                XCTAssertEqual(ownershipBeforeExplicitUnload.provisionalOwnerCount, 1)
+                XCTAssertEqual(ownershipBeforeExplicitUnload.rootClaimCount, 1)
+                XCTAssertEqual(ownershipBeforeExplicitUnload.pathReservationCount, 1)
+            }
+
+            await explicitUnloadStore.unloadRoot(id: explicitlyUnloadedRootID)
+            let ownershipAfterExplicitUnload =
+                await explicitUnloadStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipAfterExplicitUnload.installedOwnerCount, 0)
+            XCTAssertEqual(ownershipAfterExplicitUnload.provisionalOwnerCount, 0)
+            XCTAssertEqual(ownershipAfterExplicitUnload.rootClaimCount, 0)
+            XCTAssertEqual(ownershipAfterExplicitUnload.pathReservationCount, 0)
+            let rootsAfterExplicitUnload = await explicitUnloadStore.roots()
+            XCTAssertTrue(rootsAfterExplicitUnload.isEmpty)
+
+            await unloadJoinGate.release()
+            do {
+                _ = try await suspendedOwnerPreparationTask.value
+                XCTFail("Expected explicit unload to invalidate the suspended owner generation")
+            } catch let error as WorkspaceSessionWorktreeOwnershipError {
+                XCTAssertEqual(error, .staleUpdate)
+            }
+            let ownershipAfterSuspendedOwnerResumes =
+                await explicitUnloadStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipAfterSuspendedOwnerResumes.installedOwnerCount, 0)
+            XCTAssertEqual(ownershipAfterSuspendedOwnerResumes.provisionalOwnerCount, 0)
+            XCTAssertEqual(ownershipAfterSuspendedOwnerResumes.rootClaimCount, 0)
+            XCTAssertEqual(ownershipAfterSuspendedOwnerResumes.pathReservationCount, 0)
         }
 
         func testSessionWorktreeOwnershipReleaseDuringRootLoadUnloadsLateRoot() async throws {
@@ -1320,6 +1449,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 )
             }
             await loadGate.waitUntilStarted()
+            let ownershipDuringLoad = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipDuringLoad.provisionalOwnerCount, 1)
+            XCTAssertEqual(ownershipDuringLoad.rootClaimCount, 0)
+            XCTAssertEqual(ownershipDuringLoad.pathReservationCount, 1)
             await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
             await loadGate.release()
 
@@ -1337,6 +1470,129 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(ownership.installedOwnerCount, 0)
             XCTAssertEqual(ownership.provisionalOwnerCount, 0)
             XCTAssertEqual(ownership.rootClaimCount, 0)
+            XCTAssertEqual(ownership.pathReservationCount, 0)
+
+            let cancellationRoot = try makeTemporaryRoot(name: "SessionWorktreeOwnershipCancelledCreator")
+            try write("seed", to: cancellationRoot.appendingPathComponent("Seed.swift"))
+            let cancellationStore = WorkspaceFileContextStore()
+            let cancelledCreatorOwnerID = UUID()
+            let joiningOwnerID = UUID()
+            let startGate = AsyncGate()
+            let joinGate = AsyncGate()
+            let startObserved = expectation(description: "creator starts canonical ownership root load")
+            let joinObserved = expectation(description: "later owner joins creator's canonical root load")
+            await cancellationStore.setRootLoadWillStartHandler { _ in
+                startObserved.fulfill()
+                await startGate.markStartedAndWaitForRelease()
+            }
+            await cancellationStore.setRootLoadDidJoinInFlightHandler { _ in
+                joinObserved.fulfill()
+                await joinGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await startGate.release()
+                await joinGate.release()
+                await cancellationStore.setRootLoadWillStartHandler(nil)
+                await cancellationStore.setRootLoadDidJoinInFlightHandler(nil)
+            }
+
+            let cancelledCreatorPreparationTask = Task {
+                try await cancellationStore.prepareSessionWorktreeOwnership(
+                    ownerID: cancelledCreatorOwnerID,
+                    bindingFingerprint: "cancelled-creator",
+                    physicalRootPaths: [cancellationRoot.path]
+                )
+            }
+            await fulfillment(of: [startObserved], timeout: 1)
+            let ownershipBeforeCancellation =
+                await cancellationStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipBeforeCancellation.provisionalOwnerCount, 1)
+            XCTAssertEqual(ownershipBeforeCancellation.rootClaimCount, 0)
+            XCTAssertEqual(ownershipBeforeCancellation.pathReservationCount, 1)
+
+            let cancellationCompleted = expectation(
+                description: "creator ownership cancellation completes while its shared load remains blocked"
+            )
+            let cancellationCompletion = AsyncSignal()
+            let cancellationResultTask = Task {
+                let observedCancellation: Bool
+                do {
+                    _ = try await cancelledCreatorPreparationTask.value
+                    observedCancellation = false
+                } catch is CancellationError {
+                    observedCancellation = true
+                } catch {
+                    observedCancellation = false
+                }
+                await cancellationCompletion.mark()
+                cancellationCompleted.fulfill()
+                return observedCancellation
+            }
+            cancelledCreatorPreparationTask.cancel()
+            await fulfillment(of: [cancellationCompleted], timeout: 1)
+            let cancellationCompletedPromptly = await cancellationCompletion.isMarked()
+            if cancellationCompletedPromptly {
+                let ownershipAfterCancellation =
+                    await cancellationStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+                XCTAssertEqual(ownershipAfterCancellation.provisionalOwnerCount, 0)
+                XCTAssertEqual(ownershipAfterCancellation.rootClaimCount, 0)
+                XCTAssertEqual(ownershipAfterCancellation.pathReservationCount, 0)
+            }
+
+            let joiningPreparationTask = Task {
+                try await cancellationStore.prepareSessionWorktreeOwnership(
+                    ownerID: joiningOwnerID,
+                    bindingFingerprint: "joining-owner",
+                    physicalRootPaths: [cancellationRoot.path]
+                )
+            }
+            await fulfillment(of: [joinObserved], timeout: 1)
+            let joinCount = await joinGate.startCount()
+            XCTAssertEqual(joinCount, 1, "The cancelled creator's shared flight must remain joinable")
+            if joinCount == 1 {
+                let joinedOwnership =
+                    await cancellationStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+                XCTAssertEqual(joinedOwnership.provisionalOwnerCount, 1)
+                XCTAssertEqual(joinedOwnership.rootClaimCount, 0)
+                XCTAssertEqual(joinedOwnership.pathReservationCount, 1)
+            }
+
+            await startGate.release()
+            let observedCancellation = await cancellationResultTask.value
+            XCTAssertTrue(observedCancellation, "Expected the creator ownership preparation to throw CancellationError")
+            let rootLoadedForJoiner = await waitForAsyncCondition {
+                let roots = await cancellationStore.roots()
+                return !roots.isEmpty
+            }
+            XCTAssertTrue(rootLoadedForJoiner)
+            if joinCount == 1 {
+                let heldJoinOwnership =
+                    await cancellationStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+                XCTAssertEqual(heldJoinOwnership.provisionalOwnerCount, 1)
+                XCTAssertEqual(heldJoinOwnership.rootClaimCount, 0)
+                XCTAssertEqual(heldJoinOwnership.pathReservationCount, 1)
+            }
+
+            await joinGate.release()
+            let joiningPreparation = try await joiningPreparationTask.value
+            let joiningRoots = try await cancellationStore.commitSessionWorktreeOwnership(joiningPreparation)
+            let joiningRootID = try XCTUnwrap(joiningRoots.first?.rootID)
+            let diagnostics = await cancellationStore.readSearchRootDiagnosticsSnapshot()
+            XCTAssertEqual(diagnostics.first { $0.rootID == joiningRootID }?.crawlCount, 1)
+            let installedOwnership = await cancellationStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(installedOwnership.installedOwnerCount, 1)
+            XCTAssertEqual(installedOwnership.provisionalOwnerCount, 0)
+            XCTAssertEqual(installedOwnership.rootClaimCount, 1)
+            XCTAssertEqual(installedOwnership.pathReservationCount, 0)
+
+            await cancellationStore.releaseSessionWorktreeOwnership(ownerID: joiningOwnerID)
+            let rootsAfterJoinerRelease = await cancellationStore.roots()
+            XCTAssertTrue(rootsAfterJoinerRelease.isEmpty)
+            let finalCancellationOwnership = await cancellationStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(finalCancellationOwnership.installedOwnerCount, 0)
+            XCTAssertEqual(finalCancellationOwnership.provisionalOwnerCount, 0)
+            XCTAssertEqual(finalCancellationOwnership.rootClaimCount, 0)
+            XCTAssertEqual(finalCancellationOwnership.pathReservationCount, 0)
         }
 
         func testStartWatchingMissingRootThrowsWithoutRetainingDemand() async throws {
@@ -1357,29 +1613,141 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
 
         func testSessionWorktreeOwnershipActivationFailureRollsBackClaimsAndRoot() async throws {
-            let root = try makeTemporaryRoot(name: "SessionWorktreeOwnershipActivationFailure")
-            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let parent = try makeTemporaryRoot(name: "SessionWorktreeOwnershipActivationFailure")
+            let claimedRoot = parent.appendingPathComponent("A-Claimed", isDirectory: true)
+            let failingRoot = parent.appendingPathComponent("B-Fails", isDirectory: true)
+            let unreachedRoot = parent.appendingPathComponent("C-Unreached", isDirectory: true)
+            try write("claimed", to: claimedRoot.appendingPathComponent("Claimed.swift"))
+            try write("failing", to: failingRoot.appendingPathComponent("Failing.swift"))
+            try write("unreached", to: unreachedRoot.appendingPathComponent("Unreached.swift"))
             let store = WorkspaceFileContextStore()
+            let preloadedRoot = try await store.loadRoot(path: claimedRoot.path, kind: .sessionWorktree)
             await store.setWatcherActivationFailureForNewServicesForTesting(.streamStart)
+            addTeardownBlock {
+                await store.setWatcherActivationFailureForNewServicesForTesting(nil)
+            }
 
             do {
                 _ = try await store.prepareSessionWorktreeOwnership(
                     ownerID: UUID(),
                     bindingFingerprint: "activation-failure",
-                    physicalRootPaths: [root.path]
+                    physicalRootPaths: [unreachedRoot.path, failingRoot.path, claimedRoot.path]
                 )
                 XCTFail("Expected session-worktree watcher activation to fail")
             } catch let error as FileSystemWatcherActivationError {
-                XCTAssertEqual(error, .streamStartFailed(path: root.path))
+                XCTAssertEqual(error, .streamStartFailed(path: failingRoot.path))
             }
 
             let rootsAfterFailure = await store.roots()
             XCTAssertTrue(rootsAfterFailure.isEmpty)
+            XCTAssertFalse(rootsAfterFailure.contains { $0.id == preloadedRoot.id })
             let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
             XCTAssertEqual(ownership.installedOwnerCount, 0)
             XCTAssertEqual(ownership.provisionalOwnerCount, 0)
             XCTAssertEqual(ownership.rootClaimCount, 0)
+            XCTAssertEqual(ownership.pathReservationCount, 0)
             await store.setWatcherActivationFailureForNewServicesForTesting(nil)
+
+            let untouchedParent = try makeTemporaryRoot(name: "SessionWorktreeUntouchedReservation")
+            let blockedFirstRoot = untouchedParent.appendingPathComponent("A-Blocked", isDirectory: true)
+            let alreadyLoadedSecondRoot = untouchedParent.appendingPathComponent("B-AlreadyLoaded", isDirectory: true)
+            try write("blocked", to: blockedFirstRoot.appendingPathComponent("Blocked.swift"))
+            try write("existing", to: alreadyLoadedSecondRoot.appendingPathComponent("Existing.swift"))
+            let untouchedStore = WorkspaceFileContextStore()
+            let alreadyLoadedRecord = try await untouchedStore.loadRoot(
+                path: alreadyLoadedSecondRoot.path,
+                kind: .sessionWorktree
+            )
+            let blockedLoadGate = AsyncGate()
+            let blockedCleanupGate = AsyncGate()
+            let blockedLoadObserved = expectation(description: "multi-path preparation reaches blocked first path")
+            let blockedCleanupObserved = expectation(description: "cancelled first-path flight unloads exact produced root")
+            await untouchedStore.setRootLoadWillStartHandler { path in
+                guard path == blockedFirstRoot.path else { return }
+                blockedLoadObserved.fulfill()
+                await blockedLoadGate.markStartedAndWaitForRelease()
+            }
+            await untouchedStore.setRootUnloadDidDetachHandler { paths in
+                guard paths.contains(blockedFirstRoot.path) else { return }
+                blockedCleanupObserved.fulfill()
+                await blockedCleanupGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await blockedLoadGate.release()
+                await blockedCleanupGate.release()
+                await untouchedStore.setRootLoadWillStartHandler(nil)
+                await untouchedStore.setRootUnloadDidDetachHandler(nil)
+            }
+
+            let untouchedOwnerID = UUID()
+            let untouchedPreparationTask = Task {
+                try await untouchedStore.prepareSessionWorktreeOwnership(
+                    ownerID: untouchedOwnerID,
+                    bindingFingerprint: "untouched-second-root",
+                    physicalRootPaths: [alreadyLoadedSecondRoot.path, blockedFirstRoot.path]
+                )
+            }
+            await fulfillment(of: [blockedLoadObserved], timeout: 1)
+            let ownershipBeforeUntouchedCancellation =
+                await untouchedStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipBeforeUntouchedCancellation.provisionalOwnerCount, 1)
+            XCTAssertEqual(ownershipBeforeUntouchedCancellation.rootClaimCount, 0)
+            XCTAssertEqual(ownershipBeforeUntouchedCancellation.pathReservationCount, 2)
+
+            let untouchedCancellationCompleted = expectation(
+                description: "multi-path preparation cancellation completes while first flight is blocked"
+            )
+            let untouchedCancellationSignal = AsyncSignal()
+            let untouchedCancellationResultTask = Task {
+                let observedCancellation: Bool
+                do {
+                    _ = try await untouchedPreparationTask.value
+                    observedCancellation = false
+                } catch is CancellationError {
+                    observedCancellation = true
+                } catch {
+                    observedCancellation = false
+                }
+                await untouchedCancellationSignal.mark()
+                untouchedCancellationCompleted.fulfill()
+                return observedCancellation
+            }
+            untouchedPreparationTask.cancel()
+            await fulfillment(of: [untouchedCancellationCompleted], timeout: 1)
+            let untouchedCancellationCompletedPromptly = await untouchedCancellationSignal.isMarked()
+            if untouchedCancellationCompletedPromptly {
+                let rootsWhileFirstFlightIsBlocked = await untouchedStore.roots()
+                XCTAssertEqual(rootsWhileFirstFlightIsBlocked.map(\.id), [alreadyLoadedRecord.id])
+                let ownershipAfterUntouchedCancellation =
+                    await untouchedStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+                XCTAssertEqual(ownershipAfterUntouchedCancellation.installedOwnerCount, 0)
+                XCTAssertEqual(ownershipAfterUntouchedCancellation.provisionalOwnerCount, 0)
+                XCTAssertEqual(ownershipAfterUntouchedCancellation.rootClaimCount, 0)
+                XCTAssertEqual(ownershipAfterUntouchedCancellation.pathReservationCount, 0)
+            }
+
+            await blockedLoadGate.release()
+            let observedUntouchedCancellation = await untouchedCancellationResultTask.value
+            XCTAssertTrue(
+                observedUntouchedCancellation,
+                "Expected cancellation before the untouched second path reached loadRoot"
+            )
+            await fulfillment(of: [blockedCleanupObserved], timeout: 1)
+            let blockedCleanupCount = await blockedCleanupGate.startCount()
+            XCTAssertEqual(blockedCleanupCount, 1)
+            let rootsDuringExactFlightCleanup = await untouchedStore.roots()
+            XCTAssertEqual(rootsDuringExactFlightCleanup.map(\.id), [alreadyLoadedRecord.id])
+            await blockedCleanupGate.release()
+
+            let finalUntouchedRoots = await untouchedStore.roots()
+            XCTAssertEqual(finalUntouchedRoots.map(\.id), [alreadyLoadedRecord.id])
+            let finalUntouchedOwnership =
+                await untouchedStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(finalUntouchedOwnership.installedOwnerCount, 0)
+            XCTAssertEqual(finalUntouchedOwnership.provisionalOwnerCount, 0)
+            XCTAssertEqual(finalUntouchedOwnership.rootClaimCount, 0)
+            XCTAssertEqual(finalUntouchedOwnership.pathReservationCount, 0)
+            await untouchedStore.unloadRoot(id: alreadyLoadedRecord.id)
         }
 
         func testWatcherActivationFailureThrowsAndRollsBackStoreLifecycle() async throws {
@@ -1409,6 +1777,135 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let watcherIsActiveAfterRetry = try await store.rootWatcherIsActiveForTesting(rootID: record.id)
             XCTAssertTrue(watcherIsActiveAfterRetry)
             await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testConcurrentWatcherColdStartsJoinExactRootLifetimeFlight() async throws {
+            let root = try makeTemporaryRoot(name: "ConcurrentWatcherColdStart")
+            let lateFileURL = root.appendingPathComponent("Late.swift")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootID = record.id
+            let lifetimeID = try await store.rootLifetimeIDForTesting(rootID: rootID)
+            let publisherOpenGate = AsyncGate()
+            let joinObserved = expectation(description: "second watcher start joins the exact-lifetime flight")
+
+            await store.setWatcherPublisherIngressDidOpenHandler { observedRootID, observedLifetimeID in
+                guard observedRootID == rootID else { return }
+                XCTAssertEqual(observedLifetimeID, lifetimeID)
+                await publisherOpenGate.markStartedAndWaitForRelease()
+            }
+            await store.setWatcherInfrastructureDidJoinFlightHandler { observedRootID, observedLifetimeID in
+                guard observedRootID == rootID else { return }
+                XCTAssertEqual(observedLifetimeID, lifetimeID)
+                joinObserved.fulfill()
+            }
+            addTeardownBlock {
+                await publisherOpenGate.release()
+                await store.setWatcherPublisherIngressDidOpenHandler(nil)
+                await store.setWatcherInfrastructureDidJoinFlightHandler(nil)
+                await store.stopWatchingRoot(id: rootID)
+            }
+
+            let firstStart = Task {
+                try await store.startWatchingRoot(id: rootID)
+            }
+            await publisherOpenGate.waitUntilStarted()
+            let secondStart = Task {
+                try await store.startWatchingRoot(id: rootID)
+            }
+            await fulfillment(of: [joinObserved], timeout: 1)
+
+            let publisherOpenCount = await publisherOpenGate.startCount()
+            XCTAssertEqual(publisherOpenCount, 1)
+            let flightCountWhileBlocked = await store.watcherInfrastructureFlightCountForTesting(rootID: rootID)
+            XCTAssertEqual(flightCountWhileBlocked, 1)
+            let ownershipWhileBlocked = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipWhileBlocked.explicitWatcherDemandCount, 1)
+
+            await publisherOpenGate.release()
+            try await firstStart.value
+            try await secondStart.value
+
+            let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            let ingress = await store.publisherIngressDebugSnapshotForTesting(rootID: rootID)
+            let flightCountAfterStart = await store.watcherInfrastructureFlightCountForTesting(rootID: rootID)
+            XCTAssertTrue(watcherIsActive)
+            XCTAssertTrue(ingress.isOpen)
+            XCTAssertEqual(flightCountAfterStart, 0)
+
+            try write("late", to: lateFileURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: rootID,
+                deltas: [.fileAdded("Late.swift")]
+            )
+            _ = await store.flushPendingServiceEventsForAllRoots()
+            let lateFile = await store.file(rootID: rootID, relativePath: "Late.swift")
+            XCTAssertNotNil(lateFile)
+
+            await store.stopWatchingRoot(id: rootID)
+            let watcherIsActiveAfterStop = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            let ingressAfterStop = await store.publisherIngressDebugSnapshotForTesting(rootID: rootID)
+            XCTAssertFalse(watcherIsActiveAfterStop)
+            XCTAssertFalse(ingressAfterStop.isOpen)
+        }
+
+        func testCancelledColdStartCannotRemoveRestartedExplicitDemand() async throws {
+            let root = try makeTemporaryRoot(name: "CancelledWatcherColdStartRestart")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootID = record.id
+            let publisherOpenGate = AsyncGate()
+            let restartJoinObserved = expectation(description: "restart joins the blocked watcher flight")
+
+            await store.setWatcherPublisherIngressDidOpenHandler { observedRootID, _ in
+                guard observedRootID == rootID else { return }
+                await publisherOpenGate.markStartedAndWaitForRelease()
+            }
+            await store.setWatcherInfrastructureDidJoinFlightHandler { observedRootID, _ in
+                guard observedRootID == rootID else { return }
+                restartJoinObserved.fulfill()
+            }
+            addTeardownBlock {
+                await publisherOpenGate.release()
+                await store.setWatcherPublisherIngressDidOpenHandler(nil)
+                await store.setWatcherInfrastructureDidJoinFlightHandler(nil)
+                await store.stopWatchingRoot(id: rootID)
+            }
+
+            let staleStart = Task {
+                try await store.startWatchingRoot(id: rootID)
+            }
+            await publisherOpenGate.waitUntilStarted()
+            await store.stopWatchingRoot(id: rootID)
+
+            let restartedStart = Task {
+                try await store.startWatchingRoot(id: rootID)
+            }
+            await fulfillment(of: [restartJoinObserved], timeout: 1)
+
+            staleStart.cancel()
+            do {
+                try await staleStart.value
+                XCTFail("Expected the stale pre-stop start to observe cancellation")
+            } catch is CancellationError {
+                // Expected. Its generation-scoped rollback must not remove the restart's demand.
+            } catch {
+                XCTFail("Expected cancellation, got \(error)")
+            }
+
+            let ownershipAfterStaleCancellation =
+                await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownershipAfterStaleCancellation.explicitWatcherDemandCount, 1)
+
+            await publisherOpenGate.release()
+            try await restartedStart.value
+
+            let publisherOpenCount = await publisherOpenGate.startCount()
+            let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            let ingress = await store.publisherIngressDebugSnapshotForTesting(rootID: rootID)
+            XCTAssertEqual(publisherOpenCount, 2)
+            XCTAssertTrue(watcherIsActive)
+            XCTAssertTrue(ingress.isOpen)
         }
 
         @MainActor
@@ -6450,6 +6947,62 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(manager.rootFolders.first?.standardizedFullPath, (root.path as NSString).standardizingPath)
 
             await manager.unloadAllRootFolders()
+
+            let lifetimeRoot = try makeTemporaryRoot(name: "SessionWorktreeSuccessorLifetime")
+            try write("first", to: lifetimeRoot.appendingPathComponent("First.swift"))
+            let lifetimeStore = WorkspaceFileContextStore()
+            let lifetimeOwnerID = UUID()
+            let lifetimePreparation = try await lifetimeStore.prepareSessionWorktreeOwnership(
+                ownerID: lifetimeOwnerID,
+                bindingFingerprint: "first-lifetime",
+                physicalRootPaths: [lifetimeRoot.path]
+            )
+            let firstLifetimeRoots = try await lifetimeStore.commitSessionWorktreeOwnership(lifetimePreparation)
+            let firstLifetimeRootID = try XCTUnwrap(firstLifetimeRoots.first?.rootID)
+            let firstLifetimeID = try await lifetimeStore.rootLifetimeIDForTesting(rootID: firstLifetimeRootID)
+            let staleCleanupGate = AsyncGate()
+            let staleCleanupObserved = expectation(description: "first-lifetime orphan cleanup reaches watcher reconciliation")
+            await lifetimeStore.setWatcherServiceStateWillReconcileHandler { rootID, shouldWatch in
+                guard rootID == firstLifetimeRootID, !shouldWatch else { return }
+                staleCleanupObserved.fulfill()
+                await staleCleanupGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await staleCleanupGate.release()
+                await lifetimeStore.setWatcherServiceStateWillReconcileHandler(nil)
+            }
+
+            let firstLifetimeReleaseTask = Task {
+                await lifetimeStore.releaseSessionWorktreeOwnership(ownerID: lifetimeOwnerID)
+            }
+            await fulfillment(of: [staleCleanupObserved], timeout: 1)
+            let staleCleanupCount = await staleCleanupGate.startCount()
+            XCTAssertEqual(staleCleanupCount, 1)
+            if staleCleanupCount == 1 {
+                await lifetimeStore.unloadRoot(id: firstLifetimeRootID)
+                try write("second", to: lifetimeRoot.appendingPathComponent("Second.swift"))
+                let successorRoot = try await lifetimeStore.loadRoot(
+                    path: lifetimeRoot.path,
+                    kind: .sessionWorktree
+                )
+                let successorLifetimeID = try await lifetimeStore.rootLifetimeIDForTesting(rootID: successorRoot.id)
+                XCTAssertNotEqual(successorRoot.id, firstLifetimeRootID)
+                XCTAssertNotEqual(successorLifetimeID, firstLifetimeID)
+
+                await staleCleanupGate.release()
+                await firstLifetimeReleaseTask.value
+
+                let rootsAfterStaleCleanup = await lifetimeStore.roots()
+                XCTAssertEqual(rootsAfterStaleCleanup.map(\.id), [successorRoot.id])
+                let retainedSuccessorLifetimeID = try await lifetimeStore.rootLifetimeIDForTesting(
+                    rootID: successorRoot.id
+                )
+                XCTAssertEqual(retainedSuccessorLifetimeID, successorLifetimeID)
+                await lifetimeStore.unloadRoot(id: successorRoot.id)
+            } else {
+                await staleCleanupGate.release()
+                await firstLifetimeReleaseTask.value
+            }
         }
 
         @MainActor

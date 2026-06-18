@@ -4,6 +4,9 @@ import RepoPromptShared
 enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
     case worktreeScopeUnavailable(missingPhysicalRootPaths: [String])
     case workspaceFreshnessTimedOut
+    case workspaceReadinessUnavailable
+    case workspaceReadinessTimedOut
+    case workspaceReadinessSuperseded
 
     var retryAfterMilliseconds: Int {
         1000
@@ -15,6 +18,12 @@ enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
             "Retry after the suggested delay. If the worktree remains unavailable, restore it or rebind the Agent session to an available worktree."
         case .workspaceFreshnessTimedOut:
             "Retry after workspace file updates finish applying."
+        case .workspaceReadinessUnavailable:
+            "Wait for a workspace activation to establish search readiness, then retry."
+        case .workspaceReadinessTimedOut:
+            "Retry after workspace catalog and index hydration completes."
+        case .workspaceReadinessSuperseded:
+            "Retry the search against the newly active workspace."
         }
     }
 
@@ -26,6 +35,12 @@ enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
             return "The bound physical \(noun) unavailable. The visible base workspace was intentionally not searched."
         case .workspaceFreshnessTimedOut:
             return "Workspace freshness timed out before file_search could begin. Retry the search after workspace updates finish applying."
+        case .workspaceReadinessUnavailable:
+            return "Workspace search readiness is unavailable because no workspace activation is currently established."
+        case .workspaceReadinessTimedOut:
+            return "Workspace search readiness timed out before file_search could begin."
+        case .workspaceReadinessSuperseded:
+            return "Workspace search was superseded by a workspace activation or hydration generation change."
         }
     }
 }
@@ -36,6 +51,7 @@ enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
 /// `WorkspaceFilesViewModel` tree projections.
 enum StoreBackedWorkspaceSearch {
     #if DEBUG
+        @TaskLocal static var readinessWaitTimeoutOverrideForTesting: Duration?
         @TaskLocal static var freshnessWaitTimeoutOverrideForTesting: Duration?
         @TaskLocal static var freshnessWaitOperationOverrideForTesting: (@Sendable ([WorkspaceRootRef], WorkspaceFileContextStore) async -> [WorkspaceIngressBarrierSample])?
     #endif
@@ -61,7 +77,17 @@ enum StoreBackedWorkspaceSearch {
     ) async throws -> SearchResults {
         try Task.checkCancellation()
         try await ensureRootScopeAvailable(rootScope, store: store)
-        try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
+        let readinessTicket = try await acquireSearchReadiness(
+            store: store,
+            workspaceManager: workspaceManager
+        )
+        try await ensureRootScopeAvailable(
+            rootScope,
+            store: store,
+            readinessTicket: readinessTicket,
+            workspaceManager: workspaceManager
+        )
+        try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
 
         let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
         let admissionClass = broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths)
@@ -70,9 +96,14 @@ enum StoreBackedWorkspaceSearch {
             admissionClass: admissionClass
         ) { fileSearchActor in
             if admissionClass != nil {
-                try await ensureRootScopeAvailable(rootScope, store: store)
-                try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
+                try await ensureRootScopeAvailable(
+                    rootScope,
+                    store: store,
+                    readinessTicket: readinessTicket,
+                    workspaceManager: workspaceManager
+                )
             }
+            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
 
             var parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
                 await parseSearchScopePaths(
@@ -84,11 +115,13 @@ enum StoreBackedWorkspaceSearch {
             } else {
                 nil
             }
+            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             let freshnessRootRefs: [WorkspaceRootRef] = if let parsedSearchScope {
                 parsedSearchScope.freshnessRootRefs
             } else {
                 await store.rootRefs(scope: rootScope)
             }
+            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             #if DEBUG
                 let freshnessWaitTimeout = freshnessWaitTimeoutOverrideForTesting
                     ?? MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
@@ -103,6 +136,7 @@ enum StoreBackedWorkspaceSearch {
                     store: store,
                     timeout: freshnessWaitTimeout
                 )
+                try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             } catch {
                 EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
                 throw error
@@ -113,6 +147,7 @@ enum StoreBackedWorkspaceSearch {
                 rootRefs: freshnessRootRefs,
                 appliedIngressSamples: appliedIngressSamples
             )
+            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             try Task.checkCancellation()
             if let parsed = parsedSearchScope {
                 // Exact paths can change kind or disappear while the freshness barrier applies
@@ -122,6 +157,7 @@ enum StoreBackedWorkspaceSearch {
                     parsed,
                     store: store
                 )
+                try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             }
             try Task.checkCancellation()
 
@@ -146,7 +182,9 @@ enum StoreBackedWorkspaceSearch {
                 parsedSearchScope: parsedSearchScope,
                 rootScope: rootScope,
                 store: store,
-                fileSearchActor: fileSearchActor
+                fileSearchActor: fileSearchActor,
+                workspaceManager: workspaceManager,
+                readinessTicket: readinessTicket
             )
         }
     }
@@ -200,7 +238,9 @@ enum StoreBackedWorkspaceSearch {
         parsedSearchScope: SearchScopeParseResult?,
         rootScope: WorkspaceLookupRootScope,
         store: WorkspaceFileContextStore,
-        fileSearchActor: FileSearchActor
+        fileSearchActor: FileSearchActor,
+        workspaceManager: WorkspaceManagerViewModel?,
+        readinessTicket: WorkspaceSearchReadinessTicket?
     ) async throws -> SearchResults {
         let entryPerfState = EditFlowPerf.begin(
             EditFlowPerf.Stage.Search.entrypoint,
@@ -232,8 +272,11 @@ enum StoreBackedWorkspaceSearch {
             )
         }
 
+        try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+        let catalogAccess = await store.searchCatalogAccess(rootScope: rootScope)
+        try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         let snapshot: WorkspaceSearchCatalogSnapshot
-        switch await store.searchCatalogAccess(rootScope: rootScope) {
+        switch catalogAccess {
         case let .available(availableSnapshot):
             snapshot = availableSnapshot
         case let .unavailable(availability):
@@ -243,6 +286,7 @@ enum StoreBackedWorkspaceSearch {
 
         let rootsByID = Dictionary(uniqueKeysWithValues: snapshot.roots.map { ($0.id, $0) })
         let visibleRootRefs = await store.rootRefs(scope: .visibleWorkspace)
+        try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         let visibleRootIDs = Set(visibleRootRefs.map(\.id))
         let visibleRootRecords = snapshot.roots.filter { visibleRootIDs.contains($0.id) }
         let allFiles = snapshot.files
@@ -292,6 +336,7 @@ enum StoreBackedWorkspaceSearch {
             if filterResult.cancelled || Task.isCancelled {
                 throw CancellationError()
             }
+            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             filesToSearch = filterResult.matchedSnapshotIndices.map { allFiles[$0] }
         } else {
             filesToSearch = allFiles
@@ -323,6 +368,7 @@ enum StoreBackedWorkspaceSearch {
         var wasAutoCorrected: Bool? = nil
         var results: SearchResults
         do {
+            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             results = try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.Search.actorSearchCall,
                 EditFlowPerf.Dimensions(
@@ -359,6 +405,7 @@ enum StoreBackedWorkspaceSearch {
                     aliasByRootPath: aliasByRootPath
                 )
             }
+            try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         } catch {
             entryPerfStatus = "error"
             throw error
@@ -372,9 +419,12 @@ enum StoreBackedWorkspaceSearch {
 
     private static func ensureRootScopeAvailable(
         _ rootScope: WorkspaceLookupRootScope,
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        readinessTicket: WorkspaceSearchReadinessTicket? = nil,
+        workspaceManager: WorkspaceManagerViewModel? = nil
     ) async throws {
         let availability = await store.rootScopeAvailability(rootScope)
+        try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         guard availability == .available else {
             throw searchError(for: availability)
         }
@@ -391,28 +441,82 @@ enum StoreBackedWorkspaceSearch {
         }
     }
 
-    private static func ensureSearchReady(
+    private static func acquireSearchReadiness(
         store: WorkspaceFileContextStore,
+        workspaceManager: WorkspaceManagerViewModel?
+    ) async throws -> WorkspaceSearchReadinessTicket? {
+        guard let workspaceManager else {
+            try await ensureVisibleWorkspaceLoaded(
+                store: store,
+                readinessTicket: nil,
+                workspaceManager: nil
+            )
+            return nil
+        }
+        #if DEBUG
+            let timeout = readinessWaitTimeoutOverrideForTesting
+                ?? MCPTimeoutPolicy.workspaceReadinessWaitTimeout
+        #else
+            let timeout = MCPTimeoutPolicy.workspaceReadinessWaitTimeout
+        #endif
+        let ticket: WorkspaceSearchReadinessTicket
+        do {
+            ticket = try await workspaceManager.awaitWorkspaceSearchReadiness(timeout: timeout)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            throw searchError(for: error)
+        }
+        try await validateSearchReadiness(ticket, workspaceManager: workspaceManager)
+        try await ensureVisibleWorkspaceLoaded(
+            store: store,
+            readinessTicket: ticket,
+            workspaceManager: workspaceManager
+        )
+        try await validateSearchReadiness(ticket, workspaceManager: workspaceManager)
+        return ticket
+    }
+
+    private static func ensureVisibleWorkspaceLoaded(
+        store: WorkspaceFileContextStore,
+        readinessTicket: WorkspaceSearchReadinessTicket?,
         workspaceManager: WorkspaceManagerViewModel?
     ) async throws {
         let roots = await store.rootRefs(scope: .visibleWorkspace)
+        try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         guard !roots.isEmpty else {
             let msg = "No workspace is currently loaded in this window. Use the 'manage_workspaces' tool with action: 'list' to see available workspaces, then action: 'switch' to load one."
             throw FileManagerError.fileSystemServiceNotFoundWithContext(msg)
         }
-        guard let workspaceManager else { return }
-        // This state covers the activated workspace catalog. Session-bound worktrees can be
-        // loaded afterward, so their applied-ingress barrier below remains authoritative.
-        let state = await MainActor.run { workspaceManager.workspaceSearchReadinessState }
-        switch state {
-        case .ready, .degraded:
-            return
-        case .idle:
-            return
-        case .activating, .loadingCatalog, .buildingIndexes:
-            throw FileManagerError.fileSystemServiceNotFoundWithContext(
-                "Workspace search is still loading. Wait for workspace search readiness before using file_search to avoid partial or false-empty results."
-            )
+    }
+
+    private static func validateSearchReadiness(
+        _ ticket: WorkspaceSearchReadinessTicket?,
+        workspaceManager: WorkspaceManagerViewModel?
+    ) async throws {
+        guard let ticket else { return }
+        guard let workspaceManager else {
+            preconditionFailure("A workspace readiness ticket requires its issuing manager")
+        }
+        do {
+            try await workspaceManager.validateWorkspaceSearchReadiness(ticket)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as WorkspaceSearchReadinessWaitError {
+            throw searchError(for: error)
+        }
+    }
+
+    private static func searchError(
+        for error: WorkspaceSearchReadinessWaitError
+    ) -> StoreBackedWorkspaceSearchError {
+        switch error {
+        case .unavailable:
+            .workspaceReadinessUnavailable
+        case .timedOut:
+            .workspaceReadinessTimedOut
+        case .superseded:
+            .workspaceReadinessSuperseded
         }
     }
 
