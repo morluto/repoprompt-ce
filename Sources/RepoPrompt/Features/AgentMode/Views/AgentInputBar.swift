@@ -1325,18 +1325,7 @@ struct AgentComposerView: View, Equatable {
     private var claudeToolsPopoverContent: some View {
         if let claudeTools = props.providerControls?.claudeTools {
             Form {
-                if isSelectedClaudeRunActive {
-                    Section {
-                        HStack(spacing: 6) {
-                            Image(systemName: "clock.arrow.circlepath")
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                            Text("Claude tool setting changes apply to the next run")
-                                .font(fontPreset.captionFont)
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
+                claudeActiveRunNoticeSection
 
                 Section {
                     Toggle("Bash", isOn: Binding(
@@ -1419,6 +1408,22 @@ struct AgentComposerView: View, Equatable {
                 .foregroundStyle(.secondary)
                 .padding(14)
                 .frame(width: claudeToolsPopoverWidth)
+        }
+    }
+
+    @ViewBuilder
+    private var claudeActiveRunNoticeSection: some View {
+        if isSelectedClaudeRunActive {
+            Section {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    Text("Claude tool setting changes apply to the next run")
+                        .font(fontPreset.captionFont)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 
