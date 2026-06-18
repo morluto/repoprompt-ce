@@ -384,6 +384,11 @@ class WindowState: ObservableObject {
 
         // Set up additional actions
         setupSendPromptAction()
+        #if DEBUG
+            if AppLaunchConfiguration.current.forcesMCPAutoStart {
+                setupMCPAutoStart()
+            }
+        #endif
 
         // Set up workspace switch listener to sync settings and validate prompts
         workspaceManager.addWorkspaceDidSwitchListener(label: "windowState") { [weak self] workspace in

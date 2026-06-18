@@ -483,8 +483,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let root = try makeTemporaryDirectory(named: "root")
         let worktree = try makeTemporaryDirectory(named: "worktree")
         let binding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path, label: "Feature WT")
+        let runID = UUID()
         let snapshot = AgentRunMCPSnapshot(
             sessionID: UUID(),
+            runID: runID,
             tabID: UUID(),
             sessionName: "Worktree Agent",
             agentRaw: AgentProviderKind.codexExec.rawValue,
@@ -504,6 +506,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         )
 
         let object = snapshot.asObject()
+        XCTAssertEqual(object["run_id"]?.stringValue, runID.uuidString)
+        XCTAssertNil(AgentRunMCPSnapshot.expired(sessionID: UUID()).asObject()["run_id"])
         let worktreeObject = try XCTUnwrap(object["worktree"]?.objectValue)
         XCTAssertEqual(worktreeObject["worktree_id"]?.stringValue, "wt_test")
         XCTAssertEqual(worktreeObject["worktree_root_path"]?.stringValue, worktree.path)

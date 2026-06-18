@@ -3843,6 +3843,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let acquired = await lease.acquire()
             guard acquired else { return }
 
+            await lease.providerInitializationStarted(provider: AgentProviderKind.codexExec.rawValue)
             await ensureCodexNativeSession(
                 session: session,
                 policyAlreadyInstalled: true,
@@ -3852,6 +3853,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 semanticRunState: semanticRunState
             )
 
+            let providerReady = effectiveRunState.isActive
+                && session.codexController?.hasActiveThread == true
+            await lease.providerInitializationCompleted(
+                provider: AgentProviderKind.codexExec.rawValue,
+                outcome: providerReady ? "ready" : (Task.isCancelled ? "cancelled" : "failed")
+            )
             guard effectiveRunState.isActive,
                   session.codexController?.hasActiveThread == true
             else {

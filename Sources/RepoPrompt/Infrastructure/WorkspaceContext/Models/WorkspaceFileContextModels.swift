@@ -62,6 +62,17 @@ struct WorkspaceRootLoadFailure: Equatable, Identifiable {
     }
 }
 
+struct WorkspaceSearchReadinessTicket: Equatable, Hashable {
+    let workspaceID: UUID?
+    let generation: UInt64
+}
+
+enum WorkspaceSearchReadinessWaitError: Error, Equatable {
+    case unavailable
+    case timedOut
+    case superseded
+}
+
 enum WorkspaceSearchReadinessState: Equatable {
     case idle
     case activating(workspaceID: UUID?, generation: UInt64)
@@ -69,6 +80,28 @@ enum WorkspaceSearchReadinessState: Equatable {
     case buildingIndexes(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64, failures: [WorkspaceRootLoadFailure])
     case ready(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64, indexedGeneration: UInt64, diagnostics: WorkspaceCatalogDiagnostics)
     case degraded(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64?, indexedGeneration: UInt64?, failures: [WorkspaceRootLoadFailure], diagnostics: WorkspaceCatalogDiagnostics?)
+
+    var ticket: WorkspaceSearchReadinessTicket? {
+        switch self {
+        case .idle:
+            nil
+        case let .activating(workspaceID, generation),
+             let .loadingCatalog(workspaceID, generation, _, _, _),
+             let .buildingIndexes(workspaceID, generation, _, _),
+             let .ready(workspaceID, generation, _, _, _),
+             let .degraded(workspaceID, generation, _, _, _, _):
+            WorkspaceSearchReadinessTicket(workspaceID: workspaceID, generation: generation)
+        }
+    }
+
+    var isSearchAdmissible: Bool {
+        switch self {
+        case .ready, .degraded:
+            true
+        case .idle, .activating, .loadingCatalog, .buildingIndexes:
+            false
+        }
+    }
 }
 
 struct WorkspaceCatalogDiagnostics: Equatable {

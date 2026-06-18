@@ -670,12 +670,14 @@ final class AgentModeViewModel: ObservableObject {
         func test_makeTerminalPublicationEnvelope(
             for session: TabSession,
             ownership: AgentRunOwnership,
-            terminalState: AgentSessionRunState
+            terminalState: AgentSessionRunState,
+            providerRunID: UUID? = nil
         ) -> AgentRunTerminalPublicationEnvelope? {
             makeTerminalPublicationEnvelope(
                 for: session,
                 ownership: ownership,
-                terminalState: terminalState
+                terminalState: terminalState,
+                providerRunID: providerRunID
             )
         }
 
@@ -1874,6 +1876,16 @@ final class AgentModeViewModel: ObservableObject {
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: acpControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
+            expectedPIDPolicyArmer: { spec in
+                guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
+                    return !spec.requiresExpectedAgentPID
+                }
+                return await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+                    for: clientName,
+                    runID: spec.runID,
+                    windowID: spec.windowID
+                )
+            },
             mcpServerEnabler: mcpServerEnabler,
             workspacePathProvider: { [weak self] session in
                 guard let self else { return nil }
@@ -2002,11 +2014,12 @@ final class AgentModeViewModel: ObservableObject {
             prepareTerminalPublication: { [weak self] session in
                 self?.prepareTerminalPublication(for: session)
             },
-            makeTerminalPublicationEnvelope: { [weak self] session, ownership, terminalState in
+            makeTerminalPublicationEnvelope: { [weak self] session, ownership, terminalState, providerRunID in
                 self?.makeTerminalPublicationEnvelope(
                     for: session,
                     ownership: ownership,
-                    terminalState: terminalState
+                    terminalState: terminalState,
+                    providerRunID: providerRunID
                 )
             },
             publishTerminalCommit: { [weak self] session, revision, successorKind in
@@ -4143,14 +4156,19 @@ final class AgentModeViewModel: ObservableObject {
     private func makeTerminalPublicationEnvelope(
         for session: TabSession,
         ownership: AgentRunOwnership,
-        terminalState: AgentSessionRunState
+        terminalState: AgentSessionRunState,
+        providerRunID: UUID?
     ) -> AgentRunTerminalPublicationEnvelope? {
         guard let epoch = ownership.turnEpoch,
               let context = session.mcpControlContext,
               context.sessionID == epoch.sessionID,
               context.activationID == epoch.activationID,
               context.registration.generation == epoch.registrationGeneration,
-              let snapshot = mcpSnapshot(for: session, canonicalTerminalState: terminalState)
+              let snapshot = mcpSnapshot(
+                  for: session,
+                  canonicalTerminalState: terminalState,
+                  canonicalProviderRunID: providerRunID
+              )
         else {
             return nil
         }
@@ -4556,7 +4574,8 @@ final class AgentModeViewModel: ObservableObject {
 
     func mcpSnapshot(
         for session: TabSession,
-        canonicalTerminalState: AgentSessionRunState? = nil
+        canonicalTerminalState: AgentSessionRunState? = nil,
+        canonicalProviderRunID: UUID? = nil
     ) -> AgentRunMCPSnapshot? {
         guard let context = session.mcpControlContext else { return nil }
         let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
@@ -4668,8 +4687,16 @@ final class AgentModeViewModel: ObservableObject {
             return "Agent Session"
         }()
         let failureReason = AgentRunMCPSnapshot.FailureReason.classify(status: status, statusText: resolvedStatusText)
+        let providerRunID: UUID? = if canonicalTerminalState != nil {
+            canonicalProviderRunID ?? AgentModeProcessRunIdentity.mostRecentTranscriptProcessRunID(for: session)
+        } else if status.isTerminal {
+            session.runID ?? AgentModeProcessRunIdentity.mostRecentTranscriptProcessRunID(for: session)
+        } else {
+            session.runID
+        }
         return AgentRunMCPSnapshot(
             sessionID: resolvedSessionID,
+            runID: providerRunID,
             tabID: session.tabID,
             sessionName: resolvedSessionName,
             agentRaw: session.selectedAgent.rawValue,

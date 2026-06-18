@@ -307,6 +307,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                     op: "start",
                     status: "running",
                     sessionID: "session-available",
+                    runID: "11111111-1111-1111-1111-111111111111",
                     session: Session(name: "Available feature agent"),
                     worktreeBindings: [
                         WorktreeBinding(
@@ -322,7 +323,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                         )
                     ]
                 ),
-                ["- Worktree: **Feature WT**", "branch `feature/available`", "`wt_test`", "path `/tmp/repo-feature`", "#3366FF"]
+                ["- Run ID: `11111111-1111-1111-1111-111111111111`", "- Worktree: **Feature WT**", "branch `feature/available`", "`wt_test`", "path `/tmp/repo-feature`", "#3366FF"]
             ),
             (
                 "unavailable",
@@ -330,6 +331,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                     op: "start",
                     status: "failed",
                     sessionID: "session-unavailable",
+                    runID: "22222222-2222-2222-2222-222222222222",
                     session: Session(name: "Feature agent"),
                     worktreeBindings: [
                         WorktreeBinding(
@@ -345,7 +347,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                         )
                     ]
                 ),
-                ["- Worktree: **demo**", "branch `feature/demo`", "`wt_missing`", "path `/tmp/repo-missing`", "⚠️ unavailable"]
+                ["- Run ID: `22222222-2222-2222-2222-222222222222`", "- Worktree: **demo**", "branch `feature/demo`", "`wt_missing`", "path `/tmp/repo-missing`", "⚠️ unavailable"]
             )
         ]
 
@@ -532,12 +534,14 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         let op: String
         let status: String
         let sessionID: String
+        let runID: String
         let session: Session
         let worktreeBindings: [WorktreeBinding]
 
         private enum CodingKeys: String, CodingKey {
             case op, status, session
             case sessionID = "session_id"
+            case runID = "run_id"
             case worktreeBindings = "worktree_bindings"
         }
     }

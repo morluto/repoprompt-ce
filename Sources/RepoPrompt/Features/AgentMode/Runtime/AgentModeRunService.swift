@@ -8,6 +8,7 @@ final class AgentModeRunService {
         let acpProviderFactory: AgentModeViewModel.ACPProviderFactory
         let acpControllerFactory: AgentModeViewModel.ACPControllerFactory
         let connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller
+        let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
         let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
         let workspacePathProvider: (AgentModeViewModel.TabSession) throws -> String?
         let codexCoordinator: CodexAgentModeCoordinator
@@ -74,7 +75,8 @@ final class AgentModeRunService {
         let makeTerminalPublicationEnvelope: (
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
-            AgentSessionRunState
+            AgentSessionRunState,
+            UUID?
         ) -> AgentRunTerminalPublicationEnvelope?
         let publishTerminalCommit: (
             AgentModeViewModel.TabSession,
@@ -204,6 +206,7 @@ final class AgentModeRunService {
         let windowID = dependencies.windowID
         let mcpServerEnabler = dependencies.mcpServerEnabler
         let connectionPolicyInstaller = dependencies.connectionPolicyInstaller
+        let expectedPIDPolicyArmer = dependencies.expectedPIDPolicyArmer
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
@@ -219,7 +222,8 @@ final class AgentModeRunService {
             return MCPBootstrapLease(
                 spec: leaseSpec,
                 mcpServerEnabler: mcpServerEnabler,
-                policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller)
+                policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
+                expectedPIDPolicyArmer: expectedPIDPolicyArmer
             )
         }
         if selectedAgent.usesClaudeNativeRuntime {

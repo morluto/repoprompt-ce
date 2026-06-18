@@ -1552,6 +1552,7 @@ struct AgentRunMCPToolService {
         }
         let session = object["session"]?.objectValue
         let agent = object["agent"]?.objectValue
+        let runID = object["run_id"]?.stringValue.flatMap(UUID.init(uuidString:))
         let interaction = object["interaction"]?.objectValue.flatMap(interaction(from:))
         let updatedAt = object["updated_at"]?.stringValue.flatMap(Self.timestampFormatter.date(from:)) ?? Date()
         let tabID = (session?["context_id"] ?? session?["tab_id"])?.stringValue.flatMap(UUID.init(uuidString:))
@@ -1561,6 +1562,7 @@ struct AgentRunMCPToolService {
         let activeWorktreeMerges = activeWorktreeMerges(from: object)
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
+            runID: runID,
             tabID: tabID,
             sessionName: session?["name"]?.stringValue,
             agentRaw: agent?["id"]?.stringValue,

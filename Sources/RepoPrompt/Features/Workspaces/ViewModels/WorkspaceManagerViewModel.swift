@@ -569,12 +569,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         let continuation: CheckedContinuation<Bool, Never>
     }
 
+    private struct WorkspaceSearchReadinessWaiter {
+        let ticket: WorkspaceSearchReadinessTicket
+        let continuation: CheckedContinuation<WorkspaceSearchReadinessTicket, any Error>
+        let timeoutTask: Task<Void, Never>
+    }
+
     private var pendingSwitchConfirmationRequest: PendingSwitchConfirmationRequest?
     private let switchSessionRegistry = WorkspaceSwitchSessionRegistry()
     private let switchTimingPolicy: WorkspaceSwitchTimingPolicy
     #if DEBUG
         private var workspaceSwitchPhaseDidChangeHandlerForTesting: ((WorkspaceSwitchPhase) -> Void)?
         private var workspaceSwitchRecoveryWillBeginHandlerForTesting: (@MainActor () async -> Void)?
+        private var workspaceSwitchReadinessDidInvalidateHandlerForTesting: (@MainActor () async -> Void)?
     #endif
 
     private struct WorkspaceDidSwitchListener {
@@ -804,8 +811,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private(set) var isSwitchingWorkspace = false
-    @Published private(set) var workspaceSearchReadinessState: WorkspaceSearchReadinessState = .idle
+    @Published private(set) var workspaceSearchReadinessState: WorkspaceSearchReadinessState = .idle {
+        didSet {
+            reconcileWorkspaceSearchReadinessWaiters()
+        }
+    }
+
     private var workspaceHydrationGeneration: UInt64 = 0
+    private var workspaceSearchReadinessWaiters: [UUID: WorkspaceSearchReadinessWaiter] = [:]
     private var postCatalogRootWorkTasks: [UInt64: [Task<WorkspaceRootLoadFailure?, Never>]] = [:]
     private var returnToSystemAfterSwitchCancellationOperationID: UUID?
     private var committedWorkspaceSwitchOperationID: UUID?
@@ -2133,6 +2146,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             && committedWorkspaceSwitchOperationID != operationID
             && (explicitlyRequestedRecovery || crossedDestructiveBoundary)
 
+        if !originalResult.didSwitch,
+           !needsRecovery,
+           committedWorkspaceSwitchOperationID != operationID
+        {
+            invalidateWorkspaceSearchReadiness()
+        }
+
         if needsRecovery, let originalActivity {
             returnToSystemAfterSwitchCancellationOperationID = nil
             let recoveryResult = await recoverWorkspaceSwitch(
@@ -2501,6 +2521,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     #if DEBUG
+        var workspaceSearchReadinessWaiterCountForTesting: Int {
+            workspaceSearchReadinessWaiters.count
+        }
+
         func setWorkspaceSwitchPhaseDidChangeHandlerForTesting(
             _ handler: ((WorkspaceSwitchPhase) -> Void)?
         ) {
@@ -2512,7 +2536,125 @@ class WorkspaceManagerViewModel: ObservableObject {
         ) {
             workspaceSwitchRecoveryWillBeginHandlerForTesting = handler
         }
+
+        func setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(
+            _ handler: (@MainActor () async -> Void)?
+        ) {
+            workspaceSwitchReadinessDidInvalidateHandlerForTesting = handler
+        }
     #endif
+
+    func awaitWorkspaceSearchReadiness(
+        timeout: Duration
+    ) async throws -> WorkspaceSearchReadinessTicket {
+        try Task.checkCancellation()
+        guard let ticket = workspaceSearchReadinessState.ticket else {
+            throw WorkspaceSearchReadinessWaitError.unavailable
+        }
+        if workspaceSearchReadinessState.isSearchAdmissible {
+            try validateWorkspaceSearchReadiness(ticket)
+            return ticket
+        }
+
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                guard workspaceSearchReadinessState.ticket == ticket else {
+                    continuation.resume(throwing: WorkspaceSearchReadinessWaitError.superseded)
+                    return
+                }
+                if workspaceSearchReadinessState.isSearchAdmissible {
+                    do {
+                        try validateWorkspaceSearchReadiness(ticket)
+                        continuation.resume(returning: ticket)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                    return
+                }
+
+                let timeoutTask = Task { @MainActor [weak self] in
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    self?.failWorkspaceSearchReadinessWaiter(
+                        waiterID,
+                        throwing: WorkspaceSearchReadinessWaitError.timedOut
+                    )
+                }
+                workspaceSearchReadinessWaiters[waiterID] = WorkspaceSearchReadinessWaiter(
+                    ticket: ticket,
+                    continuation: continuation,
+                    timeoutTask: timeoutTask
+                )
+                if Task.isCancelled {
+                    failWorkspaceSearchReadinessWaiter(waiterID, throwing: CancellationError())
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.failWorkspaceSearchReadinessWaiter(waiterID, throwing: CancellationError())
+            }
+        }
+    }
+
+    func validateWorkspaceSearchReadiness(
+        _ ticket: WorkspaceSearchReadinessTicket
+    ) throws {
+        guard workspaceSearchReadinessState.isSearchAdmissible,
+              workspaceSearchReadinessState.ticket == ticket,
+              workspaceHydrationGeneration == ticket.generation,
+              activeWorkspaceID == ticket.workspaceID
+        else {
+            throw WorkspaceSearchReadinessWaitError.superseded
+        }
+    }
+
+    private func reconcileWorkspaceSearchReadinessWaiters() {
+        for waiterID in Array(workspaceSearchReadinessWaiters.keys) {
+            guard let waiter = workspaceSearchReadinessWaiters[waiterID] else { continue }
+            guard workspaceSearchReadinessState.ticket == waiter.ticket else {
+                failWorkspaceSearchReadinessWaiter(
+                    waiterID,
+                    throwing: WorkspaceSearchReadinessWaitError.superseded
+                )
+                continue
+            }
+            guard workspaceSearchReadinessState.isSearchAdmissible else { continue }
+            do {
+                try validateWorkspaceSearchReadiness(waiter.ticket)
+                succeedWorkspaceSearchReadinessWaiter(waiterID, ticket: waiter.ticket)
+            } catch {
+                failWorkspaceSearchReadinessWaiter(waiterID, throwing: error)
+            }
+        }
+    }
+
+    private func succeedWorkspaceSearchReadinessWaiter(
+        _ waiterID: UUID,
+        ticket: WorkspaceSearchReadinessTicket
+    ) {
+        guard let waiter = workspaceSearchReadinessWaiters.removeValue(forKey: waiterID) else { return }
+        waiter.timeoutTask.cancel()
+        waiter.continuation.resume(returning: ticket)
+    }
+
+    private func failWorkspaceSearchReadinessWaiter(
+        _ waiterID: UUID,
+        throwing error: any Error
+    ) {
+        guard let waiter = workspaceSearchReadinessWaiters.removeValue(forKey: waiterID) else { return }
+        waiter.timeoutTask.cancel()
+        waiter.continuation.resume(throwing: error)
+    }
 
     @discardableResult
     func reactivateWorkspaceAfterReplacement(
@@ -2675,10 +2817,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             }
         }
+        let hydrationGeneration = beginWorkspaceHydration(for: newWorkspace)
+        #if DEBUG
+            if let workspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await workspaceSwitchReadinessDidInvalidateHandlerForTesting()
+            }
+        #endif
         await promptViewModel.stopTokenCountUpdateTimer()
-        workspaceHydrationGeneration &+= 1
-        workspaceSearchReadinessState = .idle
-        cancelPostCatalogRootWorkTasks()
         await workspaceSearchService.reset()
         await fileManager.cancelAllScans()
         if let cancellation = cancellationResult(
@@ -2804,7 +2949,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         let loadSignpost = WorkspaceExitPerf.begin("switchWorkspace.loadWorkspace")
         defer { WorkspaceExitPerf.end("switchWorkspace.loadWorkspace", loadSignpost) }
-        let hydrationGeneration = beginWorkspaceHydration(for: activeWS)
         let restoredHeavyFileState = activeComposeTabHeavyFileStateSnapshot(in: activeWS)
         if let restoredTabID = restoredHeavyFileState?.tabID {
             activationSnapshotSuspendedTabIDs.insert(restoredTabID)
@@ -3002,9 +3146,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     confirmationID: pending.confirmationID
                 )
             }
-            workspaceHydrationGeneration &+= 1
-            workspaceSearchReadinessState = .idle
-            cancelPostCatalogRootWorkTasks()
+            invalidateWorkspaceSearchReadiness()
             await workspaceSearchService.reset()
             await fileManager.cancelAllScans()
             fileManager.cancelAllLoadingTasks()
@@ -5674,6 +5816,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         return generation
     }
 
+    private func invalidateWorkspaceSearchReadiness() {
+        workspaceHydrationGeneration &+= 1
+        workspaceSearchReadinessState = .idle
+        cancelPostCatalogRootWorkTasks()
+    }
+
     private func isHydrationGenerationCurrent(_ generation: UInt64, workspaceID: UUID?) -> Bool {
         workspaceHydrationGeneration == generation && activeWorkspaceID == workspaceID && returnToSystemAfterSwitchCancellationOperationID == nil
     }
@@ -5794,6 +5942,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             #endif
         }
 
+        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         let pathsToLoad = Self.loadableRepoPaths(for: workspace)
         let rootLoadRequests = uniqueWorkspaceRootLoadRequests(for: pathsToLoad)
         let maxConcurrentLoads = Self.boundedWorkspaceRootLoadLimit(forRootCount: rootLoadRequests.count)
@@ -5845,7 +5994,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 )
             }
         #endif
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id)
+        else {
+            for rootRecord in hydrationResults.compactMap(\.rootRecord) {
+                await fileManager.workspaceFileContextStore.unloadRoot(id: rootRecord.id)
+            }
             return
         }
         #if DEBUG
@@ -5853,6 +6007,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         #endif
         for result in hydrationResults.sorted(by: { $0.request.rootIndex < $1.request.rootIndex }) {
             if result.wasCancelled {
+                continue
+            }
+            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else {
+                if let rootRecord = result.rootRecord {
+                    await fileManager.workspaceFileContextStore.unloadRoot(id: rootRecord.id)
+                }
                 continue
             }
             if let failure = result.failure {
@@ -5866,10 +6026,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                     expectedRootCount: rootLoadRequests.count,
                     failures: failures
                 )
-                continue
-            }
-            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else {
-                await fileManager.workspaceFileContextStore.unloadRoot(id: rootRecord.id)
                 continue
             }
             do {
@@ -5918,6 +6074,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 #endif
             }
         }
+        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         let reorderChanged = fileManager.reorderRootFolders(to: pathsToLoad)
         let allPrimaryRootsVisibleSuccessfully = loadedRootCount == rootLoadRequests.count && failures.isEmpty
         #if DEBUG
@@ -5939,10 +6096,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         await failures.append(contentsOf: awaitPostCatalogRootWorkFailures(generation: hydrationGeneration))
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         await workspaceSearchService.startKeepingFresh(with: fileManager.workspaceFileContextStore)
+        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         #if DEBUG
             let searchCatalogSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         var snapshot = await fileManager.workspaceFileContextStore.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         #if DEBUG
             let initialSearchCatalogSnapshotDurationMS = searchCatalogSnapshotStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
             if let initialSearchCatalogSnapshotDurationMS {
@@ -5999,11 +6158,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         while true {
             let currentCatalogGeneration = await fileManager.workspaceFileContextStore.catalogGeneration(rootScope: .visibleWorkspace)
+            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
             guard currentCatalogGeneration != indexGeneration else { break }
             #if DEBUG
                 let loopSearchCatalogSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
             snapshot = await fileManager.workspaceFileContextStore.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
             #if DEBUG
                 if let loopSearchCatalogSnapshotStartMS {
                     let duration = WorkspaceRestorePerfLog.elapsedMS(since: loopSearchCatalogSnapshotStartMS)
@@ -6065,6 +6226,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 ].merging(debugWorkspaceOpenTraceFields(), uniquingKeysWith: { current, _ in current })
             )
         #endif
+        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         if failures.isEmpty {
             workspaceSearchReadinessState = .ready(
                 workspaceID: workspace.id,

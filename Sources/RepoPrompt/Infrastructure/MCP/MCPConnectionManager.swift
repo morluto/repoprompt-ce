@@ -6652,19 +6652,22 @@ actor ServerNetworkManager {
         #endif
     }
 
+    @discardableResult
     func requireExpectedAgentPIDForPendingPolicy(
         for clientName: String,
         runID: UUID,
         windowID: Int? = nil
-    ) {
+    ) -> Bool {
         pruneExpiredPolicies(for: clientName)
         let keys = matchingClientKeys(for: clientName, in: Array(pendingPoliciesByClient.keys))
+        var matchedCount = 0
         var updatedCount = 0
         for key in keys {
             guard var queue = pendingPoliciesByClient[key] else { continue }
             for index in queue.indices {
                 guard queue[index].runID == runID else { continue }
                 if let windowID, queue[index].windowID != windowID { continue }
+                matchedCount += 1
                 if !queue[index].requiresExpectedAgentPID {
                     queue[index].requiresExpectedAgentPID = true
                     updatedCount += 1
@@ -6672,9 +6675,24 @@ actor ServerNetworkManager {
             }
             pendingPoliciesByClient[key] = queue
         }
+        let armed = matchedCount == 1
         mcpPolicyLog(
-            "marked policy requires expected pid client=\(clientName) runID=\(runID.uuidString) window=\(windowID.map(String.init) ?? "any") updated=\(updatedCount)"
+            "marked policy requires expected pid client=\(clientName) runID=\(runID.uuidString) window=\(windowID.map(String.init) ?? "any") matched=\(matchedCount) updated=\(updatedCount) armed=\(armed)"
         )
+        #if DEBUG
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "expected_pid_policy_armed",
+                fields: [
+                    "client_name": clientName,
+                    "window_id": windowID.map(String.init) ?? "any",
+                    "matched_count": String(matchedCount),
+                    "updated_count": String(updatedCount),
+                    "armed": String(armed)
+                ]
+            )
+        #endif
+        return armed
     }
 
     #if DEBUG
@@ -8896,6 +8914,34 @@ actor ServerNetworkManager {
                     ]
                 )
             }
+        #endif
+    }
+
+    /// Revokes a run-scoped pending policy and invalidates any reserved/in-flight application
+    /// before removing live routing state. This is the terminal cleanup counterpart to
+    /// PID-owned early gate release.
+    func revokeClientConnectionPolicy(
+        for clientName: String,
+        windowID: Int,
+        runID: UUID
+    ) async {
+        // Any application already past reservation must fail its next ownership check.
+        pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
+        await clearClientConnectionPolicy(
+            for: clientName,
+            windowID: windowID,
+            runID: runID
+        )
+        await cleanupRunRoutingState(for: runID, windowID: windowID)
+        #if DEBUG
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "policy_revoked",
+                fields: [
+                    "client_name": clientName,
+                    "window_id": String(windowID)
+                ]
+            )
         #endif
     }
 

@@ -833,7 +833,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     ? .rejected(reason: "test_transient_rejection")
                     : .accepted(successorEpoch: successor)
             },
-            makeTerminalPublicationEnvelope: { _, _, _ in
+            makeTerminalPublicationEnvelope: { _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
             startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
@@ -1441,6 +1441,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: trackedACPControllerFactory,
             connectionPolicyInstaller: policyInstaller,
+            expectedPIDPolicyArmer: { _ in true },
             mcpServerEnabler: serverEnabler,
             workspacePathProvider: workspacePathProvider,
             codexCoordinator: host.test_codexCoordinator,
@@ -1480,7 +1481,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         makeTerminalPublicationEnvelope: ((
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
-            AgentSessionRunState
+            AgentSessionRunState,
+            UUID?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
         startFollowUpRun: ((UUID, String) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
@@ -1517,7 +1519,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             flushPendingAssistantDelta: flushPendingAssistantDelta,
             clearPendingAssistantDelta: { _ in },
             prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
-            makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _ in nil },
+            makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _ in nil },
             publishTerminalCommit: { session, revision, successorKind in
                 if let publishTerminalCommitResult {
                     return await publishTerminalCommitResult(session, revision, successorKind)

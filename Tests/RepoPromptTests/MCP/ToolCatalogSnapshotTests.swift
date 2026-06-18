@@ -198,12 +198,29 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
     func testProductionRegistrationUsesCatalogServiceNotViewModel() async throws {
         #if DEBUG
+            XCTAssertTrue(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
+                bundleURL: URL(fileURLWithPath: "/tmp/RepoPrompt.app", isDirectory: true)
+            ))
+            XCTAssertFalse(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
+                bundleURL: URL(fileURLWithPath: "/tmp/RepoPromptTests.xctest", isDirectory: true)
+            ))
+            XCTAssertFalse(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
+                bundleURL: URL(fileURLWithPath: "/tmp/RepoPrompt.app", isDirectory: true),
+                arguments: ["-RP_UITEST"]
+            ))
+            XCTAssertFalse(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
+                bundleURL: URL(fileURLWithPath: "/tmp/RepoPrompt.app", isDirectory: true),
+                environment: ["XCTestConfigurationFilePath": "/tmp/session.xctestconfiguration"]
+            ))
+
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 let window = Self.makeWindowWithoutAutoStart()
                 let catalogService = window.mcpServer.windowMCPToolCatalogService
 
                 try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in
+                    let storedAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
                     await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    XCTAssertEqual(GlobalSettingsStore.shared.mcpAutoStart(), storedAutoStart)
                     XCTAssertTrue(ServiceRegistry.services.contains { service in
                         (service as AnyObject) === (catalogService as AnyObject)
                     })

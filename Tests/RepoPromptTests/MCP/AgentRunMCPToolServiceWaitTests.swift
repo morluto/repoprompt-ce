@@ -66,7 +66,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             ])
         }
         try await waitForWaiter(registration: fixture.registration)
-        let terminal = makeSnapshot(sessionID: fixture.sessionID, status: .completed)
+        let terminalRunID = UUID()
+        let terminal = makeSnapshot(sessionID: fixture.sessionID, runID: terminalRunID, status: .completed)
         await liveSnapshots.set(terminal)
         _ = await AgentRunSessionStore.publishTerminal(
             .init(epoch: fixture.epoch, snapshot: terminal),
@@ -77,6 +78,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
 
         let resumedValue = try await secondWait.value
         XCTAssertEqual(resumedValue.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+        XCTAssertEqual(resumedValue.objectValue?["run_id"]?.stringValue, terminalRunID.uuidString)
         XCTAssertNil(resumedValue.objectValue?["_meta"]?.objectValue?["wake_reason"])
         let allCompletions = await recorder.completions()
         XCTAssertEqual(allCompletions.count, 2)
@@ -424,11 +426,13 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
 
     private func makeSnapshot(
         sessionID: UUID,
+        runID: UUID? = nil,
         status: AgentRunMCPSnapshot.Status,
         latestAssistantPreview: String? = nil
     ) -> AgentRunMCPSnapshot {
         AgentRunMCPSnapshot(
             sessionID: sessionID,
+            runID: runID,
             tabID: nil,
             sessionName: "Child Agent",
             agentRaw: AgentProviderKind.codexExec.rawValue,

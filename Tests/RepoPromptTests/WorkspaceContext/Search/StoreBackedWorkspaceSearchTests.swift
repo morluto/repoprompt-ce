@@ -1780,6 +1780,284 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             await store.stopWatchingRoot(id: record.id)
         }
 
+        @MainActor
+        func testReadinessWaitMapsTimeoutCancellationAndIdleUnavailable() async throws {
+            let root = try makeTemporaryRoot(name: "SearchReadinessWait")
+            let fileURL = root.appendingPathComponent("OldWorkspace.swift")
+            try write("let oldWorkspaceNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Search Readiness Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            let readinessGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await readinessGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Search Readiness Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "searchReadinessErrors")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await readinessGate.release()
+                _ = await switchTask.value
+            }
+            let switchReachedReadinessGate = await readinessGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedReadinessGate)
+
+            do {
+                _ = try await StoreBackedWorkspaceSearch.$readinessWaitTimeoutOverrideForTesting.withValue(.milliseconds(20)) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "oldWorkspaceNeedle",
+                        mode: .content,
+                        paths: [fileURL.path],
+                        rootScope: .visibleWorkspace,
+                        store: store,
+                        workspaceManager: manager
+                    )
+                }
+                XCTFail("Expected workspace readiness timeout")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceReadinessTimedOut)
+                XCTAssertTrue(error.localizedDescription.contains("readiness timed out"))
+            }
+            XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+
+            let cancelledSearch = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.$readinessWaitTimeoutOverrideForTesting.withValue(.seconds(2)) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "oldWorkspaceNeedle",
+                        mode: .content,
+                        paths: [fileURL.path],
+                        rootScope: .visibleWorkspace,
+                        store: store,
+                        workspaceManager: manager
+                    )
+                }
+            }
+            try await waitForReadinessWaiterCount(1, manager: manager)
+            cancelledSearch.cancel()
+            do {
+                _ = try await cancelledSearch.value
+                XCTFail("Expected readiness cancellation")
+            } catch is CancellationError {
+                // Expected: search must preserve manager cancellation rather than remapping it.
+            }
+            try await waitForReadinessWaiterCount(0, manager: manager)
+
+            await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+            XCTAssertEqual(manager.workspaceSearchReadinessState, .idle)
+            do {
+                _ = try await StoreBackedWorkspaceSearch.search(
+                    pattern: "oldWorkspaceNeedle",
+                    mode: .content,
+                    paths: [fileURL.path],
+                    rootScope: .visibleWorkspace,
+                    store: store,
+                    workspaceManager: manager
+                )
+                XCTFail("Expected idle readiness to be unavailable")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceReadinessUnavailable)
+            }
+
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await readinessGate.release()
+            _ = await switchTask.value
+        }
+
+        @MainActor
+        func testQueuedBroadSearchRejectsSupersededReadinessTicketAfterAdmission() async throws {
+            let root = try makeTemporaryRoot(name: "QueuedReadinessSupersession")
+            try write("let queuedReadinessNeedle = true\n", to: root.appendingPathComponent("Old.swift"))
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Queued Search Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            await configureSingleLeaseSearchLane(store)
+            let admissionGate = AsyncGate()
+            await store.setSearchLanePermitAcquiredHandlerForTesting {
+                await admissionGate.markStartedAndWaitForRelease()
+            }
+            let held = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.search(
+                    pattern: "queuedReadinessNeedle",
+                    mode: .content,
+                    rootScope: .visibleWorkspace,
+                    store: store,
+                    workspaceManager: manager
+                )
+            }
+            addTeardownBlock {
+                held.cancel()
+                await admissionGate.release()
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+                _ = try? await held.value
+            }
+            let heldSearchReachedAdmission = await admissionGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(heldSearchReachedAdmission)
+            let queued = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.search(
+                    pattern: "queuedReadinessNeedle",
+                    mode: .content,
+                    rootScope: .visibleWorkspace,
+                    store: store,
+                    workspaceManager: manager
+                )
+            }
+            addTeardownBlock {
+                queued.cancel()
+                await admissionGate.release()
+                _ = try? await queued.value
+            }
+            await assertAsyncTrue(waitForAdmissionWaiterCount(1, store: store))
+
+            let readinessGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await readinessGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Queued Search Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "queuedSearchSupersession")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await admissionGate.release()
+                await readinessGate.release()
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+                _ = await switchTask.value
+            }
+            let switchReachedReadinessGate = await readinessGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedReadinessGate)
+            await admissionGate.release()
+
+            for searchTask in [held, queued] {
+                do {
+                    _ = try await searchTask.value
+                    XCTFail("Expected the old readiness ticket to be rejected")
+                } catch let error as StoreBackedWorkspaceSearchError {
+                    XCTAssertEqual(error, .workspaceReadinessSuperseded)
+                }
+            }
+            let searchLaneBecameIdle = await waitForSearchLaneIdle(store: store)
+            XCTAssertTrue(searchLaneBecameIdle)
+
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await readinessGate.release()
+            _ = await switchTask.value
+            await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+        }
+
+        @MainActor
+        func testSearchRejectsSupersededReadinessAfterAppliedIngressWait() async throws {
+            let root = try makeTemporaryRoot(name: "IngressReadinessSupersession")
+            let fileURL = root.appendingPathComponent("Old.swift")
+            try write("let ingressReadinessNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Ingress Search Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            let ingressGate = AsyncGate()
+            let searchTask = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.$freshnessWaitOperationOverrideForTesting.withValue({ _, _ in
+                    await ingressGate.markStartedAndWaitForRelease()
+                    return []
+                }) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "ingressReadinessNeedle",
+                        mode: .content,
+                        paths: [fileURL.path],
+                        rootScope: .visibleWorkspace,
+                        store: store,
+                        workspaceManager: manager
+                    )
+                }
+            }
+            addTeardownBlock {
+                searchTask.cancel()
+                await ingressGate.release()
+                _ = try? await searchTask.value
+            }
+            let searchReachedIngressGate = await ingressGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(searchReachedIngressGate)
+
+            let readinessGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await readinessGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Ingress Search Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "ingressSearchSupersession")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await ingressGate.release()
+                await readinessGate.release()
+                _ = await switchTask.value
+            }
+            let switchReachedReadinessGate = await readinessGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedReadinessGate)
+            let rootsBeforeUnload = await store.roots()
+            XCTAssertTrue(rootsBeforeUnload.contains { $0.standardizedFullPath == root.path })
+            await ingressGate.release()
+
+            do {
+                _ = try await searchTask.value
+                XCTFail("Expected post-ingress readiness validation to reject old-root results")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceReadinessSuperseded)
+            }
+
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await readinessGate.release()
+            _ = await switchTask.value
+        }
+
         func testMissingSessionWorktreeScopeThrowsTypedUnavailableErrorBeforeAdmission() async throws {
             let logicalRoot = try makeTemporaryRoot(name: "UnavailableWorktreeLogical")
             try write("let baseNeedle = true\n", to: logicalRoot.appendingPathComponent("A.swift"))
@@ -1876,16 +2154,41 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         )
         try assertOrdered([
             "try await ensureRootScopeAvailable(rootScope, store: store)",
-            "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
+            "let readinessTicket = try await acquireSearchReadiness(",
+            "readinessTicket: readinessTicket,",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
             "let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode",
             "return try await store.withStoreBackedSearchAccess(",
-            "try await ensureRootScopeAvailable(rootScope, store: store)",
-            "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
-            "try Task.checkCancellation()",
+            "if admissionClass != nil {",
+            "try await ensureRootScopeAvailable(",
+            "readinessTicket: readinessTicket,",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "var parsedSearchScope:",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let freshnessRootRefs:",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "appliedIngressSamples = try await awaitAppliedIngress(",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
             "let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(",
-            "try Task.checkCancellation()",
-            "try await performSearch("
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "parsedSearchScope = await refreshExactSearchScopeClauses(",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "return try await performSearch("
         ], in: source)
+        let performSearchStart = try XCTUnwrap(source.range(of: "private static func performSearch("))
+        try assertOrdered([
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let catalogAccess = await store.searchCatalogAccess(rootScope: rootScope)",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let visibleRootRefs = await store.rootRefs(scope: .visibleWorkspace)",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let filterResult = await withTaskCancellationHandler",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "results = try await EditFlowPerf.measure(",
+            "try await fileSearchActor.searchUnified(",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "results.scopedFileCount = filesToSearch.count"
+        ], in: String(source[performSearchStart.lowerBound...]))
     }
 
     func testSearchScopeParserKeepsRequiredResolutionOrder() throws {
@@ -1962,6 +2265,47 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
     }
 
     #if DEBUG
+        @MainActor
+        private func makeComposition(
+            store: WorkspaceFileContextStore
+        ) -> WindowStateComposition {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            defer {
+                GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            }
+            return WindowStateCompositionFactory.make(
+                windowID: -700 - Int.random(in: 1 ... 99),
+                deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService(),
+                workspaceFileContextStore: store
+            )
+        }
+
+        @MainActor
+        private func waitForReadinessWaiterCount(
+            _ expectedCount: Int,
+            manager: WorkspaceManagerViewModel,
+            timeoutNanoseconds: UInt64 = 1_000_000_000,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            let interval: UInt64 = 10_000_000
+            var waited: UInt64 = 0
+            while manager.workspaceSearchReadinessWaiterCountForTesting != expectedCount,
+                  waited < timeoutNanoseconds
+            {
+                try await Task.sleep(nanoseconds: interval)
+                waited += interval
+            }
+            XCTAssertEqual(
+                manager.workspaceSearchReadinessWaiterCountForTesting,
+                expectedCount,
+                file: file,
+                line: line
+            )
+        }
+
         private func assertAsyncTrue(
             _ value: Bool,
             _ message: @autoclosure () -> String = "",

@@ -522,6 +522,12 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 "worktreeScopeUnavailable"
             case .workspaceFreshnessTimedOut:
                 "workspaceFreshnessTimedOut"
+            case .workspaceReadinessUnavailable:
+                "workspaceReadinessUnavailable"
+            case .workspaceReadinessTimedOut:
+                "workspaceReadinessTimedOut"
+            case .workspaceReadinessSuperseded:
+                "workspaceReadinessSuperseded"
             }
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.Search.providerWorkspaceSearchReturned,
@@ -803,6 +809,12 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             "worktree_scope_unavailable"
         case .workspaceFreshnessTimedOut:
             "workspace_freshness_timeout"
+        case .workspaceReadinessUnavailable:
+            "workspace_readiness_unavailable"
+        case .workspaceReadinessTimedOut:
+            "workspace_readiness_timeout"
+        case .workspaceReadinessSuperseded:
+            "workspace_readiness_superseded"
         }
         return ToolResultDTOs.SearchResultDTO(
             totalMatches: 0,

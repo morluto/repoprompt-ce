@@ -149,8 +149,23 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             let secondWindowID = 61005
             await installPolicy(runID: firstRunID, windowID: firstWindowID)
             await installPolicy(runID: secondRunID, windowID: secondWindowID)
-            await manager.registerExpectedAgentPID(firstProcess.parentPID, for: clientName, runID: firstRunID)
+            let firstArmed = await manager.requireExpectedAgentPIDForPendingPolicy(
+                for: clientName,
+                runID: firstRunID,
+                windowID: firstWindowID
+            )
+            let secondArmed = await manager.requireExpectedAgentPIDForPendingPolicy(
+                for: clientName,
+                runID: secondRunID,
+                windowID: secondWindowID
+            )
+            XCTAssertTrue(firstArmed)
+            XCTAssertTrue(secondArmed)
+
+            // Register in reverse policy order to prove PID ownership, not FIFO position,
+            // determines which same-client run each connection consumes.
             await manager.registerExpectedAgentPID(secondProcess.parentPID, for: clientName, runID: secondRunID)
+            await manager.registerExpectedAgentPID(firstProcess.parentPID, for: clientName, runID: firstRunID)
 
             async let first = manager.debugApplyPendingPolicy(
                 clientName: clientName,
@@ -1693,6 +1708,65 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             XCTAssertTrue(didRoute)
         #else
             throw XCTSkip("Tab-context routing diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testRunPolicyRevocationInvalidatesSuspendedApplicationBeforeAdmission() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let connectionID = UUID()
+            let windowID = 61026
+            await installPolicy(runID: runID, windowID: windowID)
+            let armed = await manager.requireExpectedAgentPIDForPendingPolicy(
+                for: clientName,
+                runID: runID,
+                windowID: windowID
+            )
+            XCTAssertTrue(armed)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            await manager.debugSuspendNextPendingPolicyRouteInstallation()
+
+            let application = Task {
+                await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: false
+                )
+            }
+            let suspended = await waitUntil {
+                await self.manager.debugIsPendingPolicyRouteInstallationSuspended()
+            }
+            XCTAssertTrue(suspended)
+
+            await manager.revokeClientConnectionPolicy(
+                for: clientName,
+                windowID: windowID,
+                runID: runID
+            )
+            await manager.debugResumePendingPolicyRouteInstallation()
+            let result = await application.value
+
+            XCTAssertTrue(
+                result.outcome == "rejected:stale_connection" || result.outcome == "rejected:policy_removed",
+                result.outcome
+            )
+            let mappedRunID = await manager.runIDForConnection(connectionID)
+            let pending = await manager.debugPendingPolicySnapshot(for: clientName)
+            let runPolicy = await manager.debugRunPolicyState(for: runID)
+            XCTAssertNil(mappedRunID)
+            XCTAssertFalse(pending.contains { $0.runID == runID })
+            XCTAssertNil(runPolicy)
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+        #else
+            throw XCTSkip("PID-gated routing diagnostics require DEBUG helpers.")
         #endif
     }
 
