@@ -32,9 +32,21 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         XCTAssertEqual(try AgentRunMCPToolService.resolvedWaitTimeoutSeconds(.int(Int(maximum))), maximum)
         XCTAssertEqual(try AgentRunMCPToolService.resolvedSteerTimeoutSeconds(.string(String(Int(maximum)))), maximum)
 
-        for value in [Value.double(maximum + 1), .int(Int(maximum) + 1), .string(String(Int(maximum) + 1))] {
-            XCTAssertThrowsError(try AgentRunMCPToolService.resolvedWaitTimeoutSeconds(value)) { error in
-                XCTAssertTrue(String(describing: error).contains(String(Int(maximum))))
+        let resolvers: [(Value?) throws -> TimeInterval] = [
+            AgentRunMCPToolService.resolvedStartTimeoutSeconds,
+            AgentRunMCPToolService.resolvedWaitTimeoutSeconds,
+            AgentRunMCPToolService.resolvedSteerTimeoutSeconds
+        ]
+        let oversizedValues = [
+            Value.double(maximum + 1),
+            .int(Int(maximum) + 1),
+            .string(String(Int(maximum) + 1))
+        ]
+        for resolver in resolvers {
+            for value in oversizedValues {
+                XCTAssertThrowsError(try resolver(value)) { error in
+                    XCTAssertTrue(String(describing: error).contains(String(Int(maximum))))
+                }
             }
         }
     }

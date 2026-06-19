@@ -333,10 +333,6 @@ struct AgentComposerView: View, Equatable {
         props.isCodexRunActive
     }
 
-    private var isSelectedClaudeRunActive: Bool {
-        props.selectedAgent.usesClaudeTooling && props.runState.isActive
-    }
-
     private var canUseLinkedAgentSession: Bool {
         props.canUseLinkedAgentSession
     }
@@ -1325,7 +1321,10 @@ struct AgentComposerView: View, Equatable {
     private var claudeToolsPopoverContent: some View {
         if let claudeTools = props.providerControls?.claudeTools {
             Form {
-                claudeActiveRunNoticeSection
+                ClaudeToolSettingsActiveRunNotice(
+                    isVisible: props.selectedAgent.usesClaudeTooling && props.runState.isActive,
+                    fontPreset: fontPreset
+                )
 
                 Section {
                     Toggle("Bash", isOn: Binding(
@@ -1408,22 +1407,6 @@ struct AgentComposerView: View, Equatable {
                 .foregroundStyle(.secondary)
                 .padding(14)
                 .frame(width: claudeToolsPopoverWidth)
-        }
-    }
-
-    @ViewBuilder
-    private var claudeActiveRunNoticeSection: some View {
-        if isSelectedClaudeRunActive {
-            Section {
-                HStack(spacing: 6) {
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    Text("Claude tool setting changes apply to the next run")
-                        .font(fontPreset.captionFont)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
         }
     }
 
