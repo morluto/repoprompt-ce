@@ -778,13 +778,55 @@ import XCTest
                         selectedPaths: [fixture.contextA.fileURL.path],
                         codemapAutoEnabled: false
                     )
-                    var composeTab = try XCTUnwrap(
-                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                    let selectionIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: fixture.contextA.tabID
                     )
-                    composeTab.selection = sourceSelection
+                    let selectionRevisionBeforeSeed = fixture.contextA.window.workspaceManager
+                        .selectionRevisionForMCP(
+                            workspaceID: selectionIdentity.workspaceID,
+                            tabID: selectionIdentity.tabID
+                        )
+                    let persistedSelection = await fixture.contextA.window.selectionCoordinator.persistSelection(
+                        sourceSelection,
+                        for: selectionIdentity,
+                        source: .mcpTabContext,
+                        mirrorToUIIfActive: true
+                    )
+                    XCTAssertEqual(persistedSelection, sourceSelection)
+                    let seededSelectionRevision = fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: selectionIdentity.workspaceID,
+                        tabID: selectionIdentity.tabID
+                    )
+                    XCTAssertGreaterThan(seededSelectionRevision, selectionRevisionBeforeSeed)
+                    var composeTab = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(for: selectionIdentity)
+                    )
                     composeTab.promptText = "Review the canonical published change"
                     fixture.contextA.window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+                    XCTAssertEqual(
+                        fixture.contextA.window.workspaceManager.composeTab(for: selectionIdentity)?.selection,
+                        sourceSelection
+                    )
 
+                    let flushedSourceSnapshot = try XCTUnwrap(
+                        fixture.contextA.window.selectionCoordinator.selectionSnapshot(
+                            for: selectionIdentity,
+                            flushPendingUIIfActive: true
+                        )
+                    )
+                    XCTAssertEqual(flushedSourceSnapshot.selection, sourceSelection)
+                    XCTAssertEqual(
+                        fixture.contextA.window.workspaceManager.composeTab(for: selectionIdentity)?.selection,
+                        sourceSelection
+                    )
+                    XCTAssertEqual(
+                        fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                            workspaceID: selectionIdentity.workspaceID,
+                            tabID: selectionIdentity.tabID
+                        ),
+                        seededSelectionRevision
+                    )
                     factory.configure(
                         networkManager: fixture.networkManager,
                         logicalFilePath: fixture.contextA.fileURL.path,
@@ -795,9 +837,10 @@ import XCTest
                         name: "bind_context",
                         arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]
                     )
-                    _ = try await endpoint.callTool(
+                    let gitResponse = try await endpoint.callTool(
                         name: MCPWindowToolName.git,
                         arguments: [
+                            "_rawJSON": true,
                             "op": "diff",
                             "repo_root": fixture.contextA.rootURL.path,
                             "scope": "selected",
@@ -806,6 +849,35 @@ import XCTest
                             "mode": "deep"
                         ],
                         timeoutSeconds: 30
+                    )
+                    let gitResponseText = try toolResultText(gitResponse)
+                    let gitResponseData = try XCTUnwrap(gitResponseText.data(using: .utf8))
+                    let gitReply = try JSONDecoder().decode(
+                        ToolResultDTOs.GitToolReplyDTO.self,
+                        from: gitResponseData
+                    )
+                    XCTAssertEqual(gitReply.op, "diff")
+                    XCTAssertFalse(try XCTUnwrap(gitReply.snapshotId).isEmpty)
+                    XCTAssertFalse(try XCTUnwrap(gitReply.snapshotDir).isEmpty)
+                    XCTAssertNil(gitReply.warning)
+                    XCTAssertNil(gitReply.emptyReason)
+                    XCTAssertNil(gitReply.error)
+                    let publishedDiff = try XCTUnwrap(gitReply.diff)
+                    XCTAssertGreaterThan(publishedDiff.totals.files, 0)
+                    let publishedArtifacts = try XCTUnwrap(gitReply.artifacts)
+                    XCTAssertFalse(publishedArtifacts.map.isEmpty)
+                    let publishedAllPatch = try XCTUnwrap(publishedArtifacts.allPatch)
+                    XCTAssertFalse(publishedAllPatch.isEmpty)
+                    let primaryArtifacts = try XCTUnwrap(gitReply.primaryArtifacts)
+                    XCTAssertTrue(
+                        primaryArtifacts.perFilePatches?.contains { $0.gitPath == relativePath } == true
+                    )
+                    XCTAssertTrue(primaryArtifacts.map.hasSuffix("/\(publishedArtifacts.map)"))
+                    let primaryAllPatch = try XCTUnwrap(primaryArtifacts.allPatch)
+                    XCTAssertTrue(primaryAllPatch.hasSuffix("/\(publishedAllPatch)"))
+                    XCTAssertEqual(
+                        Set(primaryArtifacts.autoSelected ?? []),
+                        Set([primaryArtifacts.map, primaryAllPatch])
                     )
                     let publishedSelection = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
