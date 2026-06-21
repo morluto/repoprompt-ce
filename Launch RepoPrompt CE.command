@@ -46,18 +46,15 @@ launch_app() {
         echo "Debug secure storage will be in-memory; saved API keys and secure permission changes will not persist across app launches."
     fi
     echo
+    local launch_log
+    launch_log="$(mktemp -t repoprompt-ce-launch)"
+    local relaunch_rc=0
     if (( ${#APP_ARGS[@]} > 0 )); then
-        if "$CONDUCTOR" app relaunch -- "${APP_ARGS[@]}"; then
-            echo
-            echo "RepoPrompt CE has been relaunched."
-        else
-            echo
-            echo "RepoPrompt CE was not relaunched."
-            echo "Check the result above to see whether the build failed or this run was canceled/replaced."
-            echo "If the build failed, fix the errors (or let in-flight edits settle), then press r to retry."
-            echo "Press s to check the current app and job state."
-        fi
-    elif "$CONDUCTOR" app relaunch; then
+        "$CONDUCTOR" app relaunch -- "${APP_ARGS[@]}" 2>&1 | tee "$launch_log" || relaunch_rc=${PIPESTATUS[0]}
+    else
+        "$CONDUCTOR" app relaunch 2>&1 | tee "$launch_log" || relaunch_rc=${PIPESTATUS[0]}
+    fi
+    if (( relaunch_rc == 0 )); then
         echo
         echo "RepoPrompt CE has been relaunched."
     else
@@ -66,7 +63,21 @@ launch_app() {
         echo "Check the result above to see whether the build failed or this run was canceled/replaced."
         echo "If the build failed, fix the errors (or let in-flight edits settle), then press r to retry."
         echo "Press s to check the current app and job state."
+        if grep -q "Debug ad-hoc signing is disabled by default" "$launch_log"; then
+            echo
+            echo "Debug signing was refused even though this launcher tried to configure it automatically."
+            echo "Run the same debug app from Terminal with explicit ad-hoc signing:"
+            echo
+            echo "  ALLOW_ADHOC_SIGNING=1 ./conductor app relaunch"
+            echo
+            echo "Ad-hoc debug builds use in-memory secure storage, so saved API keys and secure"
+            echo "permission changes do not persist across launches. For persistent debug"
+            echo "Keychain storage, pass a stable Apple Development identity explicitly:"
+            echo
+            echo "  SIGN_IDENTITY=\"Apple Development: Your Name (TEAMID)\" ./conductor app relaunch"
+        fi
     fi
+    rm -f "$launch_log"
 }
 
 show_status() {
