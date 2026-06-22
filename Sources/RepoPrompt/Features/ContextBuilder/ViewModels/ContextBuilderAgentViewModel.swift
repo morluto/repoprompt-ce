@@ -1577,7 +1577,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if let wroteWorkspaceID {
             settingsManager.setWorkspaceAgentModelsProfile(workspaceID: wroteWorkspaceID, profile: profile)
         } else {
-            settingsManager.setGlobalAgentModelsProfile(profile)
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: .userInitiated
+            )
         }
 
         // Notify recommendation system that inputs have changed.
