@@ -15340,8 +15340,11 @@ final class AgentModeViewModel: ObservableObject {
     ///
     /// This value type is the control surface for `cleanupRuntimeResources`.
     /// Every teardown path (window close, compose-tab close/stash/delete-stashed,
-    /// session delete, cascade finalization, workspace switch) should express its
-    /// intent through a convenience constructor rather than hand-assembling flags.
+    /// session delete, cascade finalization, workspace-switch detached target)
+    /// should express its intent through a convenience constructor rather than
+    /// hand-assembling flags. The synchronous workspace-switch pre-removal path
+    /// intentionally does not use this context; its async controller teardown
+    /// flows through `.workspaceSwitchDetached` via the detached target path.
     struct RuntimeCleanupContext: Equatable {
         let reason: String
 
@@ -15462,27 +15465,6 @@ final class AgentModeViewModel: ObservableObject {
                 releaseWorktreeOwnership: false,
                 flushSave: false,
                 removeFromSessions: true,
-                detachedRunID: nil
-            )
-        }
-
-        static func workspaceSwitchPreRemoval(reason: String = "workspace_switch") -> Self {
-            Self(
-                reason: reason,
-                cancelActiveRun: true,
-                awaitTerminalTeardown: false,
-                releaseProvider: false,
-                shutdownControllers: false,
-                clearTabScopedCoordinatorState: false,
-                teardownMCPControl: false,
-                teardownMCPControlPublishChanges: false,
-                teardownMCPControlDeactivateLiveContext: false,
-                teardownApplyEditsApproval: false,
-                cancelPendingInteractions: true,
-                cleanupMCPRunRouting: false,
-                releaseWorktreeOwnership: false,
-                flushSave: false,
-                removeFromSessions: false,
                 detachedRunID: nil
             )
         }
