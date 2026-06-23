@@ -15390,7 +15390,13 @@ final class AgentModeViewModel: ObservableObject {
             Self(
                 reason: reason,
                 cancelActiveRun: true,
-                awaitTerminalTeardown: true,
+                // Match the prior handleComposeTabsWillClose behavior: cancelAgentRun
+                // used the default .terminalPublished completion, which returns after
+                // canonical terminal publication without awaiting the exactly-once
+                // provider/controller teardown closure. The helper's steps 8/9 then
+                // own provider release and controller shutdown, avoiding any
+                // double-dispose interaction with the teardown closure.
+                awaitTerminalTeardown: false,
                 releaseProvider: true,
                 shutdownControllers: true,
                 clearTabScopedCoordinatorState: true,
