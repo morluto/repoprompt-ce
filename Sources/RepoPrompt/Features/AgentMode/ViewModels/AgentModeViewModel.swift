@@ -10463,6 +10463,19 @@ final class AgentModeViewModel: ObservableObject {
                 }
                 await cleanupRuntimeResources(for: session, context: context)
             }
+            // Release MCP run routing and worktree ownership unconditionally,
+            // even when no live session exists for this tab. The helper only
+            // runs these when a session is present (composeTabClose sets both
+            // flags to false), so nil-session tabs must be handled here to
+            // match the prior unconditional cleanup and avoid leaking routing
+            // entries or worktree ownership for never-instantiated tabs.
+            let boundID = boundSessionID(for: tabID)
+            await cleanupMCPRunRoutingIfPresent(
+                boundSessionID: boundID,
+                liveSession: sessions[tabID],
+                reason: "compose_tab_close"
+            )
+            await releaseSessionWorktreeOwnership(sessionID: boundID)
             switch reason {
             case .stash:
                 sessions.removeValue(forKey: tabID)
@@ -15408,8 +15421,11 @@ final class AgentModeViewModel: ObservableObject {
                 teardownMCPControlDeactivateLiveContext: true,
                 teardownApplyEditsApproval: true,
                 cancelPendingInteractions: true,
-                cleanupMCPRunRouting: true,
-                releaseWorktreeOwnership: true,
+                // MCP run routing and worktree ownership are released
+                // unconditionally by handleComposeTabsWillClose (even for
+                // nil-session tabs), so the helper must not duplicate them.
+                cleanupMCPRunRouting: false,
+                releaseWorktreeOwnership: false,
                 flushSave: true,
                 removeFromSessions: false,
                 detachedRunID: nil
@@ -15427,8 +15443,15 @@ final class AgentModeViewModel: ObservableObject {
         static func sessionDelete(reason: String = "session_delete") -> Self {
             Self(
                 reason: reason,
-                cancelActiveRun: true,
-                awaitTerminalTeardown: true,
+                // Match the prior deleteSession behavior: a direct
+                // session.agentTask?.cancel() rather than routing through
+                // cancelAgentRun with .terminalTeardownCompleted. The helper's
+                // step 7 still cancels agentTask unconditionally. Routing
+                // through cancelAgentRun would publish terminal state and
+                // engage the run service's full cancellation flow during
+                // deletion, which is a behavior delta the original did not have.
+                cancelActiveRun: false,
+                awaitTerminalTeardown: false,
                 releaseProvider: true,
                 shutdownControllers: true,
                 clearTabScopedCoordinatorState: true,
@@ -15451,8 +15474,11 @@ final class AgentModeViewModel: ObservableObject {
         static func finalizeDeletedReferences(reason: String = "finalize_deleted_references") -> Self {
             Self(
                 reason: reason,
-                cancelActiveRun: true,
-                awaitTerminalTeardown: true,
+                // Same rationale as sessionDelete: the original used a direct
+                // session.agentTask?.cancel(), not cancelAgentRun. Step 7 of
+                // the helper still cancels agentTask unconditionally.
+                cancelActiveRun: false,
+                awaitTerminalTeardown: false,
                 releaseProvider: true,
                 shutdownControllers: true,
                 clearTabScopedCoordinatorState: true,
