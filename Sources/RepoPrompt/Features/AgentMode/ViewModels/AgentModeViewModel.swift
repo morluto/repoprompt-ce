@@ -646,6 +646,10 @@ final class AgentModeViewModel: ObservableObject {
         private var test_currentTabIDOverride: UUID?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
+        /// Records every session ID passed to `releaseSessionWorktreeOwnership`, in
+        /// call order. Used by lifecycle tests to assert that nil-session tabs
+        /// (sidebar-bound only) still release ownership with the expected session ID.
+        private(set) var test_releaseSessionWorktreeOwnershipCalls: [UUID] = []
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_terminalPublicationOverride: ((
             AgentRunTerminalCommitRevision,
@@ -960,6 +964,14 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setMCPControlledTabIDs(_ tabIDs: Set<UUID>) {
             mcpControlledTabIDs = tabIDs
+        }
+
+        func test_setTabsWithActiveAgentRun(_ tabIDs: Set<UUID>) {
+            tabsWithActiveAgentRun = tabIDs
+        }
+
+        func test_setSessionListSortDates(_ dates: [UUID: Date]) {
+            sessionListSortDates = dates
         }
 
         func test_setActiveSessionLoadInProgressTabID(_ tabID: UUID?) {
@@ -5318,6 +5330,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func releaseSessionWorktreeOwnership(sessionID: UUID?) async {
+        #if DEBUG
+            if let sessionID {
+                test_releaseSessionWorktreeOwnershipCalls.append(sessionID)
+            }
+        #endif
         guard let sessionID, let workspaceFileContextStore else { return }
         await WorkspaceRootBindingProjectionMaterializer(store: workspaceFileContextStore).release(sessionID: sessionID)
     }
@@ -9378,12 +9395,10 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cleanupMCPRunRoutingIfPresent(
-        boundSessionID: UUID?,
         liveSession: TabSession?,
         explicitRunID: UUID? = nil,
         reason: String
     ) async {
-        _ = boundSessionID
         guard let runID = explicitRunID ?? liveSession?.runID else { return }
         _ = mcpRunToolCanceller(runID, reason)
         await mcpRunRoutingCleaner(runID, windowID, reason)
@@ -9743,7 +9758,6 @@ final class AgentModeViewModel: ObservableObject {
                     deactivateLiveControlContext: false
                 )
                 await cleanupMCPRunRoutingIfPresent(
-                    boundSessionID: target.boundSessionID,
                     liveSession: target.session,
                     explicitRunID: target.runID,
                     reason: reason
@@ -10470,11 +10484,23 @@ final class AgentModeViewModel: ObservableObject {
             // match the prior unconditional cleanup and avoid leaking routing
             // entries or worktree ownership for never-instantiated tabs.
             let boundID = boundSessionID(for: tabID)
+            let routingReason = switch reason {
+            case .close: "compose_tab_close"
+            case .stash: "compose_tab_stash"
+            case .deleteStashed: "compose_tab_delete_stashed"
+            }
             await cleanupMCPRunRoutingIfPresent(
-                boundSessionID: boundID,
                 liveSession: sessions[tabID],
-                reason: "compose_tab_close"
+                reason: routingReason
             )
+            // Worktree ownership is released after `cleanupRuntimeResources`
+            // has already shut down the provider/controllers for live sessions
+            // (steps 8/9 of the helper). Controller teardown does not depend on
+            // the worktree projection still being held: the projection only
+            // governs search-root authorization for context building, while
+            // controllers own their own process handles and shut them down
+            // directly. Releasing ownership here is safe for both live and
+            // nil-session tabs.
             await releaseSessionWorktreeOwnership(sessionID: boundID)
             switch reason {
             case .stash:
@@ -15627,9 +15653,7 @@ final class AgentModeViewModel: ObservableObject {
 
         // 10. Clean up MCP run routing.
         if context.cleanupMCPRunRouting {
-            let sessionID = boundSessionID(for: session.tabID)
             await cleanupMCPRunRoutingIfPresent(
-                boundSessionID: sessionID,
                 liveSession: session,
                 reason: context.reason
             )
@@ -15802,7 +15826,6 @@ final class AgentModeViewModel: ObservableObject {
             await cleanupRuntimeResources(for: session, context: .sessionDelete())
         }
         await cleanupMCPRunRoutingIfPresent(
-            boundSessionID: sessionID,
             liveSession: liveSession,
             reason: "session_delete"
         )
