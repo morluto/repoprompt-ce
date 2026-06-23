@@ -770,6 +770,10 @@ final class AgentModeViewModel: ObservableObject {
             ensureSessionBoundToTab(session)
         }
 
+        func test_installLiveSession(_ session: TabSession) {
+            sessions[session.tabID] = session
+        }
+
         func test_bindingResolution(sessionID: UUID) -> PersistentBindingResolution {
             persistentBindingResolution(for: sessionID)
         }
@@ -2765,36 +2769,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
-        removePendingUIRefresh(for: session.tabID)
-        cancelPersistedLoad(for: session)
-        session.derivedTranscriptRefreshTask?.cancel()
-        session.derivedTranscriptRefreshTask = nil
-        session.pendingDerivedTranscriptRefreshReason = nil
-        session.pendingCommandRunningFlushTask?.cancel()
-        session.pendingCommandRunningFlushTask = nil
-        session.pendingCommandRunningByKey.removeAll()
-        cancelPendingQuestion(for: session)
-        cancelPendingApproval(for: session)
-        cancelPendingApplyEditsReview(for: session, reason: "Cancelled because window is closing")
-        await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-        cancelPendingInstruction(for: session)
-        await teardownMCPControl(for: session, cleanupSessionStore: true)
-        session.agentTask?.cancel()
-        session.agentTask = nil
-        let provider = session.provider
-        session.provider = nil
-        if let provider {
-            await provider.dispose()
-        }
-        await codexCoordinator.shutdownCodexSession(session)
-        await claudeCoordinator.shutdownClaudeSession(session)
-        let sessionID = boundSessionID(for: session.tabID)
-        await cleanupMCPRunRoutingIfPresent(
-            boundSessionID: sessionID,
-            liveSession: session,
-            reason: "window_close"
-        )
-        await releaseSessionWorktreeOwnership(sessionID: sessionID)
+        await cleanupRuntimeResources(for: session, context: .windowClose())
     }
 
     // MARK: - Tab Management
@@ -9775,15 +9750,9 @@ final class AgentModeViewModel: ObservableObject {
                 )
                 await Task.yield()
             }
-            let codexCoordinator = codexCoordinator
-            let claudeCoordinator = claudeCoordinator
             workspaceSwitchBackgroundCleanupTasks.removeValue(forKey: cleanupID)
             for target in targets {
-                await Self.disposeDetachedWorkspaceSwitchTarget(
-                    target,
-                    codexCoordinator: codexCoordinator,
-                    claudeCoordinator: claudeCoordinator
-                )
+                await disposeDetachedWorkspaceSwitchTarget(target)
                 await Task.yield()
             }
         }
@@ -9793,34 +9762,15 @@ final class AgentModeViewModel: ObservableObject {
         #endif
     }
 
-    private static func disposeDetachedWorkspaceSwitchTarget(
-        _ target: WorkspaceSwitchSessionCleanupTarget,
-        codexCoordinator: CodexAgentModeCoordinator,
-        claudeCoordinator: ClaudeAgentModeCoordinator
+    private func disposeDetachedWorkspaceSwitchTarget(
+        _ target: WorkspaceSwitchSessionCleanupTarget
     ) async {
-        let session = target.session
-        let provider = session.provider
-        session.provider = nil
-        if let provider {
-            await provider.dispose()
-        }
-        session.acpSteeringFlushTask?.cancel()
-        session.acpSteeringFlushTask = nil
-        session.pendingACPSteeringInstructions.removeAll()
-        if let controller = session.acpController {
-            session.acpController = nil
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            await controller.cancelPrompt()
-            await controller.shutdown()
-        }
-        await codexCoordinator.shutdownCodexSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: target.runID
-        )
-        await claudeCoordinator.shutdownClaudeSession(
-            session,
-            clearTabScopedCoordinatorState: false
+        await cleanupRuntimeResources(
+            for: target.session,
+            context: .workspaceSwitchDetached(
+                reason: "workspace_switch",
+                detachedRunID: target.runID
+            )
         )
     }
 
@@ -10505,39 +10455,14 @@ final class AgentModeViewModel: ObservableObject {
         // going away so we don't leave dangling entries referring to dead IDs.
         cleanupSidebarRunAttention(tabIDs: tabIDs)
         for tabID in tabIDs {
-            let boundID = boundSessionID(for: tabID)
             if let session = sessions[tabID] {
-                removePendingUIRefresh(for: tabID)
-                cancelPersistedLoad(for: session)
-                session.pendingCommandRunningFlushTask?.cancel()
-                session.pendingCommandRunningFlushTask = nil
-                session.pendingCommandRunningByKey.removeAll()
-                // Cancel pending question
-                cancelPendingQuestion(for: session)
-                cancelPendingApproval(for: session)
-                cancelPendingApplyEditsReview(for: session, reason: "Cancelled because tab is closing")
-                await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-                cancelPendingInstruction(for: session)
-                await teardownMCPControl(for: session, cleanupSessionStore: true)
-
-                // Cancel agent run
-                if session.runState.isActive {
-                    await cancelAgentRun(tabID: tabID)
+                let context: RuntimeCleanupContext = switch reason {
+                case .close: .composeTabClose()
+                case .stash: .composeTabStash()
+                case .deleteStashed: .composeTabDeleteStashed()
                 }
-
-                await codexCoordinator.shutdownCodexSession(session)
-                await claudeCoordinator.shutdownClaudeSession(session)
-
-                // Flush save before deleting backing file
-                await flushSave(for: tabID)
+                await cleanupRuntimeResources(for: session, context: context)
             }
-            await cleanupMCPRunRoutingIfPresent(
-                boundSessionID: boundID,
-                liveSession: sessions[tabID],
-                reason: "compose_tab_close"
-            )
-            await releaseSessionWorktreeOwnership(sessionID: boundID)
-
             switch reason {
             case .stash:
                 sessions.removeValue(forKey: tabID)
@@ -15408,15 +15333,304 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func cleanupACPStateForDeletedSession(_ session: TabSession) async {
+    // MARK: - Consolidated Runtime Cleanup
+
+    /// Describes which runtime resources to release for a `TabSession` and
+    /// which path-specific steps to skip.
+    ///
+    /// This value type is the control surface for `cleanupRuntimeResources`.
+    /// Every teardown path (window close, compose-tab close/stash/delete-stashed,
+    /// session delete, cascade finalization, workspace switch) should express its
+    /// intent through a convenience constructor rather than hand-assembling flags.
+    struct RuntimeCleanupContext: Equatable {
+        let reason: String
+
+        let cancelActiveRun: Bool
+        let awaitTerminalTeardown: Bool
+
+        let releaseProvider: Bool
+        let shutdownControllers: Bool
+        let clearTabScopedCoordinatorState: Bool
+
+        let teardownMCPControl: Bool
+        let teardownMCPControlPublishChanges: Bool
+        let teardownMCPControlDeactivateLiveContext: Bool
+        let teardownApplyEditsApproval: Bool
+        let cancelPendingInteractions: Bool
+
+        let cleanupMCPRunRouting: Bool
+        let releaseWorktreeOwnership: Bool
+
+        let flushSave: Bool
+        let removeFromSessions: Bool
+
+        let detachedRunID: UUID?
+        static func windowClose(reason: String = "window_close") -> Self {
+            Self(
+                reason: reason,
+                cancelActiveRun: false,
+                awaitTerminalTeardown: false,
+                releaseProvider: true,
+                shutdownControllers: true,
+                clearTabScopedCoordinatorState: true,
+                teardownMCPControl: true,
+                teardownMCPControlPublishChanges: true,
+                teardownMCPControlDeactivateLiveContext: true,
+                teardownApplyEditsApproval: true,
+                cancelPendingInteractions: true,
+                cleanupMCPRunRouting: true,
+                releaseWorktreeOwnership: true,
+                flushSave: false,
+                removeFromSessions: false,
+                detachedRunID: nil
+            )
+        }
+
+        static func composeTabClose(reason: String = "compose_tab_close") -> Self {
+            Self(
+                reason: reason,
+                cancelActiveRun: true,
+                awaitTerminalTeardown: true,
+                releaseProvider: true,
+                shutdownControllers: true,
+                clearTabScopedCoordinatorState: true,
+                teardownMCPControl: true,
+                teardownMCPControlPublishChanges: true,
+                teardownMCPControlDeactivateLiveContext: true,
+                teardownApplyEditsApproval: true,
+                cancelPendingInteractions: true,
+                cleanupMCPRunRouting: true,
+                releaseWorktreeOwnership: true,
+                flushSave: true,
+                removeFromSessions: false,
+                detachedRunID: nil
+            )
+        }
+
+        static func composeTabStash(reason: String = "compose_tab_stash") -> Self {
+            .composeTabClose(reason: reason)
+        }
+
+        static func composeTabDeleteStashed(reason: String = "compose_tab_delete_stashed") -> Self {
+            .composeTabClose(reason: reason)
+        }
+
+        static func sessionDelete(reason: String = "session_delete") -> Self {
+            Self(
+                reason: reason,
+                cancelActiveRun: true,
+                awaitTerminalTeardown: true,
+                releaseProvider: true,
+                shutdownControllers: true,
+                clearTabScopedCoordinatorState: true,
+                teardownMCPControl: true,
+                teardownMCPControlPublishChanges: true,
+                teardownMCPControlDeactivateLiveContext: true,
+                teardownApplyEditsApproval: true,
+                cancelPendingInteractions: true,
+                cleanupMCPRunRouting: true,
+                releaseWorktreeOwnership: true,
+                flushSave: false,
+                removeFromSessions: false,
+                detachedRunID: nil
+            )
+        }
+
+        static func finalizeDeletedReferences(reason: String = "finalize_deleted_references") -> Self {
+            Self(
+                reason: reason,
+                cancelActiveRun: true,
+                awaitTerminalTeardown: true,
+                releaseProvider: true,
+                shutdownControllers: true,
+                clearTabScopedCoordinatorState: true,
+                teardownMCPControl: true,
+                teardownMCPControlPublishChanges: true,
+                teardownMCPControlDeactivateLiveContext: true,
+                teardownApplyEditsApproval: true,
+                cancelPendingInteractions: true,
+                cleanupMCPRunRouting: true,
+                releaseWorktreeOwnership: false,
+                flushSave: false,
+                removeFromSessions: true,
+                detachedRunID: nil
+            )
+        }
+
+        static func workspaceSwitchPreRemoval(reason: String = "workspace_switch") -> Self {
+            Self(
+                reason: reason,
+                cancelActiveRun: true,
+                awaitTerminalTeardown: false,
+                releaseProvider: false,
+                shutdownControllers: false,
+                clearTabScopedCoordinatorState: false,
+                teardownMCPControl: false,
+                teardownMCPControlPublishChanges: false,
+                teardownMCPControlDeactivateLiveContext: false,
+                teardownApplyEditsApproval: false,
+                cancelPendingInteractions: true,
+                cleanupMCPRunRouting: false,
+                releaseWorktreeOwnership: false,
+                flushSave: false,
+                removeFromSessions: false,
+                detachedRunID: nil
+            )
+        }
+
+        static func workspaceSwitchDetached(
+            reason: String = "workspace_switch_detached",
+            detachedRunID: UUID? = nil
+        ) -> Self {
+            Self(
+                reason: reason,
+                cancelActiveRun: false,
+                awaitTerminalTeardown: false,
+                releaseProvider: true,
+                shutdownControllers: true,
+                clearTabScopedCoordinatorState: false,
+                teardownMCPControl: false,
+                teardownMCPControlPublishChanges: false,
+                teardownMCPControlDeactivateLiveContext: false,
+                teardownApplyEditsApproval: false,
+                cancelPendingInteractions: false,
+                cleanupMCPRunRouting: false,
+                releaseWorktreeOwnership: false,
+                flushSave: false,
+                removeFromSessions: false,
+                detachedRunID: detachedRunID
+            )
+        }
+    }
+
+    /// Release runtime resources owned by a `TabSession`.
+    ///
+    /// This is the single owner for teardown ordering. All paths that remove a
+    /// session from reachability must go through here so that retained ACP/Codex/
+    /// Claude controllers, headless providers, MCP control contexts, pending UI
+    /// interactions, and worktree ownership are released consistently.
+    ///
+    /// Idempotent: repeated calls are safe because each step captures a local
+    /// reference and nils the session field before any async dispose/shutdown.
+    private func cleanupRuntimeResources(
+        for session: TabSession,
+        context: RuntimeCleanupContext
+    ) async {
+        // 1. Cancel async refresh/load tasks.
+        removePendingUIRefresh(for: session.tabID)
+        cancelPersistedLoad(for: session)
+        session.derivedTranscriptRefreshTask?.cancel()
+        session.derivedTranscriptRefreshTask = nil
+        session.pendingDerivedTranscriptRefreshReason = nil
+        session.pendingCommandRunningFlushTask?.cancel()
+        session.pendingCommandRunningFlushTask = nil
+        session.pendingCommandRunningByKey.removeAll()
+        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+        clearPendingAssistantDelta(session)
+
+        // 2. Cancel steering queues.
+        session.claudeSteeringFlushTask?.cancel()
+        session.claudeSteeringFlushTask = nil
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
+        session.pendingClaudeSteeringInstructions.removeAll()
         session.pendingACPSteeringInstructions.removeAll()
-        if let controller = session.acpController {
-            session.acpController = nil
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            await controller.cancelPrompt()
-            await controller.shutdown()
+
+        // 3. Cancel pending interactions.
+        if context.cancelPendingInteractions {
+            cancelPendingQuestion(for: session)
+            cancelPendingApproval(for: session)
+            cancelPendingApplyEditsReview(for: session, reason: "Cancelled because \(context.reason)")
+            cancelPendingInstruction(for: session)
+            session.pendingApplyEditsReview = nil
+            reconcileInteractiveRunState(session)
+        }
+
+        // 4. Cancel active run before releasing provider/controllers.
+        if context.cancelActiveRun, session.runState.isActive {
+            let completion: AgentModeRunService.CancellationCompletion =
+                context.awaitTerminalTeardown ? .terminalTeardownCompleted : .terminalPublished
+            await cancelAgentRun(tabID: session.tabID, completion: completion)
+        }
+
+        // 5. Tear down apply-edits approval subscription.
+        if context.teardownApplyEditsApproval {
+            await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
+        }
+
+        // 6. Tear down MCP control context.
+        if context.teardownMCPControl {
+            await teardownMCPControl(
+                for: session,
+                cleanupSessionStore: true,
+                publishChanges: context.teardownMCPControlPublishChanges,
+                deactivateLiveControlContext: context.teardownMCPControlDeactivateLiveContext
+            )
+        }
+
+        // 7. Cancel runtime observation tasks.
+        session.agentTask?.cancel()
+        session.agentTask = nil
+        session.codexEventTask?.cancel()
+        session.codexEventTask = nil
+        session.codexEventTaskRunID = nil
+
+        // 8. Release headless provider.
+        if context.releaseProvider {
+            let provider = session.provider
+            session.provider = nil
+            if let provider {
+                await provider.dispose()
+            }
+        }
+
+        // 9. Shutdown ACP/Codex/Claude controllers.
+        if context.shutdownControllers {
+            if let controller = session.acpController {
+                session.acpController = nil
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                await controller.cancelPrompt()
+                await controller.shutdown()
+            }
+            await codexCoordinator.shutdownCodexSession(
+                session,
+                clearTabScopedCoordinatorState: context.clearTabScopedCoordinatorState,
+                detachedRunID: context.detachedRunID
+            )
+            await claudeCoordinator.shutdownClaudeSession(
+                session,
+                clearTabScopedCoordinatorState: context.clearTabScopedCoordinatorState
+            )
+        }
+
+        // 10. Clean up MCP run routing.
+        if context.cleanupMCPRunRouting {
+            let sessionID = boundSessionID(for: session.tabID)
+            await cleanupMCPRunRoutingIfPresent(
+                boundSessionID: sessionID,
+                liveSession: session,
+                reason: context.reason
+            )
+        }
+
+        // 11. Release worktree ownership.
+        if context.releaseWorktreeOwnership {
+            let sessionID = boundSessionID(for: session.tabID)
+            await releaseSessionWorktreeOwnership(sessionID: sessionID)
+        }
+
+        // 12. Flush any pending save.
+        if context.flushSave {
+            await flushSave(for: session.tabID)
+        }
+
+        // 13. Remove from live session map.
+        if context.removeFromSessions {
+            sessions.removeValue(forKey: session.tabID)
+            tabsWithActiveAgentRun.remove(session.tabID)
+            mcpControlledTabIDs.remove(session.tabID)
+            sessionListSortDates.removeValue(forKey: session.tabID)
+            tabDraftText.removeValue(forKey: session.tabID)
         }
     }
 
@@ -15496,38 +15710,16 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         for tabID in stateCleanupTabIDs {
-            removePendingUIRefresh(for: tabID)
             if activeSessionLoadInProgressTabID == tabID {
                 activeSessionLoadInProgressTabID = nil
             }
-            sessionListSortDates.removeValue(forKey: tabID)
-            tabsWithActiveAgentRun.remove(tabID)
-            mcpControlledTabIDs.remove(tabID)
+            removePendingUIRefresh(for: tabID)
 
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { continue }
-            cancelPersistedLoad(for: session)
-            cancelPendingQuestion(for: session)
-            cancelPendingApproval(for: session)
-            cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
-            await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-            cancelPendingInstruction(for: session)
-            await cleanupACPStateForDeletedSession(session)
-            await teardownMCPControl(for: session, cleanupSessionStore: true)
-            session.pendingCommandRunningFlushTask?.cancel()
-            session.pendingCommandRunningFlushTask = nil
-            session.pendingCommandRunningByKey.removeAll()
-            session.agentTask?.cancel()
-            if let provider = session.provider {
-                await provider.dispose()
-            }
-            await codexCoordinator.shutdownCodexSession(session)
-            await claudeCoordinator.shutdownClaudeSession(session)
-            await cleanupMCPRunRoutingIfPresent(
-                boundSessionID: sessionID,
-                liveSession: session,
-                reason: reason
+            await cleanupRuntimeResources(
+                for: session,
+                context: .finalizeDeletedReferences(reason: reason)
             )
-            sessions.removeValue(forKey: tabID)
         }
 
         await releaseSessionWorktreeOwnership(sessionID: sessionID)
@@ -15578,24 +15770,7 @@ final class AgentModeViewModel: ObservableObject {
             lastProcessedTabID = nil
         }
         if let session = liveSession {
-            removePendingUIRefresh(for: tabID)
-            cancelPersistedLoad(for: session)
-            cancelPendingQuestion(for: session)
-            cancelPendingApproval(for: session)
-            cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
-            await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-            cancelPendingInstruction(for: session)
-            await cleanupACPStateForDeletedSession(session)
-            await teardownMCPControl(for: session, cleanupSessionStore: true)
-            session.pendingCommandRunningFlushTask?.cancel()
-            session.pendingCommandRunningFlushTask = nil
-            session.pendingCommandRunningByKey.removeAll()
-            session.agentTask?.cancel()
-            if let provider = session.provider {
-                await provider.dispose()
-            }
-            await codexCoordinator.shutdownCodexSession(session)
-            await claudeCoordinator.shutdownClaudeSession(session)
+            await cleanupRuntimeResources(for: session, context: .sessionDelete())
         }
         await cleanupMCPRunRoutingIfPresent(
             boundSessionID: sessionID,
