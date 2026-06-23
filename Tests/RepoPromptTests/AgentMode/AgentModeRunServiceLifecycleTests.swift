@@ -652,6 +652,167 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(remainsReusable)
     }
 
+    // MARK: - Consolidated runtime cleanup paths
+
+    private func makeCompletedReusableOpenCodeSession(
+        recorder: LifecycleRecorder = LifecycleRecorder()
+    ) async throws -> (
+        harness: LifecycleHarness,
+        session: AgentModeViewModel.TabSession,
+        controller: ACPAgentSessionController,
+        processID: pid_t
+    ) {
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent("opencode-process-id.txt")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .openCode)
+                return provider
+            },
+            autoSignalACPRouting: true
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Complete and remain reusable",
+            initialMessageForRun: "Complete and remain reusable",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("OpenCode reusable-session run") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        let controller = try XCTUnwrap(session.acpController)
+        let wasReusable = await controller.hasReusableSession
+        XCTAssertTrue(wasReusable)
+
+        try await waitUntil("OpenCode process ID should be recorded") {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+        XCTAssertTrue(Self.processIsRunning(processID))
+
+        harness.host.test_installLiveSession(session)
+
+        return (harness, session, controller, processID)
+    }
+
+    func testWindowCloseShutsDownRetainedACPController() async throws {
+        let (harness, _, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.prepareForWindowClose()
+
+        try await waitUntil("OpenCode process should exit after window close") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testSessionDeleteShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.deleteSession(tabID: session.tabID)
+
+        try await waitUntil("OpenCode process should exit after session delete") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testComposeTabCloseShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .close)
+
+        try await waitUntil("OpenCode process should exit after compose tab close") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testComposeTabStashShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .stash)
+
+        try await waitUntil("OpenCode process should exit after compose tab stash") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testComposeTabDeleteStashedShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .deleteStashed)
+
+        try await waitUntil("OpenCode process should exit after stashed tab delete") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testFinalizeDeletedReferencesShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+
+        _ = await harness.host.finalizeDeletedAgentSessionReferences(
+            sessionID: sessionID,
+            workspaceID: nil,
+            knownTabIDs: [session.tabID],
+            reason: "test_finalize_deleted_references"
+        )
+
+        try await waitUntil("OpenCode process should exit after finalize deleted references") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testConsolidatedCleanupIsIdempotent() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .close)
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .close)
+        await harness.host.prepareForWindowClose()
+
+        try await waitUntil("OpenCode process should exit after repeated cleanup") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
     func testTerminalBarrierRejectsStaleOwnership() async {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
