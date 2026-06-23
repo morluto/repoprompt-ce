@@ -15714,6 +15714,13 @@ final class AgentModeViewModel: ObservableObject {
                 activeSessionLoadInProgressTabID = nil
             }
             removePendingUIRefresh(for: tabID)
+            // Unconditionally clear stale tab-scoped bookkeeping for every candidate
+            // tabID. The helper's step 13 only runs when a live session still matches
+            // sessionID, so this preserves the original belt-and-suspenders guarantee
+            // that stale knownTabIDs cannot leave dangling entries behind.
+            sessionListSortDates.removeValue(forKey: tabID)
+            tabsWithActiveAgentRun.remove(tabID)
+            mcpControlledTabIDs.remove(tabID)
 
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { continue }
             await cleanupRuntimeResources(
