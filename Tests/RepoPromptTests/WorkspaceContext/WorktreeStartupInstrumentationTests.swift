@@ -4,15 +4,12 @@ import XCTest
 
 #if DEBUG
     final class WorktreeStartupInstrumentationTests: XCTestCase {
-        func testObservationAndServingFlagsDefaultDisabledAndServingRequiresObservation() throws {
+        func testObservationAndServingFlagsDefaultEnabledAndServingRequiresObservation() throws {
             let suiteName = "WorktreeStartupInstrumentationTests-\(UUID().uuidString)"
             let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
             defer { defaults.removePersistentDomain(forName: suiteName) }
 
-            XCTAssertEqual(WorktreeStartupFeatureFlags.current(defaults: defaults), .init())
-            defaults.set(true, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
-            XCTAssertFalse(WorktreeStartupFeatureFlags.current(defaults: defaults).serveDiffSeededWorktreeStartup)
-            defaults.set(true, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            // Diff-seeded worktree startup ships ON by default: absent keys enable both routes.
             XCTAssertEqual(
                 WorktreeStartupFeatureFlags.current(defaults: defaults),
                 .init(
@@ -20,6 +17,24 @@ import XCTest
                     serveDiffSeededWorktreeStartup: true
                 )
             )
+            // Serving still requires observation: explicit observe=false disables serving too.
+            defaults.set(false, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            defaults.set(true, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            XCTAssertFalse(WorktreeStartupFeatureFlags.current(defaults: defaults).observeDiffSeededWorktreeStartup)
+            XCTAssertFalse(WorktreeStartupFeatureFlags.current(defaults: defaults).serveDiffSeededWorktreeStartup)
+            // serve=false is an explicit kill switch while observation stays enabled.
+            defaults.set(true, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            defaults.set(false, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            XCTAssertEqual(
+                WorktreeStartupFeatureFlags.current(defaults: defaults),
+                .init(
+                    observeDiffSeededWorktreeStartup: true,
+                    serveDiffSeededWorktreeStartup: false
+                )
+            )
+            // Both keys explicitly false disables both routes.
+            defaults.set(false, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            XCTAssertEqual(WorktreeStartupFeatureFlags.current(defaults: defaults), .init())
 
             let automatic = WorktreeStartupContext(agentSessionID: UUID())
             XCTAssertEqual(automatic.servingControl, .automatic)
