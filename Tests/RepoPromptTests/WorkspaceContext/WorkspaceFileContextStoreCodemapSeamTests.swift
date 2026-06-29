@@ -8803,11 +8803,14 @@ private final class CodemapSelectionGraphProbe: @unchecked Sendable {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while clock.now < deadline {
-            if let graph = graph(rootEpoch: rootEpoch),
-               let summary = await (graph.accounting()).publishedSummary,
-               case .complete = summary.definitionUniverseCoverage
-            {
-                return true
+            if let graph = graph(rootEpoch: rootEpoch) {
+                let accounting = await graph.accounting()
+                if let summary = accounting.publishedSummary,
+                   accounting.currentObservedKey == summary.key,
+                   case .complete = summary.definitionUniverseCoverage
+                {
+                    return true
+                }
             }
             try? await Task.sleep(for: .milliseconds(10))
         }

@@ -388,6 +388,8 @@ actor WorkspaceCodemapBindingEngine {
     private var ownerLastAdmission: [OwnerKey: UInt64] = [:]
     private var consecutiveDemandAdmissions = 0
     private var manifestWriters: [CodeMapRootManifestNamespace: ManifestWriterState] = [:]
+    private var pendingManifestWaiterInstalls: Set<UUID> = []
+    private var cancelledManifestWaiterInstalls: Set<UUID> = []
     private var adoptionReservations: [PipelineScope: AdoptionReservation] = [:]
     private var retainedAdoptions: [PipelineScope: AdoptionReservation] = [:]
     private var manifestAdoptionOperations: [PipelineScope: ManifestAdoptionOperation] = [:]
@@ -6948,8 +6950,14 @@ actor WorkspaceCodemapBindingEngine {
               workKey.pipelineSessionID == pipeline.id,
               pipeline.namespace == namespace
         else { return false }
+        pendingManifestWaiterInstalls.insert(waiterID)
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
+                pendingManifestWaiterInstalls.remove(waiterID)
+                if cancelledManifestWaiterInstalls.remove(waiterID) != nil {
+                    continuation.resume(returning: false)
+                    return
+                }
                 guard !Task.isCancelled,
                       case let .eligible(currentSession)? = roots[scope.rootEpoch],
                       currentSession.id == workKey.sessionID,
@@ -6991,7 +6999,12 @@ actor WorkspaceCodemapBindingEngine {
     ) {
         guard var state = manifestWriters[namespace],
               let index = state.waiters.firstIndex(where: { $0.id == waiterID })
-        else { return }
+        else {
+            if pendingManifestWaiterInstalls.contains(waiterID) {
+                cancelledManifestWaiterInstalls.insert(waiterID)
+            }
+            return
+        }
         let waiter = state.waiters.remove(at: index)
         if state.writerID == nil, state.queuedWork.isEmpty, state.waiters.isEmpty {
             manifestWriters.removeValue(forKey: namespace)
@@ -7021,6 +7034,8 @@ actor WorkspaceCodemapBindingEngine {
     private func cancelAllManifestWriters() -> [Task<Void, Never>] {
         let states = Array(manifestWriters.values)
         manifestWriters.removeAll()
+        pendingManifestWaiterInstalls.removeAll()
+        cancelledManifestWaiterInstalls.removeAll()
         for state in states {
             state.task?.cancel()
             for waiter in state.waiters {
