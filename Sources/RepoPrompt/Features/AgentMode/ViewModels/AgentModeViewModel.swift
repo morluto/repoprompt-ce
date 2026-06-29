@@ -641,6 +641,8 @@ final class AgentModeViewModel: ObservableObject {
     var tabDraftText: [UUID: String] = [:]
     private var cancellables = Set<AnyCancellable>()
     private var tabCloseListenerToken: UUID?
+    private var workspaceDidSwitchListenerToken: UUID?
+    private var beforeSaveListenerToken: UUID?
     private var isAgentModeActive = false
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
@@ -1787,6 +1789,23 @@ final class AgentModeViewModel: ObservableObject {
     #endif
 
     deinit {
+        let promptManager = promptManager
+        let workspaceManager = workspaceManager
+        let tabCloseListenerToken = tabCloseListenerToken
+        let workspaceDidSwitchListenerToken = workspaceDidSwitchListenerToken
+        let beforeSaveListenerToken = beforeSaveListenerToken
+        Task { @MainActor in
+            if let tabCloseListenerToken {
+                promptManager?.removeComposeTabsWillCloseListener(tabCloseListenerToken)
+            }
+            if let workspaceDidSwitchListenerToken {
+                workspaceManager?.removeWorkspaceDidSwitchListener(workspaceDidSwitchListenerToken)
+            }
+            if let beforeSaveListenerToken {
+                workspaceManager?.removeBeforeSaveListener(beforeSaveListenerToken)
+            }
+        }
+        cancellables.removeAll()
         uiRefreshTask?.cancel()
         openCodeModelsSubscriptionTask?.cancel()
         cursorModelsSubscriptionTask?.cancel()
@@ -2287,7 +2306,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         // Observe workspace changes
-        workspaceManager?.addWorkspaceDidSwitchListener(label: "agentMode") { [weak self] workspace in
+        workspaceDidSwitchListenerToken = workspaceManager?.addWorkspaceDidSwitchListener(label: "agentMode") { [weak self] workspace in
             guard let self else { return }
             let owner = receiveWorkspaceSwitchNotification(workspace)
             Task { @MainActor in
@@ -2296,7 +2315,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         // Save before workspace saves
-        workspaceManager?.addBeforeSaveListener { [weak self] _ in
+        beforeSaveListenerToken = workspaceManager?.addBeforeSaveListener { [weak self] _ in
             guard let self else { return }
             persistCurrentSession()
         }
@@ -2739,9 +2758,31 @@ final class AgentModeViewModel: ObservableObject {
         #endif
     }
 
+    /// Removes observer registrations owned by this view model.
+    ///
+    /// Combine cancellables release NotificationCenter subscriptions, while the
+    /// prompt/workspace managers use explicit token-based listener arrays. Keeping
+    /// this idempotent lets both `prepareForWindowClose()` and `deinit` call it.
+    private func unregisterObserverRegistrations() {
+        if let tabCloseListenerToken {
+            promptManager?.removeComposeTabsWillCloseListener(tabCloseListenerToken)
+            self.tabCloseListenerToken = nil
+        }
+        if let workspaceDidSwitchListenerToken {
+            workspaceManager?.removeWorkspaceDidSwitchListener(workspaceDidSwitchListenerToken)
+            self.workspaceDidSwitchListenerToken = nil
+        }
+        if let beforeSaveListenerToken {
+            workspaceManager?.removeBeforeSaveListener(beforeSaveListenerToken)
+            self.beforeSaveListenerToken = nil
+        }
+        cancellables.removeAll()
+    }
+
     func prepareForWindowClose() async {
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
+        unregisterObserverRegistrations()
         codexCoordinator.stop()
         claudeCoordinator.stop()
         stopOpenCodeModelsSubscription()
@@ -2786,9 +2827,9 @@ final class AgentModeViewModel: ObservableObject {
         if session.runState.isActive {
             await cancelAgentRun(tabID: session.tabID)
         }
-        await cleanupACPStateForDeletedSession(session)
         session.agentTask?.cancel()
         session.agentTask = nil
+        await cleanupACPStateForDeletedSession(session)
         let provider = session.provider
         session.provider = nil
         if let provider {
@@ -15575,12 +15616,13 @@ final class AgentModeViewModel: ObservableObject {
             cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
             await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
             cancelPendingInstruction(for: session)
+            session.agentTask?.cancel()
+            session.agentTask = nil
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
             session.pendingCommandRunningFlushTask?.cancel()
             session.pendingCommandRunningFlushTask = nil
             session.pendingCommandRunningByKey.removeAll()
-            session.agentTask?.cancel()
             if let provider = session.provider {
                 await provider.dispose()
             }
@@ -15649,12 +15691,13 @@ final class AgentModeViewModel: ObservableObject {
             cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
             await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
             cancelPendingInstruction(for: session)
+            session.agentTask?.cancel()
+            session.agentTask = nil
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
             session.pendingCommandRunningFlushTask?.cancel()
             session.pendingCommandRunningFlushTask = nil
             session.pendingCommandRunningByKey.removeAll()
-            session.agentTask?.cancel()
             if let provider = session.provider {
                 await provider.dispose()
             }
