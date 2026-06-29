@@ -1789,26 +1789,18 @@ final class AgentModeViewModel: ObservableObject {
     #endif
 
     deinit {
-        let promptManager = promptManager
-        let workspaceManager = workspaceManager
-        let tabCloseListenerToken = tabCloseListenerToken
-        let workspaceDidSwitchListenerToken = workspaceDidSwitchListenerToken
-        let beforeSaveListenerToken = beforeSaveListenerToken
-        let codex = codexCoordinator
-        let claude = claudeCoordinator
-        Task { @MainActor in
-            Self.removeRegisteredObserverListeners(
-                promptManager: promptManager,
-                workspaceManager: workspaceManager,
-                tabCloseListenerToken: tabCloseListenerToken,
-                workspaceDidSwitchListenerToken: workspaceDidSwitchListenerToken,
-                beforeSaveListenerToken: beforeSaveListenerToken
-            )
-            await codex.stopAllCodexToolTrackingAndWait()
-            await claude.stopAllClaudeToolTrackingAndWait()
-            codex.stop()
-            claude.stop()
-        }
+        // `prepareForWindowClose()` is the primary cleanup path, called from
+        // `WindowState` during window close. It removes listener tokens, drains
+        // tool tracking, and stops coordinators on the MainActor.
+        //
+        // `deinit` is nonisolated and cannot safely hop to @MainActor to remove
+        // listeners or stop coordinators — see `WindowState.deinit` for the same
+        // constraint. A fire-and-forget `Task { @MainActor in ... }` here would
+        // be non-deterministic (may not run during app termination) and is the
+        // only view model in this codebase doing it. Listener/token cleanup
+        // relies on `prepareForWindowClose()` having been called, matching the
+        // convention used by `ContextBuilderAgentViewModel` (no deinit) and
+        // `WindowState` (deinit skips MainActor work).
         cancellables.removeAll()
         uiRefreshTask?.cancel()
         openCodeModelsSubscriptionTask?.cancel()
@@ -2758,40 +2750,23 @@ final class AgentModeViewModel: ObservableObject {
 
     /// Removes observer registrations owned by this view model.
     ///
-    /// Combine cancellables release NotificationCenter subscriptions, while the
-    /// prompt/workspace managers use explicit token-based listener arrays. Keeping
-    /// this idempotent lets both `prepareForWindowClose()` and `deinit` call it.
+    /// Called from `prepareForWindowClose()` (the primary teardown path). Not
+    /// called from `deinit`, which is nonisolated and cannot safely hop to
+    /// @MainActor — see `deinit` and `WindowState.deinit` for the rationale.
     private func unregisterObserverRegistrations() {
-        Self.removeRegisteredObserverListeners(
-            promptManager: promptManager,
-            workspaceManager: workspaceManager,
-            tabCloseListenerToken: tabCloseListenerToken,
-            workspaceDidSwitchListenerToken: workspaceDidSwitchListenerToken,
-            beforeSaveListenerToken: beforeSaveListenerToken
-        )
-        tabCloseListenerToken = nil
-        workspaceDidSwitchListenerToken = nil
-        beforeSaveListenerToken = nil
-        cancellables.removeAll()
-    }
-
-    @MainActor
-    private static func removeRegisteredObserverListeners(
-        promptManager: PromptViewModel?,
-        workspaceManager: WorkspaceManagerViewModel?,
-        tabCloseListenerToken: UUID?,
-        workspaceDidSwitchListenerToken: UUID?,
-        beforeSaveListenerToken: UUID?
-    ) {
         if let tabCloseListenerToken {
             promptManager?.removeComposeTabsWillCloseListener(tabCloseListenerToken)
+            self.tabCloseListenerToken = nil
         }
         if let workspaceDidSwitchListenerToken {
             workspaceManager?.removeWorkspaceDidSwitchListener(workspaceDidSwitchListenerToken)
+            self.workspaceDidSwitchListenerToken = nil
         }
         if let beforeSaveListenerToken {
             workspaceManager?.removeBeforeSaveListener(beforeSaveListenerToken)
+            self.beforeSaveListenerToken = nil
         }
+        cancellables.removeAll()
     }
 
     func prepareForWindowClose() async {
