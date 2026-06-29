@@ -16,6 +16,11 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
     /// `AgentModeViewModel.activeWorkspaceIDForSessionIndexOwnership`.
     var activeWorkspaceIDForSessionIndexOwnership: UUID? { get }
 
+    /// The manager's active workspace ID without last-known snapshot fallback.
+    /// Used to validate an explicit nil workspace activation so unload cleanup
+    /// is not rejected by a stale snapshot from the previous workspace.
+    var activeWorkspaceIDForWorkspaceUnloadValidation: UUID? { get }
+
     /// Builds the frozen sidebar restore order for a workspace. Mirrors
     /// `AgentModeViewModel.makeSidebarRestoreFrozenOrder(for:)`.
     func makeSidebarRestoreFrozenOrder(for workspace: WorkspaceModel) -> [UUID: Int]
@@ -122,6 +127,9 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
             return false
         }
         if let delegate {
+            if owner.workspaceID == nil, workspace == nil {
+                return delegate.activeWorkspaceIDForWorkspaceUnloadValidation == nil
+            }
             return delegate.activeWorkspaceIDForSessionIndexOwnership == owner.workspaceID
         }
         return true
