@@ -604,6 +604,7 @@ final class AgentModeViewModel: ObservableObject {
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()
+    let workspaceSwitchProvider: WorkspaceSwitchSessionProvider
     private var sessionListCacheTask: Task<Void, Never>?
     private var sessionListCacheGeneration: UInt64 = 0
     private var activeSessionIndexRefreshToken: SessionIndexRefreshToken?
@@ -616,12 +617,6 @@ final class AgentModeViewModel: ObservableObject {
     private var activeSessionIndexRefreshHasPublishedFullBatch = false
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
-    private var workspaceSwitchBackgroundCleanupTasks: [UUID: Task<Void, Never>] = [:]
-    #if DEBUG
-        private var test_workspaceSwitchBackgroundCleanupDrainTasks: [UUID: Task<Void, Never>] = [:]
-        private var test_workspaceSwitchBackgroundCleanupDrainWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
-        private var test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks: [UUID: Task<Void, Never>] = [:]
-    #endif
     var sidebarAutoArchiveTask: Task<Void, Never>?
     var isApplyingSidebarAutoArchive = false
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
@@ -842,49 +837,8 @@ final class AgentModeViewModel: ObservableObject {
         func test_drainWorkspaceSwitchBackgroundCleanup(
             timeoutNanoseconds: UInt64 = 5_000_000_000
         ) async throws {
-            guard !test_workspaceSwitchBackgroundCleanupDrainTasks.isEmpty else { return }
-
-            let waiterID = UUID()
-            try await withCheckedThrowingContinuation { continuation in
-                test_workspaceSwitchBackgroundCleanupDrainWaiters[waiterID] = continuation
-                test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks[waiterID] = Task { @MainActor in
-                    do {
-                        try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    } catch {
-                        return
-                    }
-                    self.test_timeoutWorkspaceSwitchBackgroundCleanupDrain(
-                        waiterID: waiterID,
-                        timeoutNanoseconds: timeoutNanoseconds
-                    )
-                }
-            }
-        }
-
-        private func test_completeWorkspaceSwitchBackgroundCleanup(_ cleanupID: UUID) {
-            test_workspaceSwitchBackgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
-            guard test_workspaceSwitchBackgroundCleanupDrainTasks.isEmpty else { return }
-
-            let waiters = Array(test_workspaceSwitchBackgroundCleanupDrainWaiters.values)
-            test_workspaceSwitchBackgroundCleanupDrainWaiters.removeAll()
-            let timeoutTasks = Array(test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks.values)
-            test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks.removeAll()
-            timeoutTasks.forEach { $0.cancel() }
-            waiters.forEach { $0.resume() }
-        }
-
-        private func test_timeoutWorkspaceSwitchBackgroundCleanupDrain(
-            waiterID: UUID,
-            timeoutNanoseconds: UInt64
-        ) {
-            guard let waiter = test_workspaceSwitchBackgroundCleanupDrainWaiters.removeValue(forKey: waiterID) else {
-                return
-            }
-            test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks.removeValue(forKey: waiterID)
-            waiter.resume(
-                throwing: AgentModeWorkspaceSwitchCleanupDrainTimeoutError(
-                    timeoutNanoseconds: timeoutNanoseconds
-                )
+            try await workspaceSwitchProvider.test_drainBackgroundCleanup(
+                timeoutNanoseconds: timeoutNanoseconds
             )
         }
 
@@ -1566,6 +1520,10 @@ final class AgentModeViewModel: ObservableObject {
             }
         )
         self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
+        workspaceSwitchProvider = WorkspaceSwitchSessionProvider(
+            codexCoordinator: codexCoordinator,
+            claudeCoordinator: claudeCoordinator
+        )
         providerBindingService = AgentModeProviderBindingService()
         codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, source in
             guard let self, let mcpServer = self.mcpServer else { return true }
@@ -1600,6 +1558,7 @@ final class AgentModeViewModel: ObservableObject {
         syncAllActiveUIState()
         scheduleInitialSkillCatalogRefresh()
         sessionIndexStore.delegate = self
+        workspaceSwitchProvider.delegate = self
     }
 
     #if DEBUG
@@ -1757,6 +1716,10 @@ final class AgentModeViewModel: ObservableObject {
                 }
             )
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
+            workspaceSwitchProvider = WorkspaceSwitchSessionProvider(
+                codexCoordinator: codexCoordinator,
+                claudeCoordinator: claudeCoordinator
+            )
             providerBindingService = AgentModeProviderBindingService()
             codexCoordinator.attach(viewModel: self)
             claudeCoordinator.attach(viewModel: self)
@@ -1776,6 +1739,8 @@ final class AgentModeViewModel: ObservableObject {
             }
             syncAllActiveUIState()
             scheduleInitialSkillCatalogRefresh()
+            sessionIndexStore.delegate = self
+            workspaceSwitchProvider.delegate = self
         }
     #endif
 
@@ -1799,13 +1764,6 @@ final class AgentModeViewModel: ObservableObject {
         skillCatalogDeltaObservationTask?.cancel()
         skillCatalogRefreshDebounceTask?.cancel()
         initialSystemWorkspaceSessionListRefreshDeferralFallbackTask?.cancel()
-        for task in workspaceSwitchBackgroundCleanupTasks.values {
-            task.cancel()
-        }
-        workspaceSwitchBackgroundCleanupTasks.removeAll()
-        #if DEBUG
-            test_workspaceSwitchBackgroundCleanupDrainTasks.removeAll()
-        #endif
         sessionListCacheTask?.cancel()
         sidebarAutoArchiveTask?.cancel()
         sessionListCacheGeneration &+= 1
@@ -9613,15 +9571,6 @@ final class AgentModeViewModel: ObservableObject {
 
     // MARK: - Workspace Handling
 
-    private struct WorkspaceSwitchSessionCleanupTarget {
-        let tabID: UUID
-        let session: TabSession
-        let boundSessionID: UUID?
-        let providerSessionID: String?
-        let runID: UUID?
-        let selectedAgent: AgentProviderKind
-    }
-
     private func prepareWorkspaceSwitchSessionDiscard(
         _ session: TabSession,
         reason: String
@@ -9646,84 +9595,6 @@ final class AgentModeViewModel: ObservableObject {
             _ = mcpRunToolCanceller(runID, "workspace_switch")
         }
         return target
-    }
-
-    private func scheduleWorkspaceSwitchBackgroundCleanup(
-        targets: [WorkspaceSwitchSessionCleanupTarget],
-        reason: String
-    ) {
-        guard !targets.isEmpty else { return }
-        let cleanupID = UUID()
-        let task = Task { @MainActor [weak self] in
-            #if DEBUG
-                defer {
-                    self?.test_completeWorkspaceSwitchBackgroundCleanup(cleanupID)
-                }
-            #endif
-            await Task.yield()
-            guard let self else { return }
-            for target in targets {
-                await teardownMCPControl(
-                    for: target.session,
-                    cleanupSessionStore: true,
-                    publishChanges: false,
-                    deactivateLiveControlContext: false
-                )
-                await cleanupMCPRunRoutingIfPresent(
-                    boundSessionID: target.boundSessionID,
-                    liveSession: target.session,
-                    explicitRunID: target.runID,
-                    reason: reason
-                )
-                await Task.yield()
-            }
-            let codexCoordinator = codexCoordinator
-            let claudeCoordinator = claudeCoordinator
-            workspaceSwitchBackgroundCleanupTasks.removeValue(forKey: cleanupID)
-            for target in targets {
-                await Self.disposeDetachedWorkspaceSwitchTarget(
-                    target,
-                    codexCoordinator: codexCoordinator,
-                    claudeCoordinator: claudeCoordinator
-                )
-                await Task.yield()
-            }
-        }
-        workspaceSwitchBackgroundCleanupTasks[cleanupID] = task
-        #if DEBUG
-            test_workspaceSwitchBackgroundCleanupDrainTasks[cleanupID] = task
-        #endif
-    }
-
-    private static func disposeDetachedWorkspaceSwitchTarget(
-        _ target: WorkspaceSwitchSessionCleanupTarget,
-        codexCoordinator: CodexAgentModeCoordinator,
-        claudeCoordinator: ClaudeAgentModeCoordinator
-    ) async {
-        let session = target.session
-        let provider = session.provider
-        session.provider = nil
-        if let provider {
-            await provider.dispose()
-        }
-        session.acpSteeringFlushTask?.cancel()
-        session.acpSteeringFlushTask = nil
-        session.pendingACPSteeringInstructions.removeAll()
-        if let controller = session.acpController {
-            session.acpController = nil
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            await controller.cancelPrompt()
-            await controller.shutdown()
-        }
-        await codexCoordinator.shutdownCodexSession(
-            session,
-            clearTabScopedCoordinatorState: false,
-            detachedRunID: target.runID
-        )
-        await claudeCoordinator.shutdownClaudeSession(
-            session,
-            clearTabScopedCoordinatorState: false
-        )
     }
 
     func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
@@ -9817,7 +9688,7 @@ final class AgentModeViewModel: ObservableObject {
             windowID: windowID,
             reason: "Cancelled due to workspace switch"
         )
-        scheduleWorkspaceSwitchBackgroundCleanup(
+        workspaceSwitchProvider.scheduleBackgroundCleanup(
             targets: cleanupTargets,
             reason: "workspace_switch"
         )
@@ -15981,18 +15852,6 @@ final class AgentModeViewModel: ObservableObject {
     }
 }
 
-#if DEBUG
-    private struct AgentModeWorkspaceSwitchCleanupDrainTimeoutError: LocalizedError {
-        let timeoutNanoseconds: UInt64
-
-        var errorDescription: String? {
-            let timeoutSeconds = Double(timeoutNanoseconds) / 1_000_000_000
-            return "Timed out waiting for workspace-switch background cleanup after \(timeoutSeconds)s."
-        }
-    }
-
-#endif
-
 // MARK: - AgentWorkspaceSessionIndexStoreDelegate
 
 @MainActor
@@ -16027,5 +15886,38 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
         case .sessionList:
             syncSidebarUIState(refresh: true, reason: .sessionList)
         }
+    }
+}
+
+// MARK: - WorkspaceSwitchSessionProviderDelegate
+
+@MainActor
+extension AgentModeViewModel: WorkspaceSwitchSessionProviderDelegate {
+    func teardownMCPControlForDiscardedSession(
+        _ session: TabSession,
+        cleanupSessionStore: Bool,
+        publishChanges: Bool,
+        deactivateLiveControlContext: Bool
+    ) async {
+        await teardownMCPControl(
+            for: session,
+            cleanupSessionStore: cleanupSessionStore,
+            publishChanges: publishChanges,
+            deactivateLiveControlContext: deactivateLiveControlContext
+        )
+    }
+
+    func cleanupMCPRunRoutingForDiscardedSession(
+        boundSessionID: UUID?,
+        liveSession: TabSession,
+        explicitRunID: UUID?,
+        reason: String
+    ) async {
+        await cleanupMCPRunRoutingIfPresent(
+            boundSessionID: boundSessionID,
+            liveSession: liveSession,
+            explicitRunID: explicitRunID,
+            reason: reason
+        )
     }
 }
