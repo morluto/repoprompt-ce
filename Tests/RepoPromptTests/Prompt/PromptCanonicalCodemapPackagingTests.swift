@@ -181,7 +181,12 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
         )
         let logicalSelectedURL = logicalRoot.appendingPathComponent("Sources/Selected.swift")
 
-        let store = WorkspaceFileContextStore()
+        let store = WorkspaceFileContextStore(
+            codemapGitEligibilityProbe: .init { _ in
+                .transientUnavailable(.repositoryChanging)
+            },
+            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+        )
         let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
         let worktreeRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
 
