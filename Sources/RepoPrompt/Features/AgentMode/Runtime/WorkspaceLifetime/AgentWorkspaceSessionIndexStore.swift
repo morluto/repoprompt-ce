@@ -53,16 +53,20 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
 
     weak var delegate: AgentWorkspaceSessionIndexStoreDelegate?
 
+    private var suppressDelegateNotifications = false
+
     // MARK: - Published data (formerly @Published on AgentModeViewModel)
 
     @Published private(set) var sessionIndex: [UUID: AgentSessionIndexEntry] = [:] {
         didSet {
+            guard !suppressDelegateNotifications else { return }
             delegate?.sessionIndexStore(self, didChangeStateWithReason: .sessionIndex)
         }
     }
 
     @Published private(set) var sessionListSortDates: [UUID: Date] = [:] {
         didSet {
+            guard !suppressDelegateNotifications else { return }
             delegate?.sessionIndexStore(self, didChangeStateWithReason: .sortDates)
         }
     }
@@ -70,6 +74,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     @Published private(set) var sessionListCacheReady: Bool = false {
         didSet {
             guard sessionListCacheReady != oldValue else { return }
+            guard !suppressDelegateNotifications else { return }
             delegate?.sessionIndexStore(self, didChangeStateWithReason: .sessionList)
         }
     }
@@ -187,6 +192,11 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     /// `cancelSessionIndexRefresh(releaseFrozenOrder: false)` before this and
     /// resetting `lastSidebarContentFingerprint` after.
     func installOwner(_ owner: SessionIndexOwner, workspace: WorkspaceModel?) {
+        suppressDelegateNotifications = true
+        defer {
+            suppressDelegateNotifications = false
+            delegate?.sessionIndexStore(self, didChangeStateWithReason: .sessionIndex)
+        }
         sessionIndexOwner = owner
         sessionListSortDatesOwner = owner
         sessionListCacheReadyOwner = owner
@@ -278,22 +288,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
             let rebuildStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
             let debugSessionIndexCount = sessionIndex.count
         #endif
-        var preferredEntryByTabID: [UUID: AgentSessionIndexEntry] = [:]
-        for entry in sessionIndex.values where entry.lastUserMessageAt != nil {
-            if let existing = preferredEntryByTabID[entry.tabID] {
-                if AgentSessionRestoreSupport.shouldPreferSidebarEntry(entry, over: existing) {
-                    preferredEntryByTabID[entry.tabID] = entry
-                }
-            } else {
-                preferredEntryByTabID[entry.tabID] = entry
-            }
-        }
-        var sortDates: [UUID: Date] = [:]
-        for (tabID, entry) in preferredEntryByTabID {
-            if let date = entry.lastUserMessageAt {
-                sortDates[tabID] = date
-            }
-        }
+        var sortDates = AgentSessionRestoreSupport.sidebarSortDates(from: sessionIndex)
         sessionListSortDatesOwner = sessionIndexOwner
         if sessionListSortDates != sortDates {
             sessionListSortDates = sortDates
@@ -328,6 +323,7 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
     /// Sets a sort-date entry for a tab. Used by session hydration paths
     /// that previously called `sessionListSortDates[tabID] = date`.
     func setSortDate(_ date: Date, forTabID tabID: UUID) {
+        guard sessionListSortDates[tabID] != date else { return }
         sessionListSortDates[tabID] = date
     }
 
