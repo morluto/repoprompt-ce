@@ -12,11 +12,9 @@ import Foundation
 /// codebase convention (`WindowState.deinit`, `ContextBuilderAgentViewModel`).
 @MainActor
 struct ListenerRegistration {
-    private let id: UUID
     private let removal: @MainActor () -> Void
 
     init(removal: @escaping @MainActor () -> Void) {
-        id = UUID()
         self.removal = removal
     }
 
