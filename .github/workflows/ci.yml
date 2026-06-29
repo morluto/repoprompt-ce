@@ -102,7 +102,7 @@ jobs:
               for process_id in process_ids:
                   try:
                       groups.add(os.getpgid(process_id))
-                  except ProcessLookupError:
+                  except (ProcessLookupError, PermissionError):
                       pass
               groups.discard(os.getpgrp())
               return groups
@@ -111,7 +111,7 @@ jobs:
               for group in groups:
                   try:
                       os.killpg(group, sent_signal)
-                  except ProcessLookupError:
+                  except (ProcessLookupError, PermissionError):
                       pass
 
           def live_process_groups(groups):
@@ -120,6 +120,12 @@ jobs:
                   try:
                       os.killpg(group, 0)
                   except ProcessLookupError:
+                      continue
+                  except PermissionError:
+                      # The process group exists but we cannot signal it
+                      # (e.g. owned by another user on hosted runners). Treat
+                      # it as live so we don't prematurely proceed to SIGKILL.
+                      live.add(group)
                       continue
                   live.add(group)
               return live
@@ -165,7 +171,10 @@ jobs:
                   try:
                       return_code = process.wait(timeout=suite_timeout_seconds)
                   except subprocess.TimeoutExpired:
-                      stop_process_tree(process)
+                      try:
+                          stop_process_tree(process)
+                      except Exception as exc:
+                          print(f"::warning::stop_process_tree failed: {exc}", flush=True)
                       relay.join(timeout=10)
                       if attempt == 1 and not output_seen.is_set():
                           print(
