@@ -1200,6 +1200,12 @@ struct WorkspaceSelectionMutationService {
                 await ownership.record(ticket)
             }
         }
+        for rootEpoch in sourceTicketsByRoot.keys.sorted(by: codemapRootEpochPrecedes) {
+            guard await store.waitForCodemapGraphPublication(
+                rootEpoch: rootEpoch,
+                deadline: deadline
+            ) else { break }
+        }
 
         var candidatePlanDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition =
             .pending([])
@@ -1442,6 +1448,19 @@ struct WorkspaceSelectionMutationService {
                 roots: [],
                 aggregateCoverage: .pending(candidatePendingReasons)
             )
+        }
+
+        let candidateRootEpochs = Set(candidatePlan.candidates.map {
+            WorkspaceCodemapRootEpoch(
+                rootID: $0.identity.rootID,
+                rootLifetimeID: $0.identity.rootLifetimeID
+            )
+        })
+        for rootEpoch in candidateRootEpochs.sorted(by: codemapRootEpochPrecedes) {
+            guard await store.waitForCodemapGraphPublication(
+                rootEpoch: rootEpoch,
+                deadline: deadline
+            ) else { break }
         }
 
         var result = try await store.resolveAutomaticCodemapSelection(
