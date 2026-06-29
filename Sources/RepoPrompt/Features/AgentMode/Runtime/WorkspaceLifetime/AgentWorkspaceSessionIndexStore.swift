@@ -21,6 +21,15 @@ protocol AgentWorkspaceSessionIndexStoreDelegate: AnyObject {
     /// is not rejected by a stale snapshot from the previous workspace.
     var activeWorkspaceIDForWorkspaceUnloadValidation: UUID? { get }
 
+    /// Whether the active-workspace-ID check should be enforced for non-nil
+    /// workspace activations. Mirrors the pre-extraction behavior: the check
+    /// is enforced only when a workspace manager is present or a DEBUG test
+    /// override is set. Without either (e.g. tests that drive
+    /// `handleWorkspaceSwitch` directly with no manager), the check is skipped
+    /// so owner validation does not fall back to a stale or nil
+    /// `lastKnownWorkspaceSnapshot`.
+    var enforcesActiveWorkspaceIDForSessionIndexOwnership: Bool { get }
+
     /// Builds the frozen sidebar restore order for a workspace. Mirrors
     /// `AgentModeViewModel.makeSidebarRestoreFrozenOrder(for:)`.
     func makeSidebarRestoreFrozenOrder(for workspace: WorkspaceModel) -> [UUID: Int]
@@ -130,6 +139,13 @@ final class AgentWorkspaceSessionIndexStore: ObservableObject {
             if owner.workspaceID == nil, workspace == nil {
                 return delegate.activeWorkspaceIDForWorkspaceUnloadValidation == nil
             }
+            // Mirror the pre-extraction behavior: only enforce the
+            // active-workspace-ID check when a workspace manager is present
+            // or a DEBUG test override is set. Otherwise (e.g. tests that
+            // drive `handleWorkspaceSwitch` with no manager) skip the check
+            // so a stale/nil `lastKnownWorkspaceSnapshot` cannot reject a
+            // fresh owner.
+            guard delegate.enforcesActiveWorkspaceIDForSessionIndexOwnership else { return true }
             return delegate.activeWorkspaceIDForSessionIndexOwnership == owner.workspaceID
         }
         return true

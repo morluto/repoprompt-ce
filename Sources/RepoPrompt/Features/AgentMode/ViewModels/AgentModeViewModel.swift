@@ -15803,6 +15803,13 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
         workspaceManager?.activeWorkspaceID
     }
 
+    var enforcesActiveWorkspaceIDForSessionIndexOwnership: Bool {
+        #if DEBUG
+            if test_activeWorkspaceIDForSessionIndexOverride != nil { return true }
+        #endif
+        return workspaceManager != nil
+    }
+
     func makeSidebarRestoreFrozenOrder(for workspace: WorkspaceModel) -> [UUID: Int] {
         var orderByTabID: [UUID: Int] = [:]
         for (index, tab) in persistedSidebarTabs(for: workspace).enumerated() where orderByTabID[tab.id] == nil {
