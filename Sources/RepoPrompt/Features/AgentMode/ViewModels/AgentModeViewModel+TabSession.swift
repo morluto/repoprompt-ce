@@ -616,7 +616,6 @@ extension AgentModeViewModel {
             applyEditsApprovalSubscriptionTask?.cancel()
             applyEditsApprovalSubscriptionTask = nil
             applyEditsApprovalSubscriptionID = nil
-            pendingApplyEditsReview = nil
         }
 
         @discardableResult

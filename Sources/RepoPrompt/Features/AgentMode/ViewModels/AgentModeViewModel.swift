@@ -2731,6 +2731,7 @@ final class AgentModeViewModel: ObservableObject {
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
+        workspaceSwitchProvider.cancelAllBackgroundCleanup()
         cancelSessionIndexRefresh(releaseFrozenOrder: true)
         let tabIDs = Array(sessions.keys)
         await withTaskGroup(of: Void.self) { group in
@@ -9579,9 +9580,7 @@ final class AgentModeViewModel: ObservableObject {
             tabID: session.tabID,
             session: session,
             boundSessionID: boundSessionID(for: session.tabID),
-            providerSessionID: session.providerSessionID,
-            runID: session.runID,
-            selectedAgent: session.selectedAgent
+            runID: session.runID
         )
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
@@ -9657,6 +9656,7 @@ final class AgentModeViewModel: ObservableObject {
         for session in sessions.values where session.runState.isActive {
             await cancelAgentRun(tabID: session.tabID)
         }
+        claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
         codexCoordinator.stop()
         claudeCoordinator.stop()
         for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
@@ -10276,9 +10276,7 @@ final class AgentModeViewModel: ObservableObject {
             if let session = sessions[tabID] {
                 removePendingUIRefresh(for: tabID)
                 cancelPersistedLoad(for: session)
-                session.pendingCommandRunningFlushTask?.cancel()
-                session.pendingCommandRunningFlushTask = nil
-                session.pendingCommandRunningByKey.removeAll()
+                session.cancelEphemeralRuntimeState()
                 // Cancel pending question
                 cancelPendingQuestion(for: session)
                 cancelPendingApproval(for: session)
@@ -10291,9 +10289,6 @@ final class AgentModeViewModel: ObservableObject {
                 if session.runState.isActive {
                     await cancelAgentRun(tabID: tabID)
                 }
-
-                session.agentTask?.cancel()
-                session.agentTask = nil
 
                 // All compose-tab removal reasons detach the live TabSession owner from `sessions`.
                 // Release retained ACP runtimes before that controller handle can become unreachable.
@@ -15195,15 +15190,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cleanupACPStateForDeletedSession(_ session: TabSession) async {
-        session.acpSteeringFlushTask?.cancel()
-        session.acpSteeringFlushTask = nil
-        session.pendingACPSteeringInstructions.removeAll()
-        if let controller = session.acpController {
-            session.acpController = nil
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            await controller.cancelPrompt()
-            await controller.shutdown()
-        }
+        await session.teardownACPControllerIfPresent()
     }
 
     struct DeletedAgentSessionCleanupResult: Equatable {
@@ -15292,18 +15279,14 @@ final class AgentModeViewModel: ObservableObject {
 
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { continue }
             cancelPersistedLoad(for: session)
+            session.cancelEphemeralRuntimeState()
             cancelPendingQuestion(for: session)
             cancelPendingApproval(for: session)
             cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
             await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
             cancelPendingInstruction(for: session)
-            session.agentTask?.cancel()
-            session.agentTask = nil
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
-            session.pendingCommandRunningFlushTask?.cancel()
-            session.pendingCommandRunningFlushTask = nil
-            session.pendingCommandRunningByKey.removeAll()
             if let provider = session.provider {
                 await provider.dispose()
             }
@@ -15367,18 +15350,14 @@ final class AgentModeViewModel: ObservableObject {
         if let session = liveSession {
             removePendingUIRefresh(for: tabID)
             cancelPersistedLoad(for: session)
+            session.cancelEphemeralRuntimeState()
             cancelPendingQuestion(for: session)
             cancelPendingApproval(for: session)
             cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
             await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
             cancelPendingInstruction(for: session)
-            session.agentTask?.cancel()
-            session.agentTask = nil
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
-            session.pendingCommandRunningFlushTask?.cancel()
-            session.pendingCommandRunningFlushTask = nil
-            session.pendingCommandRunningByKey.removeAll()
             if let provider = session.provider {
                 await provider.dispose()
             }

@@ -5,9 +5,7 @@ struct WorkspaceSwitchSessionCleanupTarget {
     let tabID: UUID
     let session: TabSession
     let boundSessionID: UUID?
-    let providerSessionID: String?
     let runID: UUID?
-    let selectedAgent: AgentProviderKind
 }
 
 /// Owns the background cleanup of sessions discarded during a workspace switch.
@@ -77,6 +75,9 @@ final class WorkspaceSwitchSessionProvider {
         guard !targets.isEmpty else { return }
         let cleanupID = UUID()
         let task = Task { @MainActor [weak self] in
+            defer {
+                self?.backgroundCleanupTasks.removeValue(forKey: cleanupID)
+            }
             #if DEBUG
                 defer {
                     self?.test_completeBackgroundCleanup(cleanupID)
@@ -99,7 +100,6 @@ final class WorkspaceSwitchSessionProvider {
                 )
                 await Task.yield()
             }
-            backgroundCleanupTasks.removeValue(forKey: cleanupID)
             for target in targets {
                 await Self.disposeDetachedTarget(
                     target,
@@ -126,15 +126,7 @@ final class WorkspaceSwitchSessionProvider {
         if let provider {
             await provider.dispose()
         }
-        session.acpSteeringFlushTask?.cancel()
-        session.acpSteeringFlushTask = nil
-        session.pendingACPSteeringInstructions.removeAll()
-        if let controller = session.acpController {
-            session.acpController = nil
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            await controller.cancelPrompt()
-            await controller.shutdown()
-        }
+        await session.teardownACPControllerIfPresent()
         await codexCoordinator.shutdownCodexSession(
             session,
             clearTabScopedCoordinatorState: false,
@@ -142,7 +134,8 @@ final class WorkspaceSwitchSessionProvider {
         )
         await claudeCoordinator.shutdownClaudeSession(
             session,
-            clearTabScopedCoordinatorState: false
+            clearTabScopedCoordinatorState: false,
+            detachedRunID: target.runID
         )
     }
 
@@ -179,6 +172,40 @@ final class WorkspaceSwitchSessionProvider {
             }
         }
     #endif
+
+    func cancelAllBackgroundCleanup() {
+        for task in backgroundCleanupTasks.values {
+            task.cancel()
+        }
+        backgroundCleanupTasks.removeAll()
+        #if DEBUG
+            for task in test_backgroundCleanupDrainTasks.values {
+                task.cancel()
+            }
+            test_backgroundCleanupDrainTasks.removeAll()
+            for (_, waiter) in test_backgroundCleanupDrainWaiters {
+                waiter.resume(throwing: CancellationError())
+            }
+            test_backgroundCleanupDrainWaiters.removeAll()
+            for task in test_backgroundCleanupDrainTimeoutTasks.values {
+                task.cancel()
+            }
+            test_backgroundCleanupDrainTimeoutTasks.removeAll()
+        #endif
+    }
+}
+
+extension AgentModeViewModel.TabSession {
+    func teardownACPControllerIfPresent() async {
+        acpSteeringFlushTask?.cancel()
+        acpSteeringFlushTask = nil
+        pendingACPSteeringInstructions.removeAll()
+        guard let controller = acpController else { return }
+        acpController = nil
+        AgentModeProcessRunIdentity.clearProcessRunID(for: self)
+        await controller.cancelPrompt()
+        await controller.shutdown()
+    }
 }
 
 #if DEBUG
