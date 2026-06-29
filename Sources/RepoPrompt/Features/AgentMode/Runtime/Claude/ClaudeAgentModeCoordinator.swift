@@ -152,19 +152,6 @@ final class ClaudeAgentModeCoordinator {
         retiredResumeTransferTasksByTabID.removeAll()
     }
 
-    /// Stops every tab-scoped Claude tool tracker owned by the coordinator.
-    ///
-    /// Call only from true lifetime teardown. Do not invoke from `stop()`, which
-    /// also runs when agent mode UI is hidden while sessions remain alive.
-    func stopAllClaudeToolTrackingAndWait() async {
-        let handlers = toolHandlerByTabID
-        toolHandlerByTabID.removeAll()
-        for (tabID, handler) in handlers {
-            let session = AgentModeViewModel.TabSession(tabID: tabID)
-            await handler.stopTracking(for: session)
-        }
-    }
-
     private func finalizeSession(
         _ session: AgentModeViewModel.TabSession,
         state: AgentSessionRunState,

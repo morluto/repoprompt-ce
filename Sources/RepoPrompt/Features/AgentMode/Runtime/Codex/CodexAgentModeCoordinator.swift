@@ -2586,17 +2586,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         false
     }
 
-    /// Stops and forgets every tab-scoped Codex tool tracker owned by the coordinator.
-    ///
-    /// Call only from true lifetime teardown (`prepareForWindowClose`, `deinit`,
-    /// workspace switch). Do not invoke from `stop()`, which also runs when agent
-    /// mode UI is hidden while sessions and in-flight runs remain alive.
-    func stopAllCodexToolTrackingAndWait() async {
-        for tabID in Array(toolTrackingByTabID.keys) {
-            await stopCodexToolTrackingAndWait(for: AgentModeViewModel.TabSession(tabID: tabID))
-        }
-    }
-
     private func stopCodexToolTracking(
         for session: AgentModeViewModel.TabSession
     ) {

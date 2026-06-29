@@ -2791,8 +2791,6 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
         }
-        await codexCoordinator.stopAllCodexToolTrackingAndWait()
-        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
         codexCoordinator.stop()
         claudeCoordinator.stop()
         await applyEditsApprovalStore.cleanupWindowScopes(
@@ -9965,8 +9963,6 @@ final class AgentModeViewModel: ObservableObject {
         for session in sessions.values where session.runState.isActive {
             await cancelAgentRun(tabID: session.tabID)
         }
-        await codexCoordinator.stopAllCodexToolTrackingAndWait()
-        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
         codexCoordinator.stop()
         claudeCoordinator.stop()
         for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
