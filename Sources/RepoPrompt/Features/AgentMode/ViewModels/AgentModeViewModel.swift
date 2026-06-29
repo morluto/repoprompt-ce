@@ -2798,10 +2798,6 @@ final class AgentModeViewModel: ObservableObject {
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
         unregisterObserverRegistrations()
-        await codexCoordinator.stopAllCodexToolTrackingAndWait()
-        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
-        codexCoordinator.stop()
-        claudeCoordinator.stop()
         stopOpenCodeModelsSubscription()
         stopCursorModelsSubscription()
         sidebarAutoArchiveTask?.cancel()
@@ -2820,6 +2816,10 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
         }
+        await codexCoordinator.stopAllCodexToolTrackingAndWait()
+        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
+        codexCoordinator.stop()
+        claudeCoordinator.stop()
         await applyEditsApprovalStore.cleanupWindowScopes(
             windowID: windowID,
             reason: "Cancelled because window is closing"
@@ -9968,10 +9968,6 @@ final class AgentModeViewModel: ObservableObject {
         if workspace != nil {
             publishLoadingTranscriptPresentation(tabID: initialActiveTabID)
         }
-        await codexCoordinator.stopAllCodexToolTrackingAndWait()
-        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
-        codexCoordinator.stop()
-        claudeCoordinator.stop()
         stopOpenCodeModelsSubscription()
         stopCursorModelsSubscription()
         sidebarAutoArchiveTask?.cancel()
@@ -9991,6 +9987,13 @@ final class AgentModeViewModel: ObservableObject {
                 reason: "Cancelled due to workspace switch"
             )
         }
+        for session in sessions.values where session.runState.isActive {
+            await cancelAgentRun(tabID: session.tabID)
+        }
+        await codexCoordinator.stopAllCodexToolTrackingAndWait()
+        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
+        codexCoordinator.stop()
+        claudeCoordinator.stop()
         for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
             await releaseSessionWorktreeOwnership(sessionID: sessionID)
         }

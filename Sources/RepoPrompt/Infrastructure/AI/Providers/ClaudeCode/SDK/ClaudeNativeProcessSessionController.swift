@@ -242,21 +242,39 @@ final actor ClaudeNativeProcessSessionController {
     ///
     /// Normal owners must call async `shutdown()`, which can reap the process and
     /// clear expected PID registrations. `deinit` cannot await that path, so this
-    /// method only releases file-handle callbacks, closes stdin, and sends SIGTERM
-    /// to any still-owned child process.
+    /// method releases file-handle callbacks, closes stdin, sends SIGTERM to any
+    /// still-owned child process, and schedules expected-PID cleanup on the MCP actor.
     private func performSynchronousDeinitCleanup() {
         stdoutChunkChannel?.finish()
         stderrChunkChannel?.finish()
         stdoutConsumerTask?.cancel()
         stderrConsumerTask?.cancel()
 
-        guard let process else { return }
-        process.stdout.readabilityHandler = nil
-        process.stderr.readabilityHandler = nil
-        process.stdin?.closeFile()
-        _ = Darwin.kill(process.pid, SIGTERM)
-        var status: Int32 = 0
-        _ = Darwin.waitpid(process.pid, &status, WNOHANG)
+        if let process {
+            process.stdout.readabilityHandler = nil
+            process.stderr.readabilityHandler = nil
+            process.stdin?.closeFile()
+            _ = Darwin.kill(process.pid, SIGTERM)
+            var status: Int32 = 0
+            _ = Darwin.waitpid(process.pid, &status, WNOHANG)
+        }
+
+        scheduleExpectedAgentPIDDeinitClearIfNeeded()
+    }
+
+    /// Clears MCP expected-agent PID registration when async `shutdown()` did not run.
+    private func scheduleExpectedAgentPIDDeinitClearIfNeeded() {
+        guard config.toolContext == .agentRun,
+              let registeredExpectedAgentPID,
+              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+        else {
+            return
+        }
+        let pid = registeredExpectedAgentPID
+        let runID = runID
+        Task {
+            await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+        }
     }
 
     var hasTurnInFlight: Bool {
