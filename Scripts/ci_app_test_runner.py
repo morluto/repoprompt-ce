@@ -21,6 +21,7 @@ from typing import Callable, Iterable, TextIO
 
 DEFAULT_SUITE_TIMEOUT_SECONDS = 180.0
 DEFAULT_SILENT_TIMEOUT_RETRIES = 1
+DEFAULT_SILENT_STARTUP_SECONDS = 60.0
 XCTEST_FAILURE_RE = re.compile(r"^.*:\d+(?::\d+)?:\s+error:\s+-\[[^\]]+\]\s+:")
 XCTEST_STARTED_RE = re.compile(r"^Test Case '-\[(?P<test>[^\]]+)\]' started\.$")
 TIMEOUT_EXIT_CODE = 124
@@ -238,9 +239,11 @@ def run_suite_attempt(
     stop_process_tree_func: Callable[[subprocess.Popen[str]], None] = stop_process_tree,
     output: TextIO = sys.stdout,
     poll_interval_seconds: float = 0.1,
+    silent_startup_seconds: float | None = None,
 ) -> SuiteRunResult:
     start = time.monotonic()
     deadline = start + timeout_seconds
+    silent_deadline = start + silent_startup_seconds if silent_startup_seconds is not None else None
     state = OutputState()
     process = process_factory(suite)
     relay = threading.Thread(target=relay_output, args=(process, state, output), daemon=True)
@@ -292,7 +295,32 @@ def run_suite_attempt(
                 attempts=attempt,
             )
 
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        # A hosted runner can wedge Swift's cooperative executor before XCTest prints
+        # anything. Kill the silent process early (before the full suite timeout) so the
+        # retry fires sooner instead of burning the whole suite budget on a hung startup.
+        if (
+            silent_deadline is not None
+            and now >= silent_deadline
+            and not state.output_seen.is_set()
+        ):
+            stop_process_tree_func(process)
+            relay.join(timeout=10)
+            snapshot = state.snapshot()
+            elapsed = now - start
+            return SuiteRunResult(
+                suite=suite,
+                state="timed_out",
+                exit_code=TIMEOUT_EXIT_CODE,
+                elapsed_seconds=elapsed,
+                output_seen=snapshot.output_seen,
+                first_failure_line=snapshot.first_failure_line,
+                last_started_test=snapshot.last_started_test,
+                timed_out_after_seconds=elapsed,
+                attempts=attempt,
+            )
+
+        if now >= deadline:
             stop_process_tree_func(process)
             relay.join(timeout=10)
             snapshot = state.snapshot()
@@ -320,6 +348,7 @@ def run_suite(
     stop_process_tree_func: Callable[[subprocess.Popen[str]], None] = stop_process_tree,
     output: TextIO = sys.stdout,
     poll_interval_seconds: float = 0.1,
+    silent_startup_seconds: float | None = None,
 ) -> SuiteRunResult:
     max_attempts = silent_timeout_retries + 1
     for attempt in range(1, max_attempts + 1):
@@ -331,10 +360,14 @@ def run_suite(
             stop_process_tree_func=stop_process_tree_func,
             output=output,
             poll_interval_seconds=poll_interval_seconds,
+            silent_startup_seconds=silent_startup_seconds,
         )
         if result.state == "timed_out" and not result.output_seen and attempt < max_attempts:
+            silent_seconds = (
+                silent_startup_seconds if silent_startup_seconds is not None else timeout_seconds
+            )
             print(
-                f"::warning::{suite} produced no output for {timeout_seconds:g}s; "
+                f"::warning::{suite} produced no output for {silent_seconds:g}s; "
                 f"retrying once (attempt {attempt + 1}/{max_attempts})",
                 flush=True,
                 file=output,
@@ -394,6 +427,7 @@ def run_all_suites(
     swift_binary: str,
     cwd: Path | None,
     output: TextIO = sys.stdout,
+    silent_startup_seconds: float | None = None,
 ) -> int:
     passed_results: list[SuiteRunResult] = []
     for suite in suites:
@@ -409,6 +443,7 @@ def run_all_suites(
             silent_timeout_retries=silent_timeout_retries,
             process_factory=process_factory,
             output=output,
+            silent_startup_seconds=silent_startup_seconds,
         )
         report_suite_result(result, output)
         print("::endgroup::", flush=True, file=output)
@@ -427,6 +462,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run RepoPrompt CE app XCTest suites for hosted CI.")
     parser.add_argument("--suite-timeout-seconds", type=float, default=DEFAULT_SUITE_TIMEOUT_SECONDS)
     parser.add_argument("--silent-timeout-retries", type=int, default=DEFAULT_SILENT_TIMEOUT_RETRIES)
+    parser.add_argument(
+        "--silent-startup-seconds",
+        type=float,
+        default=DEFAULT_SILENT_STARTUP_SECONDS,
+        help="Kill and retry a suite that produces no output within this many seconds, "
+        "instead of waiting the full suite timeout.",
+    )
     parser.add_argument("--swift-binary", default="swift")
     parser.add_argument("--cwd", type=Path, default=None)
     return parser.parse_args(argv)
@@ -450,6 +492,7 @@ def main(argv: list[str]) -> int:
         silent_timeout_retries=args.silent_timeout_retries,
         swift_binary=args.swift_binary,
         cwd=args.cwd,
+        silent_startup_seconds=args.silent_startup_seconds,
     )
 
 

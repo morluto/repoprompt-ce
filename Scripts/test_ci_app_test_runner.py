@@ -197,6 +197,32 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(result.attempts, 2)
         self.assertEqual(len(stopped), 1)
 
+    def test_silent_startup_timeout_kills_before_full_suite_timeout(self) -> None:
+        attempts = [FakeProcess([]), FakeProcess(returncode=0)]
+        stopped: list[FakeProcess] = []
+
+        start = time.monotonic()
+        result = ci_app_test_runner.run_suite(
+            "RepoPromptTests.S",
+            timeout_seconds=2.0,
+            silent_timeout_retries=1,
+            process_factory=lambda suite: attempts.pop(0),
+            stop_process_tree_func=self.stop_fake_process(stopped),
+            output=io.StringIO(),
+            poll_interval_seconds=0.001,
+            silent_startup_seconds=0.02,
+        )
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(result.state, "passed")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(len(stopped), 1)
+        # The silent startup timeout (0.02s) must fire well before the full suite
+        # timeout (2.0s); otherwise the retry would not happen until the whole budget
+        # elapsed.
+        self.assertLess(elapsed, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

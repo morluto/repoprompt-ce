@@ -54,7 +54,7 @@ jobs:
           # and can wedge Swift's cooperative executor late in the suite on hosted runners.
           # Preserve serial test semantics while bounding each process to one test class.
           # Retry only silent startup timeouts; assertion failures fail fast in the runner.
-          python3 Scripts/ci_app_test_runner.py --suite-timeout-seconds 180 --silent-timeout-retries 1
+          python3 Scripts/ci_app_test_runner.py --suite-timeout-seconds 180 --silent-timeout-retries 1 --silent-startup-seconds 60
 
       - name: Run provider package tests
         working-directory: Packages/RepoPromptAgentProviders
