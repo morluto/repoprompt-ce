@@ -25,6 +25,7 @@ DEFAULT_SILENT_STARTUP_SECONDS = 60.0
 XCTEST_FAILURE_RE = re.compile(r"^.*:\d+(?::\d+)?:\s+error:\s+-\[[^\]]+\]\s+:")
 XCTEST_STARTED_RE = re.compile(r"^Test Case '-\[(?P<test>[^\]]+)\]' started\.$")
 TIMEOUT_EXIT_CODE = 124
+XCTEST_BUNDLE_GLOB = "*.xctest"
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,46 @@ def list_suites(swift_binary: str, cwd: Path | None) -> list[str]:
         text=True,
     )
     return parse_suites(listed.stdout)
+
+
+def discover_test_bundle(swift_binary: str, cwd: Path | None) -> Path | None:
+    """Find the built XCTest bundle so suites can run via ``xcrun xctest`` directly.
+
+    ``swift test --skip-build --filter`` re-resolves the package and re-plans the
+    build on every invocation. On hosted macOS runners that per-invocation
+    overhead can wedge silently before XCTest prints anything, burning the silent
+    startup budget. Running ``xcrun xctest -XCTest <suite> <bundle>`` directly
+    skips swift's process management entirely and starts producing XCTest output
+    immediately.
+    """
+    try:
+        show_bin = subprocess.run(
+            [swift_binary, "build", "--show-bin-path"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    bin_path = Path(show_bin.stdout.strip())
+    if not bin_path.is_dir():
+        return None
+    candidates = sorted(bin_path.glob(XCTEST_BUNDLE_GLOB))
+    return candidates[0] if candidates else None
+
+
+def xctest_binary_path() -> str:
+    try:
+        result = subprocess.run(
+            ["xcrun", "--find", "xctest"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "xcrun"
 
 
 def descendant_process_groups(root_pid: int) -> set[int]:
@@ -208,7 +249,25 @@ def stop_process_tree(process: subprocess.Popen[str]) -> None:
             process.wait()
 
 
-def create_suite_process(suite: str, *, swift_binary: str, cwd: Path | None) -> subprocess.Popen[str]:
+def create_suite_process(
+    suite: str,
+    *,
+    swift_binary: str,
+    cwd: Path | None,
+    test_bundle: Path | None = None,
+    xctest_binary: str | None = None,
+) -> subprocess.Popen[str]:
+    if test_bundle is not None:
+        xctest = xctest_binary or "xcrun"
+        return subprocess.Popen(
+            [xctest, "-XCTest", suite, str(test_bundle)],
+            cwd=cwd,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
     return subprocess.Popen(
         [swift_binary, "test", "--skip-build", "--filter", suite],
         cwd=cwd,
@@ -428,14 +487,24 @@ def run_all_suites(
     cwd: Path | None,
     output: TextIO = sys.stdout,
     silent_startup_seconds: float | None = None,
+    test_bundle: Path | None = None,
+    xctest_binary: str | None = None,
 ) -> int:
     passed_results: list[SuiteRunResult] = []
+    if test_bundle is not None:
+        print(
+            f"Using xcrun xctest bundle: {test_bundle}",
+            flush=True,
+            file=output,
+        )
     for suite in suites:
         print(f"::group::{suite}", flush=True, file=output)
         process_factory = lambda selected_suite: create_suite_process(  # noqa: E731
             selected_suite,
             swift_binary=swift_binary,
             cwd=cwd,
+            test_bundle=test_bundle,
+            xctest_binary=xctest_binary,
         )
         result = run_suite(
             suite,
@@ -471,6 +540,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--swift-binary", default="swift")
     parser.add_argument("--cwd", type=Path, default=None)
+    parser.add_argument(
+        "--test-bundle",
+        type=Path,
+        default=None,
+        help="Path to the built .xctest bundle. When provided, suites run via "
+        "xcrun xctest directly instead of swift test --skip-build --filter, "
+        "avoiding swift's per-invocation package resolution overhead.",
+    )
+    parser.add_argument(
+        "--no-xctest-bundle",
+        action="store_true",
+        default=False,
+        help="Disable automatic test bundle discovery and force swift test --filter.",
+    )
     return parser.parse_args(argv)
 
 
@@ -486,6 +569,11 @@ def main(argv: list[str]) -> int:
             print(error.stderr, end="", file=sys.stderr)
         return error.returncode
 
+    test_bundle = args.test_bundle
+    if test_bundle is None and not args.no_xctest_bundle:
+        test_bundle = discover_test_bundle(args.swift_binary, args.cwd)
+    xctest_binary = xctest_binary_path() if test_bundle is not None else None
+
     return run_all_suites(
         suites,
         timeout_seconds=args.suite_timeout_seconds,
@@ -493,6 +581,8 @@ def main(argv: list[str]) -> int:
         swift_binary=args.swift_binary,
         cwd=args.cwd,
         silent_startup_seconds=args.silent_startup_seconds,
+        test_bundle=test_bundle,
+        xctest_binary=xctest_binary,
     )
 
 
