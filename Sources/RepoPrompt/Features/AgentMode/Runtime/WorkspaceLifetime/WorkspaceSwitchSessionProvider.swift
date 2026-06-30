@@ -149,22 +149,41 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
         func test_drainBackgroundCleanup(timeoutNanoseconds: UInt64) async throws {
             let cleanupIDs = Array(test_backgroundCleanupDrainTasks.keys)
             for cleanupID in cleanupIDs {
-                guard test_backgroundCleanupDrainTasks[cleanupID] != nil else { continue }
-                let task = test_backgroundCleanupDrainTasks[cleanupID]
-                try await withTaskCancellationHandler(handler: {
-                    task?.cancel()
-                }, operation: {
-                    try await withCheckedThrowingContinuation { continuation in
-                        test_backgroundCleanupDrainWaiters[cleanupID] = continuation
-                        let timeoutTask = Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                            if let waiter = test_backgroundCleanupDrainWaiters.removeValue(forKey: cleanupID) {
-                                waiter.resume(throwing: AgentModeWorkspaceSwitchCleanupDrainTimeoutError(timeoutNanoseconds: timeoutNanoseconds))
-                            }
-                        }
-                        test_backgroundCleanupDrainTimeoutTasks[cleanupID] = timeoutTask
+                guard let task = test_backgroundCleanupDrainTasks[cleanupID] else { continue }
+                // Poll for the cleanup task's completion by yielding the main actor.
+                // The cleanup task is a `Task { @MainActor ... }` that may not get
+                // scheduled automatically even when the main actor is suspended via
+                // a task group. Yielding in a loop gives the Swift runtime repeated
+                // opportunities to schedule the pending @MainActor task. Once the
+                // task completes, its defer removes it from
+                // test_backgroundCleanupDrainTasks, which the poll detects.
+                let pollIntervalNanoseconds: UInt64 = 10_000_000 // 10ms
+                let deadline = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
+                while DispatchTime.now().uptimeNanoseconds < deadline {
+                    if test_backgroundCleanupDrainTasks[cleanupID] == nil {
+                        // Task completed and was removed by test_completeBackgroundCleanup.
+                        break
                     }
-                })
+                    await Task.yield()
+                    try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+                }
+                // If the task still hasn't completed after polling, race its value
+                // against the remaining timeout as a final fallback.
+                if test_backgroundCleanupDrainTasks[cleanupID] != nil {
+                    let remaining = deadline &- DispatchTime.now().uptimeNanoseconds
+                    let fallbackTimeout = max(remaining, pollIntervalNanoseconds)
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask { await task.value }
+                        group.addTask {
+                            try await Task.sleep(nanoseconds: fallbackTimeout)
+                            throw AgentModeWorkspaceSwitchCleanupDrainTimeoutError(timeoutNanoseconds: timeoutNanoseconds)
+                        }
+                        try await group.next()
+                        group.cancelAll()
+                    }
+                }
+                test_backgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
+                test_backgroundCleanupDrainTimeoutTasks.removeValue(forKey: cleanupID)?.cancel()
             }
         }
     #endif
