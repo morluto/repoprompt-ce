@@ -109,7 +109,7 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         XCTAssertTrue(removed.mutated)
     }
 
-    func testStoredSelectionPersistsManualPathsButDiscardsLegacyInferredPathKey() throws {
+    func testStoredSelectionIgnoresLegacyInferredPathsAndWritesCompatibilityAlias() throws {
         let legacyJSON = try XCTUnwrap(
             """
             {
@@ -128,16 +128,26 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         XCTAssertFalse(decoded.codemapAutoEnabled)
 
         let encoded = try JSONEncoder().encode(decoded)
-        let encodedText = try XCTUnwrap(String(data: encoded, encoding: .utf8))
         let encodedObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         )
-        XCTAssertFalse(encodedText.contains("autoCodemapPaths"))
-        XCTAssertFalse(encodedText.contains("/workspace/Legacy.swift"))
         XCTAssertEqual(
             encodedObject["manualCodemapPaths"] as? [String],
             ["/workspace/Manual.swift"]
         )
+        XCTAssertEqual(encodedObject["autoCodemapPaths"] as? [String], [])
+    }
+
+    func testStoredSelectionEncodingRemainsReadableByLegacyDecoder() throws {
+        let currentManual = StoredSelection(
+            selectedPaths: ["/workspace/Source.swift"],
+            manualCodemapPaths: ["/workspace/Manual.swift"],
+            codemapAutoEnabled: false
+        )
+
+        let manualEncoded = try JSONEncoder().encode(currentManual)
+        let legacyManual = try JSONDecoder().decode(LegacyStoredSelection.self, from: manualEncoded)
+        XCTAssertTrue(legacyManual.autoCodemapPaths.isEmpty)
     }
 
     func testSelectionProductionPathContainsNoLegacyRelationshipCalls() throws {
@@ -192,4 +202,11 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
         )
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
+}
+
+private struct LegacyStoredSelection: Codable {
+    let selectedPaths: [String]
+    let autoCodemapPaths: [String]
+    let slices: [String: [LineRange]]
+    let codemapAutoEnabled: Bool
 }
