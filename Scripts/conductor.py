@@ -137,8 +137,8 @@ Operation commands:
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
-  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run]
-    (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
+  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
+      (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor release preflight|artifact|package|local-install
 
@@ -3548,6 +3548,16 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
                 print(f"FAILED stage '{name}' with status {code}", flush=True)
             return code
 
+    if args.get("executionLocationUI"):
+        code, _stdout, _stderr = run_operation_command(
+            "execution location UI smoke",
+            [str(repo_root / "Scripts" / "smoke_agent_execution_location_popover.sh"), "RepoPrompt"],
+            repo_root,
+            env=env,
+        )
+        if code != 0:
+            return code
+
     if args.get("agentRun"):
         agent_timeout = float(args.get("agentTimeout") or SMOKE_AGENT_WAIT_SECONDS)
         start_payload = {
@@ -3762,6 +3772,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("--window-id", type=int, default=1)
         parser.add_argument("--agent-run", action="store_true")
         parser.add_argument("--agent-timeout", type=float, default=SMOKE_AGENT_WAIT_SECONDS)
+        parser.add_argument("--execution-location-ui", action="store_true")
         ns = parser.parse_args(rest)
         if ns.agent_timeout < 0:
             raise ConductorError("--agent-timeout must be non-negative")
@@ -3769,6 +3780,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--artifact-manifest requires --packaged-app")
         if ns.packaged_app and ns.agent_run:
             raise ConductorError("--agent-run is not supported with --packaged-app")
+        if ns.packaged_app and ns.execution_location_ui:
+            raise ConductorError("--execution-location-ui is not supported with --packaged-app")
         args.update(
             {
                 "launch": ns.launch,
@@ -3778,6 +3791,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
                 "windowId": ns.window_id,
                 "agentRun": ns.agent_run,
                 "agentTimeout": ns.agent_timeout,
+                "executionLocationUI": ns.execution_location_ui,
             }
         )
     elif operation == "diagnostics":
