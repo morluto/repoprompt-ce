@@ -275,6 +275,48 @@ class CIAppTestRunnerTests(unittest.TestCase):
 
         self.assertIsNone(bundle)
 
+    def test_discover_test_bundles_returns_map_by_test_target_name(self) -> None:
+        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(args, **kwargs):
+            if "build" in args and "--show-bin-path" in args:
+                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
+            raise AssertionError(f"unexpected call: {args}")
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
+                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
+                    fake_bin_dir / "RepoPromptTests.xctest",
+                    fake_bin_dir / "RepoPromptWorkspaceTests.xctest",
+                ]):
+                    bundles = ci_app_test_runner.discover_test_bundles("swift", None)
+
+        self.assertEqual(
+            bundles,
+            {
+                "RepoPromptTests": fake_bin_dir / "RepoPromptTests.xctest",
+                "RepoPromptWorkspaceTests": fake_bin_dir / "RepoPromptWorkspaceTests.xctest",
+            },
+        )
+
+    def test_bundle_for_suite_selects_matching_test_target(self) -> None:
+        bundles = {
+            "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
+            "RepoPromptWorkspaceTests": Path("/fake/RepoPromptWorkspaceTests.xctest"),
+        }
+
+        self.assertEqual(
+            ci_app_test_runner.bundle_for_suite("RepoPromptWorkspaceTests.WorkspaceTests", bundles),
+            Path("/fake/RepoPromptWorkspaceTests.xctest"),
+        )
+        self.assertIsNone(ci_app_test_runner.bundle_for_suite("MissingTarget.Tests", bundles))
+
     def test_create_suite_process_uses_xctest_when_bundle_provided(self) -> None:
         captured_args: list[list[str]] = []
 
@@ -374,6 +416,122 @@ class CIAppTestRunnerTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         ci_app_test_runner.discover_test_bundle("swift", None)
 
+    def test_discover_test_bundle_selects_exact_requested_bundle_name(self) -> None:
+        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(args, **kwargs):
+            if "build" in args and "--show-bin-path" in args:
+                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
+            raise AssertionError(f"unexpected call: {args}")
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
+                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
+                    fake_bin_dir / "RepoPromptTests.xctest",
+                    fake_bin_dir / "RepoPromptWorkspaceTests.xctest",
+                ]):
+                    bundle = ci_app_test_runner.discover_test_bundle(
+                        "swift",
+                        None,
+                        "RepoPromptWorkspaceTests",
+                    )
+
+        self.assertEqual(bundle, fake_bin_dir / "RepoPromptWorkspaceTests.xctest")
+
+    def test_discover_test_bundle_returns_none_when_requested_bundle_missing(self) -> None:
+        fake_bin_dir = Path("/fake/.build/arm64-apple-macosx/debug")
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(args, **kwargs):
+            if "build" in args and "--show-bin-path" in args:
+                return FakeCompletedProcess(str(fake_bin_dir) + "\n")
+            raise AssertionError(f"unexpected call: {args}")
+
+        with mock.patch.object(ci_app_test_runner.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(ci_app_test_runner.Path, "is_dir", return_value=True):
+                with mock.patch.object(ci_app_test_runner.Path, "glob", return_value=[
+                    fake_bin_dir / "RepoPromptTests.xctest",
+                ]):
+                    bundle = ci_app_test_runner.discover_test_bundle(
+                        "swift",
+                        None,
+                        "RepoPromptWorkspaceTests.xctest",
+                    )
+
+        self.assertIsNone(bundle)
+
+    def test_run_all_suites_uses_bundle_matching_each_suite_target(self) -> None:
+        selected: list[tuple[str, Path | None]] = []
+
+        def fake_create_suite_process(suite, **kwargs):
+            selected.append((suite, kwargs["test_bundle"]))
+            return FakeProcess(returncode=0)
+
+        output = io.StringIO()
+        with mock.patch.object(
+            ci_app_test_runner,
+            "create_suite_process",
+            side_effect=fake_create_suite_process,
+        ):
+            exit_code = ci_app_test_runner.run_all_suites(
+                [
+                    "RepoPromptTests.ModelPickerStringOrderingTests",
+                    "RepoPromptWorkspaceTests.WorkspaceCodemapBindingEngineTests",
+                ],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=output,
+                test_bundles={
+                    "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
+                    "RepoPromptWorkspaceTests": Path("/fake/RepoPromptWorkspaceTests.xctest"),
+                },
+                xctest_binary=["/usr/bin/xctest"],
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            selected,
+            [
+                ("RepoPromptTests.ModelPickerStringOrderingTests", Path("/fake/RepoPromptTests.xctest")),
+                (
+                    "RepoPromptWorkspaceTests.WorkspaceCodemapBindingEngineTests",
+                    Path("/fake/RepoPromptWorkspaceTests.xctest"),
+                ),
+            ],
+        )
+        self.assertIn("Using xcrun xctest bundles by suite target", output.getvalue())
+
+    def test_run_all_suites_fails_when_bundle_map_lacks_suite_target(self) -> None:
+        output = io.StringIO()
+        exit_code = ci_app_test_runner.run_all_suites(
+            ["UnknownTarget.SomeTests"],
+            timeout_seconds=1.0,
+            silent_timeout_retries=0,
+            swift_binary="swift",
+            cwd=None,
+            output=output,
+            test_bundles={
+                "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
+            },
+            xctest_binary=["/usr/bin/xctest"],
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("No XCTest bundle found for suite target UnknownTarget", output.getvalue())
+
     def test_create_suite_process_falls_back_to_swift_test_without_bundle(self) -> None:
         captured_args: list[list[str]] = []
 
@@ -393,6 +551,53 @@ class CIAppTestRunnerTests(unittest.TestCase):
 
         self.assertEqual(len(captured_args), 1)
         self.assertEqual(captured_args[0], ["swift", "test", "--skip-build", "--filter", "RepoPromptTests.S"])
+
+    def test_main_routes_discovered_multiple_bundles_without_explicit_name(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run_all_suites(suites, **kwargs):
+            captured["suites"] = list(suites)
+            captured["test_bundle"] = kwargs["test_bundle"]
+            captured["test_bundles"] = kwargs["test_bundles"]
+            captured["xctest_binary"] = kwargs["xctest_binary"]
+            return 0
+
+        bundles = {
+            "RepoPromptTests": Path("/fake/RepoPromptTests.xctest"),
+            "RepoPromptWorkspaceTests": Path("/fake/RepoPromptWorkspaceTests.xctest"),
+        }
+        with (
+            mock.patch.object(
+                ci_app_test_runner,
+                "list_suites",
+                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+            ),
+            mock.patch.object(ci_app_test_runner, "discover_test_bundles", return_value=bundles),
+            mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
+            mock.patch.object(ci_app_test_runner, "run_all_suites", side_effect=fake_run_all_suites),
+        ):
+            exit_code = ci_app_test_runner.main([])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["suites"], ["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"])
+        self.assertIsNone(captured["test_bundle"])
+        self.assertEqual(captured["test_bundles"], bundles)
+        self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
+
+    def test_main_rejects_bundle_name_when_list_contains_other_targets(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                ci_app_test_runner,
+                "list_suites",
+                return_value=["RepoPromptTests.A", "RepoPromptWorkspaceTests.B"],
+            ),
+            mock.patch("sys.stdout", output),
+        ):
+            exit_code = ci_app_test_runner.main(["--test-bundle-name", "RepoPromptTests"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("cannot run suites from other targets", output.getvalue())
 
 
 if __name__ == "__main__":

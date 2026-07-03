@@ -62,6 +62,7 @@ MEASUREMENT_SOURCE_SUFFIXES = {".swift", ".c", ".h"}
 SOURCE_GUARD_CONTENT = "content"
 SOURCE_GUARD_METADATA = "metadata"
 PROGRESS_PREFIX = "test_suite_optimizer.progress "
+LIST_COMMAND_TIMEOUT_SECONDS = 1800
 ProgressSink = Callable[[dict[str, Any]], None]
 
 
@@ -124,6 +125,8 @@ class Sample:
     timings: list[TestCaseTiming]
     source_guard_kind: str = SOURCE_GUARD_CONTENT
     source_changed: bool = False
+    build: dict[str, Any] | None = None
+    resource_usage: dict[str, Any] | None = None
 
     @property
     def valid(self) -> bool:
@@ -220,14 +223,24 @@ def repo_root_from_script() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def run_command(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def run_command(
+    command: Sequence[str],
+    cwd: Path,
+    timeout_seconds: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            list(command),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OptimizerError(
+            f"command timed out after {timeout_seconds}s: {' '.join(command)}"
+        ) from exc
 
 
 def parse_conductor_json(stdout: str) -> dict[str, Any]:
@@ -269,13 +282,38 @@ def conductor_command(
     return command
 
 
+def conductor_build_command(repo_root: Path, target: str) -> list[str]:
+    if target != "root":
+        raise OptimizerError("--build-before-samples currently supports only --target root")
+    return [str(repo_root / "conductor"), "swift-build", "--product", "all", "--json"]
+
+
 def run_conductor(
     repo_root: Path,
     target: str,
     list_mode: bool = False,
     filter_value: str | None = None,
+    timeout_seconds: int | None = None,
 ) -> ConductorRun:
     command = conductor_command(repo_root, target, list_mode=list_mode, filter_value=filter_value)
+    completed = run_command(command, repo_root, timeout_seconds=timeout_seconds)
+    payload = parse_conductor_json(completed.stdout)
+    result = payload["result"]
+    log_path = Path(str(result.get("logPath") or ""))
+    log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+    return ConductorRun(
+        command=command,
+        process_exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        result=result,
+        log_text=log_text,
+        ticket=conductor_ticket_from_payload(payload, result),
+    )
+
+
+def run_conductor_build(repo_root: Path, target: str) -> ConductorRun:
+    command = conductor_build_command(repo_root, target)
     completed = run_command(command, repo_root)
     payload = parse_conductor_json(completed.stdout)
     result = payload["result"]
@@ -294,7 +332,16 @@ def run_conductor(
 
 def source_roots(repo_root: Path, target: str) -> list[Path]:
     if target == "root":
-        return [repo_root / "Tests" / "RepoPromptTests"]
+        tests_root = repo_root / "Tests"
+        if tests_root.is_dir():
+            roots = [
+                path
+                for path in sorted(tests_root.iterdir())
+                if path.is_dir() and any(path.rglob("*.swift"))
+            ]
+        else:
+            roots = []
+        return roots or [tests_root / "RepoPromptTests"]
     return [
         repo_root
         / "Packages"
@@ -312,7 +359,10 @@ def source_files(repo_root: Path, target: str) -> list[Path]:
 
 
 def domain_for_file(repo_root: Path, target: str, path: Path) -> str:
-    root = source_roots(repo_root, target)[0]
+    roots = source_roots(repo_root, target)
+    root = next((candidate for candidate in roots if path.is_relative_to(candidate)), None)
+    if root is None:
+        raise OptimizerError(f"test source is outside known {target} roots: {path}")
     relative = path.relative_to(root)
     if target == "provider":
         return f"Provider/{relative.parts[0] if len(relative.parts) > 1 else 'General'}"
@@ -520,6 +570,38 @@ def sample_invalid_reasons(
     return reasons
 
 
+def result_resource_usage(result: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "maxRSSBytes",
+        "maxRssBytes",
+        "maxRSS",
+        "maxRss",
+        "rssBytes",
+        "peakRSSBytes",
+        "peakRssBytes",
+        "memoryBytes",
+        "resourceUsage",
+    )
+    usage = {key: result.get(key) for key in keys if key in result}
+    return usage
+
+
+def build_result_dict(run: ConductorRun) -> dict[str, Any]:
+    result = run.result
+    return {
+        "command": run.command,
+        "process_exit_code": run.process_exit_code,
+        "state": result.get("state"),
+        "exit_code": result.get("exitCode"),
+        "queue_wait_seconds": result.get("queueWaitSeconds"),
+        "execution_seconds": result.get("executionSeconds"),
+        "measurement_invalid": result.get("measurementInvalid"),
+        "log_path": result.get("logPath"),
+        "ticket": run.ticket,
+        "resource_usage": result_resource_usage(result),
+    }
+
+
 def sample_from_run(
     index: int,
     target: str,
@@ -527,9 +609,11 @@ def sample_from_run(
     source_changed: bool,
     source_guard_kind: str = SOURCE_GUARD_CONTENT,
     require_timings: bool = False,
+    build: dict[str, Any] | None = None,
 ) -> Sample:
     result = run.result
     timings = parse_xctest_timings(run.log_text)
+    resource_usage = result_resource_usage(result)
     return Sample(
         index=index,
         target=target,
@@ -552,6 +636,8 @@ def sample_from_run(
         timings=timings,
         source_guard_kind=source_guard_kind,
         source_changed=source_changed,
+        build=build,
+        resource_usage=resource_usage,
     )
 
 
@@ -641,6 +727,8 @@ def sample_to_dict(sample: Sample) -> dict[str, Any]:
         "parsed_test_case_timings": len(sample.timings),
         "source_guard_kind": sample.source_guard_kind,
         "source_changed": sample.source_changed,
+        "build": sample.build,
+        "resource_usage": sample.resource_usage or {},
     }
 
 
@@ -650,7 +738,12 @@ def baseline_summary(samples: Sequence[Sample]) -> dict[str, Any]:
     if not values:
         raise OptimizerError("baseline produced no valid samples")
     rel_mad = relative_mad(values)
-    return {
+    valid_builds = [
+        float((sample.build or {}).get("execution_seconds"))
+        for sample in valid
+        if (sample.build or {}).get("execution_seconds") is not None
+    ]
+    summary: dict[str, Any] = {
         "attempts": len(samples),
         "valid_samples": len(valid),
         "invalid_samples": len(samples) - len(valid),
@@ -660,6 +753,14 @@ def baseline_summary(samples: Sequence[Sample]) -> dict[str, Any]:
         "relative_mad": rel_mad,
         "noise_classification": noise_classification(rel_mad),
     }
+    if valid_builds:
+        summary["raw_build_execution_seconds"] = valid_builds
+        summary["median_build_execution_seconds"] = statistics.median(valid_builds)
+        summary["observed_p95_build_execution_seconds"] = nearest_rank_p95(valid_builds)
+        summary["median_total_build_plus_test_seconds"] = (
+            summary["median_build_execution_seconds"] + summary["median_seconds"]
+        )
+    return summary
 
 
 def scoreboard_scaffold() -> str:
@@ -668,6 +769,16 @@ def scoreboard_scaffold() -> str:
 ## Measurement contract
 
 - Primary metric: warm local root `Scripts/test_suite_optimizer.py baseline --target root` using conductor JSON `executionSeconds` from `./conductor test --json`.
+- Build/link cost is separate from warm XCTest execution cost. Use `baseline --build-before-samples`
+  only when an iteration needs paired build+test evidence; primary root timing remains test
+  `executionSeconds`.
+- Focused tiny-test latency is a different metric from full-suite runtime. Diagnose it with
+  paired build/test artifacts and, for hosted per-suite CI, prefer the built `.xctest` bundle
+  path through `Scripts/ci_app_test_runner.py` over repeated `swift test --skip-build --filter`
+  invocations.
+- Runtime-heavy Workspace/Codemap suites are optimized only from parsed XCTest method/suite
+  timings in complete or focused baseline artifacts. Do not claim a Workspace/Codemap runtime
+  win from build/link, process-startup, or package-resolution overhead changes.
 - Provider package timing is measured separately with `Scripts/test_suite_optimizer.py baseline --target provider`.
 - A root+provider number may be reported only as a derived secondary serial estimate, not as an observed single-process wallclock.
 - Normal timing samples must not enable XCTest stall diagnostics or wake probes.
@@ -699,6 +810,16 @@ def scoreboard_scaffold() -> str:
 | 1 | Optimizer source-change guard, focused baseline support, and per-method ranking | Tooling only | Reduces campaign overhead and improves targeting; no primary suite-speed claim | Low | Always first setup step | Python optimizer tests, append-only scaffold, zero method/contract/scenario delta | Planned |
 | 2 | ACP mode-config fake ACP server fixture setup reduction | Root primary, conditional | Reduces repeated test fixture IO/setup if ACP suite ranks high | Low to medium | Initial root slow-suite/method ranking implicates `ACPAgentSessionControllerModeConfigTests` | Focused before/after artifact, focused XCTest, full-root after artifact, ledger verify | Waiting for baseline |
 | 3 | Hosted CI class-per-process batching | CI-only secondary | Reduces hosted CI subprocess overhead; no local root primary improvement | Medium/high | CI elapsed becomes explicit target after local baseline | CI runner self-tests and GitHub Build and Test evidence | Waiting for CI prioritization |
+| 4 | Root test-target split by domain boundary (`Workspace/Codemap`, `MCP`, root/unit) | Focused overhead secondary | Reduces fixed compile/link/load cost for tiny focused runs by shrinking the test target dependency graph; does not claim runtime-heavy suite improvement | Medium/high | Paired evidence shows focused total time dominated by fixed overhead, e.g. tiny suite total seconds greatly exceed parsed XCTest seconds; provider package remains a cheap control lane | Before/after focused tiny-suite artifact, complete root artifact, provider artifact, authoritative lists, exact ledger reconciliation, no contract/scenario loss | Evidence needed |
+| 5 | Workspace/Codemap fixture scale reduction and reuse | Root primary | Reduces parsed XCTest time in Workspace/Codemap suites where test body dominates total time | Medium | Slow-suite/method ranking implicates Workspace/Codemap runtime and the protected contract can be proven with smaller synthetic fixtures, such as crossing paging thresholds without thousands of files | Focused before/after artifact for affected suites, full-root artifact, contract/oracle review, ledger verify, scenario totals preserved | Evidence needed |
+| 6 | Workspace/Codemap async determinism pass | Root primary/reliability | Removes sleeps, uncontrolled timing, and process/file dependency variance from expensive async/worktree/context-builder tests | Medium | Invalid samples or slow methods correlate with waits, retries, real timing, worktree/process setup, or codemap readiness polling | Focused reliability repetitions, focused runtime artifact, full-root artifact, no diagnostics counted as timing samples | Evidence needed |
+
+## Optimization lanes
+
+- **Fixed overhead lane:** Tiny focused suites with near-zero parsed XCTest time but high total elapsed are package/build/link/test-launch problems. Use paired build/test artifacts, hosted `.xctest` bundle execution through `Scripts/ci_app_test_runner.py`, and domain target-split experiments. Do not count these as Workspace/Codemap runtime wins.
+- **Runtime-heavy lane:** Suites whose parsed XCTest seconds nearly equal total suite seconds need fixture, async, filesystem, worktree, codemap catalog, or scenario redesign. Target splitting may improve developer ergonomics but is not the primary speed lever.
+- **Memory/RSS lane:** RSS claims require explicit `resource_usage` evidence in optimizer artifacts or a separate diagnostic. Existing memory snapshots are insufficient for a strong compiler/test-run RSS conclusion.
+- **Ledger/trust lane:** `verify-ledger` depends on conductor list jobs. A conductor/list shell hang or missing Swift toolchain blocks trust restoration but is separate from XCTest runtime.
 
 ## Reverted attempts
 
@@ -765,17 +886,20 @@ def append_baseline_scoreboard(
         f"Inventory: `{payload.get('inventory') or ''}`",
         f"Scope/filter: {scope_filter}",
         f"Source-change guard: `{source_guard}`",
+        f"Build before samples: {'yes' if payload.get('build_before_samples') else 'no'}",
         f"Primary metric eligible: {'yes' if payload.get('primary_metric_eligible') else 'no'}",
         "",
-        "| Sample | Valid | Execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |",
-        "|---:|---|---:|---:|---|---:|---|---|---|",
+        "| Sample | Valid | Build seconds | Test execution seconds | Queue wait | State | Exit | Measurement invalid | Log | Invalid reason |",
+        "|---:|---|---:|---:|---:|---|---:|---|---|---|",
     ]
     for sample in payload["samples"]:
         reasons = "; ".join(sample["invalid_reasons"])
+        build = sample.get("build") or {}
         lines.append(
-            "| {index} | {valid} | {execution} | {queue} | {state} | {exit_code} | {invalid} | `{log}` | {reasons} |".format(
+            "| {index} | {valid} | {build_seconds} | {execution} | {queue} | {state} | {exit_code} | {invalid} | `{log}` | {reasons} |".format(
                 index=sample["index"],
                 valid="yes" if sample["valid"] else "no",
+                build_seconds=format_seconds(build.get("execution_seconds")),
                 execution=format_seconds(sample["execution_seconds"]),
                 queue=format_seconds(sample["queue_wait_seconds"]),
                 state=sample["state"],
@@ -811,6 +935,22 @@ def append_baseline_scoreboard(
             "",
         ]
     )
+    if summary.get("median_build_execution_seconds") is not None:
+        lines.extend(
+            [
+                "Build/test cost split:",
+                "",
+                "| Median build seconds | Observed p95 build seconds | Median test seconds | Median build+test seconds |",
+                "|---:|---:|---:|---:|",
+                "| {build:.3f} | {build_p95:.3f} | {test:.3f} | {total:.3f} |".format(
+                    build=summary["median_build_execution_seconds"],
+                    build_p95=summary["observed_p95_build_execution_seconds"],
+                    test=summary["median_seconds"],
+                    total=summary["median_total_build_plus_test_seconds"],
+                ),
+                "",
+            ]
+        )
     if payload.get("slowest_suites"):
         lines.extend(
             [
@@ -890,13 +1030,61 @@ def inventory(repo_root: Path, ledger: Path, output: Path | None, force: bool) -
     return payload
 
 
-def verify_ledger(repo_root: Path, ledger: Path) -> dict[str, Any]:
+def verify_ledger(
+    repo_root: Path,
+    ledger: Path,
+    list_timeout_seconds: int = LIST_COMMAND_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    return verify_ledger_with_progress(repo_root, ledger, emit_progress_event, list_timeout_seconds)
+
+
+def verify_ledger_with_progress(
+    repo_root: Path,
+    ledger: Path,
+    progress_sink: ProgressSink | None,
+    list_timeout_seconds: int = LIST_COMMAND_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    if list_timeout_seconds <= 0:
+        raise OptimizerError("--list-timeout-seconds must be greater than zero")
     listed: list[ListedTest] = []
     logs: dict[str, str] = {}
     for target in ("root", "provider"):
-        run = run_conductor(repo_root, target, list_mode=True)
-        if run.process_exit_code != 0 or run.result.get("exitCode") != 0:
-            raise OptimizerError(f"{target} test list failed; log: {run.result.get('logPath')}")
+        if progress_sink is not None:
+            progress_sink({
+                "event": "verify_ledger_list_start",
+                "timestamp": utc_now(),
+                "target": target,
+                "timeout_seconds": list_timeout_seconds,
+            })
+        run = run_conductor(
+            repo_root,
+            target,
+            list_mode=True,
+            timeout_seconds=list_timeout_seconds,
+        )
+        if progress_sink is not None:
+            progress_sink({
+                "event": "verify_ledger_list_end",
+                "timestamp": utc_now(),
+                "target": target,
+                "ticket": run.ticket,
+                "process_exit_code": run.process_exit_code,
+                "state": run.result.get("state"),
+                "exit_code": run.result.get("exitCode"),
+                "log_path": run.result.get("logPath"),
+            })
+        if (
+            run.process_exit_code != 0
+            or run.result.get("state") != "completed"
+            or run.result.get("exitCode") != 0
+        ):
+            raise OptimizerError(
+                f"{target} test list failed: process_exit={run.process_exit_code} "
+                f"state={run.result.get('state')} exit={run.result.get('exitCode')} "
+                f"ticket={run.ticket} log={run.result.get('logPath')} stderr={run.stderr[-500:]}"
+            )
+        if not run.log_text:
+            raise OptimizerError(f"{target} test list log missing or empty: {run.result.get('logPath')}")
         listed.extend(parse_test_list(run.log_text, target))
         logs[target] = str(run.result.get("logPath") or "")
     listed_ids = sorted(test.method_id for test in listed)
@@ -922,10 +1110,13 @@ def baseline(
     inventory_path: Path | None = None,
     source_change_guard: str = SOURCE_GUARD_CONTENT,
     filter_value: str | None = None,
+    build_before_samples: bool = False,
     progress_sink: ProgressSink | None = emit_progress_event,
 ) -> dict[str, Any]:
     if samples_requested <= 0:
         raise OptimizerError("--samples must be greater than zero")
+    if build_before_samples and target != "root":
+        raise OptimizerError("--build-before-samples currently supports only --target root")
     samples: list[Sample] = []
     command = conductor_command(repo_root, target, filter_value=filter_value)
     scope = "filtered" if filter_value else "complete"
@@ -947,6 +1138,40 @@ def baseline(
                 }
             )
         before = measurement_source_guard_fingerprint(repo_root, source_change_guard)
+        build: dict[str, Any] | None = None
+        if build_before_samples:
+            if progress_sink is not None:
+                progress_sink(
+                    {
+                        "event": "baseline_build_start",
+                        "timestamp": utc_now(),
+                        "target": target,
+                        "scope": scope,
+                        "filter": filter_value,
+                        "sample_index": index,
+                        "sample_count": samples_requested,
+                    }
+                )
+            build_run = run_conductor_build(repo_root, target)
+            build = build_result_dict(build_run)
+            if progress_sink is not None:
+                progress_sink(
+                    {
+                        "event": "baseline_build_end",
+                        "timestamp": utc_now(),
+                        "target": target,
+                        "scope": scope,
+                        "filter": filter_value,
+                        "sample_index": index,
+                        "sample_count": samples_requested,
+                        "ticket": build_run.ticket,
+                        "log_path": build.get("log_path"),
+                        "process_exit_code": build.get("process_exit_code"),
+                        "state": build.get("state"),
+                        "exit_code": build.get("exit_code"),
+                        "execution_seconds": build.get("execution_seconds"),
+                    }
+                )
         run = run_conductor(repo_root, target, list_mode=False, filter_value=filter_value)
         after = measurement_source_guard_fingerprint(repo_root, source_change_guard)
         sample = sample_from_run(
@@ -956,7 +1181,14 @@ def baseline(
             source_changed=before != after,
             source_guard_kind=source_change_guard,
             require_timings=filter_value is not None,
+            build=build,
         )
+        if build is not None and (
+            build.get("process_exit_code") != 0
+            or build.get("state") != "completed"
+            or build.get("exit_code") != 0
+        ):
+            sample.invalid_reasons.append("paired build failed")
         samples.append(sample)
         if progress_sink is not None:
             progress_sink(
@@ -990,6 +1222,7 @@ def baseline(
         "inventory": str(inventory_path) if inventory_path else None,
         "scope": scope,
         "filter": filter_value,
+        "build_before_samples": build_before_samples,
         "primary_metric_eligible": target == "root" and filter_value is None,
         "source_guard": {"kind": source_change_guard},
         "command": command,
@@ -1171,6 +1404,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=SOURCE_GUARD_CONTENT,
         help="source mutation guard used before/after each sample",
     )
+    baseline_parser.add_argument(
+        "--build-before-samples",
+        action="store_true",
+        help="run a coordinated build before each test sample and record build/test cost separately",
+    )
 
     combine_parser = subparsers.add_parser("combine-baselines", help="combine append-only baseline artifacts")
     combine_parser.add_argument("--input", action="append", type=Path, required=True)
@@ -1187,6 +1425,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify_parser = subparsers.add_parser("verify-ledger", help="re-list tests and reconcile ledger rows")
     verify_parser.add_argument("--ledger", type=Path, required=True)
+    verify_parser.add_argument(
+        "--list-timeout-seconds",
+        type=int,
+        default=LIST_COMMAND_TIMEOUT_SECONDS,
+        help="client-side timeout for each conductor list job",
+    )
     return parser
 
 
@@ -1208,6 +1452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 inventory_path=args.inventory,
                 source_change_guard=args.source_change_guard,
                 filter_value=args.filter,
+                build_before_samples=args.build_before_samples,
             )
         elif args.command == "combine-baselines":
             payload = combine_baselines(args.input, args.top)
@@ -1217,7 +1462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "rank":
             payload = rank_logs(args.log, args.top)
         elif args.command == "verify-ledger":
-            payload = verify_ledger(repo_root, args.ledger)
+            payload = verify_ledger(repo_root, args.ledger, args.list_timeout_seconds)
         else:
             raise OptimizerError(f"unsupported command: {args.command}")
     except (OSError, OptimizerError, ValueError) as exc:

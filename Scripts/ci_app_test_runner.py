@@ -111,7 +111,11 @@ def list_suites(swift_binary: str, cwd: Path | None) -> list[str]:
     return parse_suites(listed.stdout)
 
 
-def discover_test_bundle(swift_binary: str, cwd: Path | None) -> Path | None:
+def discover_test_bundle(
+    swift_binary: str,
+    cwd: Path | None,
+    bundle_name: str | None = None,
+) -> Path | None:
     """Find the built XCTest bundle so suites can run via ``xcrun xctest`` directly.
 
     ``swift test --skip-build --filter`` re-resolves the package and re-plans the
@@ -121,8 +125,9 @@ def discover_test_bundle(swift_binary: str, cwd: Path | None) -> Path | None:
     skips swift's process management entirely and starts producing XCTest output
     immediately.
 
-    Fails if multiple candidate bundles are found, since silently picking the
-    first sorted bundle could run suites against the wrong test target.
+    Fails if multiple candidate bundles are found and no exact bundle name was
+    requested, since silently picking the first sorted bundle could run suites
+    against the wrong test target.
     """
     try:
         show_bin = subprocess.run(
@@ -138,6 +143,9 @@ def discover_test_bundle(swift_binary: str, cwd: Path | None) -> Path | None:
     if not bin_path.is_dir():
         return None
     candidates = sorted(bin_path.glob(XCTEST_BUNDLE_GLOB))
+    if bundle_name:
+        requested = bundle_name if bundle_name.endswith(".xctest") else f"{bundle_name}.xctest"
+        candidates = [candidate for candidate in candidates if candidate.name == requested]
     if not candidates:
         return None
     if len(candidates) > 1:
@@ -146,6 +154,37 @@ def discover_test_bundle(swift_binary: str, cwd: Path | None) -> Path | None:
             f"ambiguously: {[str(c) for c in candidates]}"
         )
     return candidates[0]
+
+
+def discover_test_bundles(swift_binary: str, cwd: Path | None) -> dict[str, Path]:
+    """Return built XCTest bundles keyed by SwiftPM test target name."""
+    try:
+        show_bin = subprocess.run(
+            [swift_binary, "build", "--show-bin-path"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    bin_path = Path(show_bin.stdout.strip())
+    if not bin_path.is_dir():
+        return {}
+    return {
+        candidate.name.removesuffix(".xctest"): candidate
+        for candidate in sorted(bin_path.glob(XCTEST_BUNDLE_GLOB))
+    }
+
+
+def test_target_for_suite(suite: str) -> str:
+    return suite.split(".", 1)[0]
+
+
+def bundle_for_suite(suite: str, test_bundles: dict[str, Path] | None) -> Path | None:
+    if not test_bundles:
+        return None
+    return test_bundles.get(test_target_for_suite(suite))
 
 
 def xctest_binary_path() -> list[str]:
@@ -508,6 +547,7 @@ def run_all_suites(
     output: TextIO = sys.stdout,
     silent_startup_seconds: float | None = None,
     test_bundle: Path | None = None,
+    test_bundles: dict[str, Path] | None = None,
     xctest_binary: list[str] | None = None,
 ) -> int:
     passed_results: list[SuiteRunResult] = []
@@ -517,13 +557,29 @@ def run_all_suites(
             flush=True,
             file=output,
         )
+    elif test_bundles:
+        names = ", ".join(sorted(test_bundles))
+        print(
+            f"Using xcrun xctest bundles by suite target: {names}",
+            flush=True,
+            file=output,
+        )
     for suite in suites:
+        selected_bundle = test_bundle if test_bundle is not None else bundle_for_suite(suite, test_bundles)
+        if test_bundles is not None and selected_bundle is None:
+            print(
+                f"::error::No XCTest bundle found for suite target {test_target_for_suite(suite)} "
+                f"while routing {suite}; available bundles: {sorted(test_bundles)}",
+                flush=True,
+                file=output,
+            )
+            return 1
         print(f"::group::{suite}", flush=True, file=output)
         process_factory = lambda selected_suite: create_suite_process(  # noqa: E731
             selected_suite,
             swift_binary=swift_binary,
             cwd=cwd,
-            test_bundle=test_bundle,
+            test_bundle=selected_bundle,
             xctest_binary=xctest_binary,
         )
         result = run_suite(
@@ -569,6 +625,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "avoiding swift's per-invocation package resolution overhead.",
     )
     parser.add_argument(
+        "--test-bundle-name",
+        default=None,
+        help="Exact built .xctest bundle name to auto-select when multiple bundles exist, "
+        "for example RepoPromptTests.xctest.",
+    )
+    parser.add_argument(
         "--no-xctest-bundle",
         action="store_true",
         default=False,
@@ -590,13 +652,26 @@ def main(argv: list[str]) -> int:
         return error.returncode
 
     test_bundle = args.test_bundle
+    test_bundles: dict[str, Path] | None = None
     if test_bundle is None and not args.no_xctest_bundle:
-        try:
-            test_bundle = discover_test_bundle(args.swift_binary, args.cwd)
-        except ValueError as error:
-            print(f"::error::{error}", flush=True)
-            return 1
-    xctest_binary = xctest_binary_path() if test_bundle is not None else None
+        if args.test_bundle_name:
+            requested_target = args.test_bundle_name.removesuffix(".xctest")
+            mismatched = [suite for suite in suites if test_target_for_suite(suite) != requested_target]
+            if mismatched:
+                print(
+                    f"::error::--test-bundle-name {args.test_bundle_name} cannot run suites "
+                    f"from other targets: {mismatched[:5]}",
+                    flush=True,
+                )
+                return 1
+            test_bundle = discover_test_bundle(args.swift_binary, args.cwd, args.test_bundle_name)
+        else:
+            discovered = discover_test_bundles(args.swift_binary, args.cwd)
+            if len(discovered) == 1:
+                test_bundle = next(iter(discovered.values()))
+            elif discovered:
+                test_bundles = discovered
+    xctest_binary = xctest_binary_path() if test_bundle is not None or test_bundles else None
 
     return run_all_suites(
         suites,
@@ -606,6 +681,7 @@ def main(argv: list[str]) -> int:
         cwd=args.cwd,
         silent_startup_seconds=args.silent_startup_seconds,
         test_bundle=test_bundle,
+        test_bundles=test_bundles,
         xctest_binary=xctest_binary,
     )
 

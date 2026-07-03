@@ -148,6 +148,26 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(sample.source_guard_kind, optimizer.SOURCE_GUARD_METADATA)
         self.assertIn("filtered baseline produced no parsed XCTest timings", sample.invalid_reasons)
 
+    def test_baseline_summary_separates_build_and_test_seconds(self) -> None:
+        samples = [
+            self.make_sample(1, []),
+            self.make_sample(2, []),
+            self.make_sample(3, []),
+        ]
+        samples[0].execution_seconds = 10.0
+        samples[1].execution_seconds = 12.0
+        samples[2].execution_seconds = 14.0
+        samples[0].build = {"execution_seconds": 3.0}
+        samples[1].build = {"execution_seconds": 5.0}
+        samples[2].build = {"execution_seconds": 7.0}
+
+        summary = optimizer.baseline_summary(samples)
+
+        self.assertEqual(summary["median_seconds"], 12.0)
+        self.assertEqual(summary["median_build_execution_seconds"], 5.0)
+        self.assertEqual(summary["observed_p95_build_execution_seconds"], 7.0)
+        self.assertEqual(summary["median_total_build_plus_test_seconds"], 17.0)
+
     def test_suite_ranking_uses_median_aggregate_seconds(self) -> None:
         ranking = optimizer.suite_ranking([
             self.make_sample(
@@ -267,6 +287,33 @@ class SourceAndLedgerTests(unittest.TestCase):
         self.assertEqual(rows[0]["scenario_count"], "1")
         self.assertEqual(rows[0]["current_disposition"], "retain_pending_review")
 
+    def test_source_mapping_supports_multiple_root_test_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "Tests" / "RepoPromptTests" / "MCP"
+            second = root / "Tests" / "RepoPromptWorkspaceTests" / "WorkspaceContext"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            (first / "ExampleTests.swift").write_text(
+                "final class ExampleTests { func testOne() {} }\n",
+                encoding="utf-8",
+            )
+            (second / "WorkspaceExampleTests.swift").write_text(
+                "final class WorkspaceExampleTests { func testTwo() {} }\n",
+                encoding="utf-8",
+            )
+            tests = [
+                optimizer.ListedTest("root", "RepoPromptWorkspaceTests.WorkspaceExampleTests", "testTwo")
+            ]
+
+            locations = optimizer.map_test_sources(root, tests)
+
+        self.assertEqual(
+            locations[tests[0].method_id].file,
+            "Tests/RepoPromptWorkspaceTests/WorkspaceContext/WorkspaceExampleTests.swift",
+        )
+        self.assertEqual(locations[tests[0].method_id].domain, "WorkspaceContext")
+
     def test_source_mapping_rejects_ambiguous_method_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -297,6 +344,114 @@ class SourceAndLedgerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(optimizer.OptimizerError, "duplicate method_id"):
                 optimizer.read_ledger_ids(path)
+
+    def test_verify_ledger_emits_progress_and_checks_completed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            with ledger.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=optimizer.LEDGER_COLUMNS,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                for method_id, target, suite, method in [
+                    ("root/RepoPromptTests.ExampleTests/testOne", "root", "RepoPromptTests.ExampleTests", "testOne"),
+                    (
+                        "provider/RepoPromptClaudeCompatibleProviderTests.CodecTests/testRoundTrip",
+                        "provider",
+                        "RepoPromptClaudeCompatibleProviderTests.CodecTests",
+                        "testRoundTrip",
+                    ),
+                ]:
+                    row = {column: "" for column in optimizer.LEDGER_COLUMNS}
+                    row.update({"method_id": method_id, "target": target, "suite": suite, "method": method})
+                    writer.writerow(row)
+            runs = {
+                "root": optimizer.ConductorRun(
+                    command=["/repo/conductor", "test", "--list", "--json"],
+                    process_exit_code=0,
+                    stdout="{}",
+                    stderr="",
+                    result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root.log"},
+                    log_text="RepoPromptTests.ExampleTests/testOne\n",
+                    ticket="root-ticket",
+                ),
+                "provider": optimizer.ConductorRun(
+                    command=["/repo/conductor", "provider-test", "--list", "--json"],
+                    process_exit_code=0,
+                    stdout="{}",
+                    stderr="",
+                    result={"state": "completed", "exitCode": 0, "logPath": "/tmp/provider.log"},
+                    log_text="RepoPromptClaudeCompatibleProviderTests.CodecTests/testRoundTrip\n",
+                    ticket="provider-ticket",
+                ),
+            }
+            events: list[dict[str, object]] = []
+
+            def fake_run_conductor(repo_root, target, list_mode=False, filter_value=None, timeout_seconds=None):
+                self.assertTrue(list_mode)
+                self.assertEqual(timeout_seconds, 12)
+                return runs[target]
+
+            with mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor):
+                payload = optimizer.verify_ledger_with_progress(
+                    root,
+                    ledger,
+                    lambda event: events.append(dict(event)),
+                    list_timeout_seconds=12,
+                )
+
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "verify_ledger_list_start",
+                "verify_ledger_list_end",
+                "verify_ledger_list_start",
+                "verify_ledger_list_end",
+            ],
+        )
+        self.assertEqual(events[0]["timeout_seconds"], 12)
+        self.assertEqual(events[1]["ticket"], "root-ticket")
+        self.assertEqual(events[3]["ticket"], "provider-ticket")
+
+    def test_verify_ledger_rejects_missing_list_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            with ledger.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=optimizer.LEDGER_COLUMNS,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+            run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/missing/root.log"},
+                log_text="",
+                ticket="root-ticket",
+            )
+
+            with mock.patch.object(optimizer, "run_conductor", return_value=run):
+                with self.assertRaisesRegex(optimizer.OptimizerError, "list log missing or empty"):
+                    optimizer.verify_ledger_with_progress(root, ledger, None)
+
+    def test_verify_ledger_rejects_non_positive_list_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            ledger.write_text("\t".join(optimizer.LEDGER_COLUMNS) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "must be greater than zero"):
+                optimizer.verify_ledger_with_progress(root, ledger, None, list_timeout_seconds=0)
 
 
 class ProgressOutputTests(unittest.TestCase):
@@ -442,6 +597,94 @@ class BaselineProgressTests(unittest.TestCase):
         self.assertEqual(events[3]["valid"], True)
         self.assertEqual(events[3]["invalid_reasons"], [])
 
+    def test_baseline_build_before_samples_emits_build_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events: list[dict[str, object]] = []
+            operations: list[str] = []
+            build_result = {
+                "state": "completed",
+                "exitCode": 0,
+                "queueWaitSeconds": 0.1,
+                "executionSeconds": 3.0,
+                "measurementInvalid": False,
+                "logPath": "/tmp/build.log",
+            }
+            build_run = optimizer.ConductorRun(
+                command=["/repo/conductor", "swift-build", "--product", "all", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result=build_result,
+                log_text="",
+                ticket="build-ticket",
+            )
+
+            def fake_build(repo_root: Path, target: str) -> optimizer.ConductorRun:
+                operations.append("build")
+                return build_run
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+            ) -> optimizer.ConductorRun:
+                operations.append("test")
+                return self.make_run(1)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "b" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor_build", side_effect=fake_build),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-01T00:00:00+00:00"),
+            ):
+                payload = optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=1,
+                    label="build-progress-test",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    build_before_samples=True,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+        self.assertEqual(operations, ["build", "test"])
+        self.assertEqual(
+            [event["event"] for event in events],
+            [
+                "baseline_sample_start",
+                "baseline_build_start",
+                "baseline_build_end",
+                "baseline_sample_end",
+            ],
+        )
+        self.assertEqual(events[2]["ticket"], "build-ticket")
+        self.assertEqual(events[2]["execution_seconds"], 3.0)
+        self.assertEqual(payload["summary"]["median_build_execution_seconds"], 3.0)
+
+    def test_baseline_rejects_provider_build_before_samples_before_progress(self) -> None:
+        events: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(optimizer.OptimizerError, "supports only --target root"):
+                optimizer.baseline(
+                    repo_root=root,
+                    target="provider",
+                    samples_requested=1,
+                    label="provider-build",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    build_before_samples=True,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+        self.assertEqual(events, [])
+
 
 class CombinedBaselineTests(unittest.TestCase):
     def test_combine_baselines_marks_fewer_than_three_valid_samples_unreliable(self) -> None:
@@ -566,6 +809,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
             "inventory": "/tmp/inventory.json",
             "scope": "complete",
             "filter": None,
+            "build_before_samples": False,
             "primary_metric_eligible": False,
             "source_guard": {"kind": optimizer.SOURCE_GUARD_METADATA},
             "command": ["./conductor", "provider-test", "--json"],
@@ -575,6 +819,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
                     "index": 1,
                     "valid": True,
                     "execution_seconds": 1.0,
+                    "build": None,
                     "queue_wait_seconds": 0.1,
                     "state": "completed",
                     "exit_code": 0,
@@ -607,6 +852,8 @@ class AppendOnlyArtifactTests(unittest.TestCase):
         self.assertIn("/one.log", second)
         self.assertIn("/two.log", second)
         self.assertIn("Source-change guard: `metadata`", second)
+        self.assertIn("Build before samples: no", second)
+        self.assertIn("| Sample | Valid | Build seconds | Test execution seconds |", second)
         self.assertIn("Primary metric eligible: no", second)
 
     def test_json_artifacts_refuse_overwrite(self) -> None:
