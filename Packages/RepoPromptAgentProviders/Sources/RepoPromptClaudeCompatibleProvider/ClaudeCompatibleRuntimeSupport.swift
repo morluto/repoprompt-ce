@@ -507,6 +507,7 @@ public enum ClaudeCompatibleModelNormalizer {
             return configuredSlot
         }
 
+        guard config.id == .glmZAI else { return nil }
         switch normalized {
         case haikuEquivalentModelRawValue, "glm-4.7":
             return haikuRequestedModelRawValue
@@ -595,7 +596,8 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
 
     public func resolve(
         variant: ClaudeCompatibleRuntimeVariant,
-        requestedModel: String?
+        requestedModel: String?,
+        requestedEffort: String? = nil
     ) async throws -> ClaudeCompatibleLaunchEnvironment {
         switch variant {
         case .standard:
@@ -616,14 +618,20 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             guard let backendID = variant.compatibleBackendID else {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported Claude Code runtime variant.")
             }
-            return try await resolveCompatibleBackend(backendID, variant: variant, requestedModel: requestedModel)
+            return try await resolveCompatibleBackend(
+                backendID,
+                variant: variant,
+                requestedModel: requestedModel,
+                requestedEffort: requestedEffort
+            )
         }
     }
 
     private func resolveCompatibleBackend(
         _ backendID: ClaudeCompatibleBackendID,
         variant: ClaudeCompatibleRuntimeVariant,
-        requestedModel: String?
+        requestedModel: String?,
+        requestedEffort: String?
     ) async throws -> ClaudeCompatibleLaunchEnvironment {
         let config = backendConfigProvider(backendID).normalized
         guard config.isEnabled, config.isValid else {
@@ -631,12 +639,14 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
         }
 
         let requestedSpecifier = ClaudeCompatibleEffortEncodedModel(raw: requestedModel)
+        let normalizedRequestedEffort = Self.normalizedEffortRaw(requestedEffort)
+        let effectiveEffortRaw = requestedSpecifier.effortRaw ?? normalizedRequestedEffort
         let effectiveModel: String?
         let selectedBackendModelID: String?
         let environmentConfig: ClaudeCompatibleBackendConfig
         switch config.modelBehavior {
         case .noModel:
-            guard !requestedSpecifier.hasEffort,
+            guard effectiveEffortRaw == nil,
                   isAllowedNoModelSelection(requestedModel, backendID: backendID)
             else {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
@@ -649,7 +659,7 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
                let directBackendModelID = requestedSpecifier.baseModel?.lowercased(),
                let directSlot = ClaudeCompatibleModelNormalizer.directSelectableGLMSlotRawValue(for: directBackendModelID)
             {
-                if requestedSpecifier.effortRaw == "xhigh",
+                if effectiveEffortRaw == "xhigh",
                    !ClaudeCompatibleModelNormalizer.supportsXHighEffort(directBackendModelID)
                 {
                     throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
@@ -667,7 +677,7 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             else {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
             }
-            if requestedSpecifier.effortRaw == "xhigh",
+            if effectiveEffortRaw == "xhigh",
                !ClaudeCompatibleModelNormalizer.supportsXHighEffort(backendModelID)
             {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
@@ -697,6 +707,12 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             backendID: backendID,
             suppressesEffortSettings: config.modelBehavior == .noModel
         )
+    }
+
+    private static func normalizedEffortRaw(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed == "x-high" ? "xhigh" : trimmed
     }
 
     private func backendModelID(forSlot slot: String, config: ClaudeCompatibleBackendConfig) -> String? {
