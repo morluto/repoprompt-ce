@@ -269,13 +269,18 @@ def conductor_command(
     target: str,
     list_mode: bool = False,
     filter_value: str | None = None,
+    test_product: str | None = None,
 ) -> list[str]:
     if list_mode and filter_value:
         raise OptimizerError("--filter cannot be used with list mode")
+    if list_mode and test_product:
+        raise OptimizerError("--test-product cannot be used with list mode")
     operation = "test" if target == "root" else "provider-test"
     command = [str(repo_root / "conductor"), operation]
     if list_mode:
         command.append("--list")
+    if test_product:
+        command.extend(["--test-product", test_product])
     if filter_value:
         command.extend(["--filter", filter_value])
     command.append("--json")
@@ -293,9 +298,16 @@ def run_conductor(
     target: str,
     list_mode: bool = False,
     filter_value: str | None = None,
+    test_product: str | None = None,
     timeout_seconds: int | None = None,
 ) -> ConductorRun:
-    command = conductor_command(repo_root, target, list_mode=list_mode, filter_value=filter_value)
+    command = conductor_command(
+        repo_root,
+        target,
+        list_mode=list_mode,
+        filter_value=filter_value,
+        test_product=test_product,
+    )
     completed = run_command(command, repo_root, timeout_seconds=timeout_seconds)
     payload = parse_conductor_json(completed.stdout)
     result = payload["result"]
@@ -869,6 +881,7 @@ def append_baseline_scoreboard(
     target = payload["target"]
     scope = str(payload.get("scope") or "complete")
     filter_value = payload.get("filter")
+    test_product = payload.get("test_product")
     scope_filter = scope if not filter_value else f"{scope}: `{filter_value}`"
     source_guard = (payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT
     summary = payload["summary"]
@@ -877,7 +890,7 @@ def append_baseline_scoreboard(
     root_count = counts.get("root", 0)
     provider_count = counts.get("provider", 0)
     total_count = root_count + provider_count if counts else 0
-    record_heading = "Focused" if scope == "filtered" else "Baseline"
+    record_heading = "Focused" if scope in {"filtered", "test-product"} else "Baseline"
     lines = [
         f"### {record_heading}: {payload['timestamp']} — {target} — {payload['label']}",
         "",
@@ -885,6 +898,7 @@ def append_baseline_scoreboard(
         f"Artifact: `{payload.get('artifact') or ''}`",
         f"Inventory: `{payload.get('inventory') or ''}`",
         f"Scope/filter: {scope_filter}",
+        f"Test product: `{test_product or ''}`",
         f"Source-change guard: `{source_guard}`",
         f"Build before samples: {'yes' if payload.get('build_before_samples') else 'no'}",
         f"Primary metric eligible: {'yes' if payload.get('primary_metric_eligible') else 'no'}",
@@ -1110,6 +1124,7 @@ def baseline(
     inventory_path: Path | None = None,
     source_change_guard: str = SOURCE_GUARD_CONTENT,
     filter_value: str | None = None,
+    test_product: str | None = None,
     build_before_samples: bool = False,
     progress_sink: ProgressSink | None = emit_progress_event,
 ) -> dict[str, Any]:
@@ -1117,9 +1132,11 @@ def baseline(
         raise OptimizerError("--samples must be greater than zero")
     if build_before_samples and target != "root":
         raise OptimizerError("--build-before-samples currently supports only --target root")
+    if build_before_samples and test_product:
+        raise OptimizerError("--build-before-samples cannot be combined with --test-product")
     samples: list[Sample] = []
-    command = conductor_command(repo_root, target, filter_value=filter_value)
-    scope = "filtered" if filter_value else "complete"
+    command = conductor_command(repo_root, target, filter_value=filter_value, test_product=test_product)
+    scope = "filtered" if filter_value else "test-product" if test_product else "complete"
     for index in range(1, samples_requested + 1):
         if progress_sink is not None:
             progress_sink(
@@ -1129,6 +1146,7 @@ def baseline(
                     "target": target,
                     "scope": scope,
                     "filter": filter_value,
+                    "test_product": test_product,
                     "source_guard": source_change_guard,
                     "sample_index": index,
                     "sample_count": samples_requested,
@@ -1148,6 +1166,7 @@ def baseline(
                         "target": target,
                         "scope": scope,
                         "filter": filter_value,
+                        "test_product": test_product,
                         "sample_index": index,
                         "sample_count": samples_requested,
                     }
@@ -1162,6 +1181,7 @@ def baseline(
                         "target": target,
                         "scope": scope,
                         "filter": filter_value,
+                        "test_product": test_product,
                         "sample_index": index,
                         "sample_count": samples_requested,
                         "ticket": build_run.ticket,
@@ -1172,7 +1192,13 @@ def baseline(
                         "execution_seconds": build.get("execution_seconds"),
                     }
                 )
-        run = run_conductor(repo_root, target, list_mode=False, filter_value=filter_value)
+        run = run_conductor(
+            repo_root,
+            target,
+            list_mode=False,
+            filter_value=filter_value,
+            test_product=test_product,
+        )
         after = measurement_source_guard_fingerprint(repo_root, source_change_guard)
         sample = sample_from_run(
             index,
@@ -1198,6 +1224,7 @@ def baseline(
                     "target": target,
                     "scope": scope,
                     "filter": filter_value,
+                    "test_product": test_product,
                     "source_guard": source_change_guard,
                     "sample_index": index,
                     "sample_count": samples_requested,
@@ -1222,8 +1249,9 @@ def baseline(
         "inventory": str(inventory_path) if inventory_path else None,
         "scope": scope,
         "filter": filter_value,
+        "test_product": test_product,
         "build_before_samples": build_before_samples,
-        "primary_metric_eligible": target == "root" and filter_value is None,
+        "primary_metric_eligible": target == "root" and filter_value is None and test_product is None,
         "source_guard": {"kind": source_change_guard},
         "command": command,
         "git": git_metadata(repo_root),
@@ -1251,16 +1279,19 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
     targets: set[str] = set()
     scopes: set[str] = set()
     filters: set[str | None] = set()
+    test_products: set[str | None] = set()
     source_guards: set[str] = set()
     for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
         target = str(payload.get("target") or "")
         scope = str(payload.get("scope") or "complete")
         filter_value = payload.get("filter")
+        test_product = payload.get("test_product")
         source_guard = str((payload.get("source_guard") or {}).get("kind") or SOURCE_GUARD_CONTENT)
         targets.add(target)
         scopes.add(scope)
         filters.add(str(filter_value) if filter_value is not None else None)
+        test_products.add(str(test_product) if test_product is not None else None)
         source_guards.add(source_guard)
         for raw_sample in payload.get("samples") or []:
             sample = dict(raw_sample)
@@ -1297,6 +1328,10 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
         raise OptimizerError(f"combined baselines must have one scope, found: {sorted(scopes)}")
     if len(filters) != 1:
         raise OptimizerError(f"combined baselines must have one filter, found: {sorted(filters, key=str)}")
+    if len(test_products) != 1:
+        raise OptimizerError(
+            f"combined baselines must have one test product, found: {sorted(test_products, key=str)}"
+        )
     if len(source_guards) != 1:
         raise OptimizerError(
             f"combined baselines must have one source change guard, found: {sorted(source_guards)}"
@@ -1308,13 +1343,15 @@ def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
     target = next(iter(targets))
     scope = next(iter(scopes))
     filter_value = next(iter(filters))
+    test_product = next(iter(test_products))
     source_guard = next(iter(source_guards))
     return {
         "timestamp": utc_now(),
         "target": target,
         "scope": scope,
         "filter": filter_value,
-        "primary_metric_eligible": target == "root" and filter_value is None,
+        "test_product": test_product,
+        "primary_metric_eligible": target == "root" and filter_value is None and test_product is None,
         "source_guard": {"kind": source_guard},
         "source_artifacts": [str(path) for path in paths],
         "samples": samples,
@@ -1399,6 +1436,10 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_parser.add_argument("--inventory", type=Path)
     baseline_parser.add_argument("--filter", help="optional XCTest filter for focused baseline artifacts")
     baseline_parser.add_argument(
+        "--test-product",
+        help="optional SwiftPM test product for focused split-target baseline artifacts",
+    )
+    baseline_parser.add_argument(
         "--source-change-guard",
         choices=[SOURCE_GUARD_CONTENT, SOURCE_GUARD_METADATA],
         default=SOURCE_GUARD_CONTENT,
@@ -1452,6 +1493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 inventory_path=args.inventory,
                 source_change_guard=args.source_change_guard,
                 filter_value=args.filter,
+                test_product=args.test_product,
                 build_before_samples=args.build_before_samples,
             )
         elif args.command == "combine-baselines":

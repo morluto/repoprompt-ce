@@ -250,6 +250,34 @@ class SourceAndLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(optimizer.OptimizerError, "--filter cannot be used with list mode"):
             optimizer.conductor_command(Path("/repo"), "provider", list_mode=True, filter_value="Suite")
 
+    def test_conductor_command_adds_test_product_before_filter(self) -> None:
+        command = optimizer.conductor_command(
+            Path("/repo"),
+            "root",
+            filter_value="WorkspaceTests",
+            test_product="RepoPromptWorkspaceTests",
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/repo/conductor",
+                "test",
+                "--test-product",
+                "RepoPromptWorkspaceTests",
+                "--filter",
+                "WorkspaceTests",
+                "--json",
+            ],
+        )
+        with self.assertRaisesRegex(optimizer.OptimizerError, "--test-product cannot be used with list mode"):
+            optimizer.conductor_command(
+                Path("/repo"),
+                "root",
+                list_mode=True,
+                test_product="RepoPromptWorkspaceTests",
+            )
+
     def test_metadata_source_guard_changes_on_add_modify_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -531,11 +559,13 @@ class BaselineProgressTests(unittest.TestCase):
                 target: str,
                 list_mode: bool = False,
                 filter_value: str | None = None,
+                test_product: str | None = None,
             ) -> optimizer.ConductorRun:
                 nonlocal run_count
                 run_count += 1
                 self.assertFalse(list_mode)
                 self.assertEqual((target, filter_value), ("root", "RepoPromptTests.ExampleTests"))
+                self.assertIsNone(test_product)
                 operations.append(("run", run_count))
                 return runs.pop(0)
 
@@ -577,6 +607,7 @@ class BaselineProgressTests(unittest.TestCase):
         self.assertEqual(start["target"], "root")
         self.assertEqual(start["scope"], "filtered")
         self.assertEqual(start["filter"], filter_value)
+        self.assertIsNone(start["test_product"])
         self.assertEqual(start["source_guard"], optimizer.SOURCE_GUARD_METADATA)
         self.assertEqual(start["sample_index"], 1)
         self.assertEqual(start["sample_count"], 2)
@@ -629,8 +660,10 @@ class BaselineProgressTests(unittest.TestCase):
                 target: str,
                 list_mode: bool = False,
                 filter_value: str | None = None,
+                test_product: str | None = None,
             ) -> optimizer.ConductorRun:
                 operations.append("test")
+                self.assertIsNone(test_product)
                 return self.make_run(1)
 
             with (
@@ -666,6 +699,54 @@ class BaselineProgressTests(unittest.TestCase):
         self.assertEqual(events[2]["execution_seconds"], 3.0)
         self.assertEqual(payload["summary"]["median_build_execution_seconds"], 3.0)
 
+    def test_baseline_records_test_product_and_keeps_primary_metric_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected_product = "RepoPromptWorkspaceTests"
+            expected_command = optimizer.conductor_command(root, "root", test_product=expected_product)
+            events: list[dict[str, object]] = []
+
+            def fake_run_conductor(
+                repo_root: Path,
+                target: str,
+                list_mode: bool = False,
+                filter_value: str | None = None,
+                test_product: str | None = None,
+            ) -> optimizer.ConductorRun:
+                self.assertEqual((target, list_mode, filter_value, test_product), ("root", False, None, expected_product))
+                return self.make_run(1)
+
+            with (
+                mock.patch.object(optimizer, "git_metadata", return_value={"commit": "c" * 40, "working_tree": ""}),
+                mock.patch.object(optimizer, "measurement_source_guard_fingerprint", return_value="same-source"),
+                mock.patch.object(optimizer, "run_conductor", side_effect=fake_run_conductor),
+                mock.patch.object(optimizer, "utc_now", return_value="2026-07-01T00:00:00+00:00"),
+            ):
+                payload = optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=1,
+                    label="workspace-product",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    test_product=expected_product,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+                scoreboard = (root / "scoreboard.md").read_text(encoding="utf-8")
+
+        self.assertEqual(payload["command"], expected_command)
+        self.assertEqual(payload["test_product"], expected_product)
+        self.assertEqual(payload["scope"], "test-product")
+        self.assertFalse(payload["primary_metric_eligible"])
+        self.assertEqual(events[0]["test_product"], expected_product)
+        self.assertEqual(events[0]["scope"], "test-product")
+        self.assertEqual(events[1]["test_product"], expected_product)
+        self.assertEqual(events[1]["scope"], "test-product")
+        self.assertIn("### Focused:", scoreboard)
+        self.assertIn("Scope/filter: test-product", scoreboard)
+        self.assertIn(f"Test product: `{expected_product}`", scoreboard)
+
     def test_baseline_rejects_provider_build_before_samples_before_progress(self) -> None:
         events: list[dict[str, object]] = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -679,6 +760,26 @@ class BaselineProgressTests(unittest.TestCase):
                     scoreboard=root / "scoreboard.md",
                     output=root / "baseline.json",
                     method_counts=None,
+                    build_before_samples=True,
+                    progress_sink=lambda event: events.append(dict(event)),
+                )
+
+        self.assertEqual(events, [])
+
+    def test_baseline_rejects_test_product_build_before_samples_before_progress(self) -> None:
+        events: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(optimizer.OptimizerError, "cannot be combined with --test-product"):
+                optimizer.baseline(
+                    repo_root=root,
+                    target="root",
+                    samples_requested=1,
+                    label="product-build",
+                    scoreboard=root / "scoreboard.md",
+                    output=root / "baseline.json",
+                    method_counts=None,
+                    test_product="RepoPromptWorkspaceTests",
                     build_before_samples=True,
                     progress_sink=lambda event: events.append(dict(event)),
                 )
@@ -742,6 +843,7 @@ class CombinedBaselineTests(unittest.TestCase):
             *,
             scope: str = "complete",
             filter_value: str | None = None,
+            test_product: str | None = None,
             guard: str = optimizer.SOURCE_GUARD_CONTENT,
         ) -> Path:
             path = root / f"{name}.json"
@@ -751,6 +853,7 @@ class CombinedBaselineTests(unittest.TestCase):
                         "target": "root",
                         "scope": scope,
                         "filter": filter_value,
+                        "test_product": test_product,
                         "source_guard": {"kind": guard},
                         "samples": [
                             {
@@ -775,12 +878,16 @@ class CombinedBaselineTests(unittest.TestCase):
             complete = artifact(root, "complete")
             focused = artifact(root, "focused", scope="filtered", filter_value="RepoPromptTests.A")
             focused_other = artifact(root, "focused-other", scope="filtered", filter_value="RepoPromptTests.B")
+            workspace_product = artifact(root, "workspace-product", test_product="RepoPromptWorkspaceTests")
+            mcp_product = artifact(root, "mcp-product", test_product="RepoPromptMCPTests")
             metadata = artifact(root, "metadata", guard=optimizer.SOURCE_GUARD_METADATA)
 
             with self.assertRaisesRegex(optimizer.OptimizerError, "one scope"):
                 optimizer.combine_baselines([complete, focused])
             with self.assertRaisesRegex(optimizer.OptimizerError, "one filter"):
                 optimizer.combine_baselines([focused, focused_other])
+            with self.assertRaisesRegex(optimizer.OptimizerError, "one test product"):
+                optimizer.combine_baselines([workspace_product, mcp_product])
             with self.assertRaisesRegex(optimizer.OptimizerError, "one source change guard"):
                 optimizer.combine_baselines([complete, metadata])
 
@@ -852,6 +959,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
         self.assertIn("/one.log", second)
         self.assertIn("/two.log", second)
         self.assertIn("Source-change guard: `metadata`", second)
+        self.assertIn("Test product: ``", second)
         self.assertIn("Build before samples: no", second)
         self.assertIn("| Sample | Valid | Build seconds | Test execution seconds |", second)
         self.assertIn("Primary metric eligible: no", second)
