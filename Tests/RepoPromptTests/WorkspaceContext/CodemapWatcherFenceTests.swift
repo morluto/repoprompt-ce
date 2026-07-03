@@ -43,7 +43,11 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let currentFile = try XCTUnwrap(currentFiles.first {
             $0.standardizedRelativePath == file.standardizedRelativePath
         })
-        let successorDemand = await store.requestCodemapArtifact(forFileID: currentFile.id)
+        let successorDemand = try await currentCodemapArtifactDemand(
+            store: store,
+            fileID: currentFile.id,
+            phase: "catalog-advance successor"
+        )
         let successorTicket: WorkspaceCodemapArtifactDemandTicket
         switch successorDemand {
         case let .pending(ticket):

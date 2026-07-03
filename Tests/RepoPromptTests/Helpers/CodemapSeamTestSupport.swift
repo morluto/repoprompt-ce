@@ -728,6 +728,41 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
         throw CodemapStoreTestError.timedOut
     }
 
+    func currentCodemapArtifactDemand(
+        store: WorkspaceFileContextStore,
+        fileID: UUID,
+        phase: String,
+        timeout: Duration = .seconds(15),
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> WorkspaceCodemapArtifactDemandResult {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var latestResult: WorkspaceCodemapArtifactDemandResult?
+        while clock.now < deadline {
+            let result = await store.requestCodemapArtifact(forFileID: fileID)
+            latestResult = result
+            switch result {
+            case .pending, .ready:
+                return result
+            case let .unavailable(.busy(retryAfterMilliseconds)):
+                let retryMilliseconds = retryAfterMilliseconds.map { UInt64(max(0, $0)) } ?? 25
+                try await Task.sleep(for: .milliseconds(
+                    boundedProjectionRetryMilliseconds(retryMilliseconds)
+                ))
+            case .unavailable:
+                XCTFail("Expected \(phase) codemap artifact demand, got \(result).", file: file, line: line)
+                throw CodemapStoreTestError.timedOut
+            }
+        }
+        XCTFail(
+            "Timed out waiting for \(phase) codemap artifact demand; latest=\(String(describing: latestResult)).",
+            file: file,
+            line: line
+        )
+        throw CodemapStoreTestError.timedOut
+    }
+
     func routeBecomesUnavailable(
         registry: WorkspaceCodemapBindingIntegrationRegistry,
         ticket: WorkspaceCodemapArtifactDemandTicket,
