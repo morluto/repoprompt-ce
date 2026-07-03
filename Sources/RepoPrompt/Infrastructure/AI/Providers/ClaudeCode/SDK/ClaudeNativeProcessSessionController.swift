@@ -577,6 +577,7 @@ final actor ClaudeNativeProcessSessionController {
         let environment = await resolvedLaunchEnvironment(
             resolverOverrides: launchEnvironment.environmentOverrides,
             resolverRemovedKeys: launchEnvironment.removedEnvironmentKeys,
+            effortLevel: resolvedFlags.environmentEffortLevel,
             suppressesEffortSettings: launchEnvironment.suppressesEffortSettings
         )
         let resolvedCommand = CommandPathResolver.resolve(
@@ -672,7 +673,7 @@ final actor ClaudeNativeProcessSessionController {
     private func resolveLaunchFlagSettings(
         model: String?,
         effortLevel suppliedEffortLevel: ClaudeCodeEffortLevel?
-    ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?) {
+    ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?, environmentEffortLevel: ClaudeCodeEffortLevel?) {
         let modelSpecifier = model.map { ClaudeModelSpecifier(raw: $0) }
         let requestedModel = modelSpecifier != nil
             ? model
@@ -682,7 +683,8 @@ final actor ClaudeNativeProcessSessionController {
             ?? config.effortLevel
         let launchEnvironment = try await environmentResolver.resolve(
             variant: config.runtimeVariant,
-            requestedModel: requestedModel
+            requestedModel: requestedModel,
+            requestedEffort: effectiveEffortLevel?.rawValue
         )
         let requestEffortLevel = Self.shouldSuppressEffortSettings(for: launchEnvironment)
             ? nil
@@ -691,7 +693,7 @@ final actor ClaudeNativeProcessSessionController {
             model: launchEnvironment.effectiveModel,
             effortLevel: requestEffortLevel
         )
-        return (launchEnvironment, request)
+        return (launchEnvironment, request, requestEffortLevel)
     }
 
     private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
@@ -1731,12 +1733,14 @@ final actor ClaudeNativeProcessSessionController {
             base: [String: String],
             resolverOverrides: [String: String] = [:],
             resolverRemovedKeys: Set<String> = [],
+            effortLevel: ClaudeCodeEffortLevel? = nil,
             suppressesEffortSettings: Bool = false
         ) -> [String: String] {
             effectiveLaunchEnvironment(
                 base: base,
                 resolverOverrides: resolverOverrides,
                 resolverRemovedKeys: resolverRemovedKeys,
+                effortLevel: effortLevel,
                 suppressesEffortSettings: suppressesEffortSettings
             )
         }
@@ -2293,6 +2297,7 @@ final actor ClaudeNativeProcessSessionController {
     private func resolvedLaunchEnvironment(
         resolverOverrides: [String: String],
         resolverRemovedKeys: Set<String>,
+        effortLevel: ClaudeCodeEffortLevel?,
         suppressesEffortSettings: Bool
     ) async -> [String: String] {
         let result = await ProcessEnvironmentBuilder.build(
@@ -2306,6 +2311,7 @@ final actor ClaudeNativeProcessSessionController {
             base: result.environment,
             resolverOverrides: resolverOverrides,
             resolverRemovedKeys: resolverRemovedKeys,
+            effortLevel: effortLevel,
             suppressesEffortSettings: suppressesEffortSettings
         )
     }
@@ -2314,6 +2320,7 @@ final actor ClaudeNativeProcessSessionController {
         base: [String: String],
         resolverOverrides: [String: String],
         resolverRemovedKeys: Set<String> = [],
+        effortLevel: ClaudeCodeEffortLevel? = nil,
         suppressesEffortSettings: Bool = false
     ) -> [String: String] {
         var env = base
@@ -2334,10 +2341,10 @@ final actor ClaudeNativeProcessSessionController {
         }
         if suppressesEffortSettings {
             env.removeValue(forKey: "CLAUDE_CODE_EFFORT_LEVEL")
+        } else if let effortLevel {
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = effortLevel.envValue
         } else {
-            for (key, value) in config.effortEnvironmentOverrides {
-                env[key] = value
-            }
+            env.removeValue(forKey: "CLAUDE_CODE_EFFORT_LEVEL")
         }
         return ProcessEnvironmentSanitizer.sanitizedForChildLaunch(
             env,

@@ -9,12 +9,15 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
     actor RecordingLaunchEnvironmentResolver: ClaudeCodeLaunchEnvironmentResolving {
         private(set) var requestedModels: [String?] = []
+        private(set) var requestedEfforts: [String?] = []
 
         func resolve(
             variant _: ClaudeCodeRuntimeVariant,
-            requestedModel: String?
+            requestedModel: String?,
+            requestedEffort: String?
         ) async throws -> ClaudeCodeLaunchEnvironment {
             requestedModels.append(requestedModel)
+            requestedEfforts.append(requestedEffort)
             guard requestedModel != "glm-5-turbo:xhigh" else {
                 throw ResolverError.unsupportedModel
             }
@@ -48,7 +51,31 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         }
 
         let requestedModels = await resolver.requestedModels
+        let requestedEfforts = await resolver.requestedEfforts
         XCTAssertEqual(requestedModels, ["glm-5-turbo:xhigh"])
+        XCTAssertEqual(requestedEfforts, ["xhigh"])
+    }
+
+    func testNativeFlagResolutionPassesSeparateEffortToResolver() async throws {
+        let resolver = RecordingLaunchEnvironmentResolver()
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .glm
+            ),
+            environmentResolver: resolver
+        )
+
+        _ = try await controller.test_resolveApplyFlagSettingsRequest(model: "sonnet", effortLevel: .max)
+
+        let requestedModels = await resolver.requestedModels
+        let requestedEfforts = await resolver.requestedEfforts
+        XCTAssertEqual(requestedModels, ["sonnet"])
+        XCTAssertEqual(requestedEfforts, ["max"])
     }
 
     func testNativeLaunchEnvironmentIncludesEffortEnvironment() async {
@@ -69,11 +96,33 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             resolverOverrides: [
                 "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
                 "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]"
-            ]
+            ],
+            effortLevel: .max
         )
 
         XCTAssertEqual(environment["ANTHROPIC_MODEL"], "deepseek-v4-pro[1m]")
         XCTAssertEqual(environment["CLAUDE_CODE_EFFORT_LEVEL"], "max")
+    }
+
+    func testNativeLaunchEnvironmentUsesPerLaunchEffortEnvironment() async {
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .agentMode(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .standard,
+                effortLevel: .max
+            )
+        )
+
+        let environment = await controller.test_effectiveLaunchEnvironment(
+            base: ["CLAUDE_CODE_EFFORT_LEVEL": "max"],
+            effortLevel: .low
+        )
+
+        XCTAssertEqual(environment["CLAUDE_CODE_EFFORT_LEVEL"], "low")
     }
 
     func testNativeLaunchEnvironmentOmitsEffortEnvironmentWhenSuppressed() async {

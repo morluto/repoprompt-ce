@@ -9,7 +9,7 @@ fail() {
   exit 1
 }
 
-osascript <<APPLESCRIPT
+osascript - "$APP_PROCESS_NAME" "$WAIT_SECONDS" <<'APPLESCRIPT'
 on labelText(elementRef)
     tell application "System Events"
         set parts to {}
@@ -63,51 +63,52 @@ on clickButtonContaining(processRef, needles, requiredLabel)
     end tell
 end clickButtonContaining
 
-tell application "${APP_PROCESS_NAME}" to activate
-delay 0.5
+on run argv
+    set appProcessName to item 1 of argv
+    set waitSeconds to item 2 of argv as number
 
-tell application "System Events"
-    if not (exists process "${APP_PROCESS_NAME}") then error "${APP_PROCESS_NAME} process is not running"
-    tell process "${APP_PROCESS_NAME}"
-        set frontmost to true
-        repeat 30 times
-            if exists window 1 then exit repeat
-            delay 0.2
-        end repeat
-        if not (exists window 1) then error "${APP_PROCESS_NAME} has no front window"
+    tell application "System Events"
+        if not (exists process appProcessName) then error appProcessName & " process is not running"
+        tell process appProcessName
+            set frontmost to true
+            delay 0.5
+            repeat 30 times
+                if exists window 1 then exit repeat
+                delay 0.2
+            end repeat
+            if not (exists window 1) then error appProcessName & " has no front window"
+        end tell
     end tell
-end tell
 
--- Open the execution-location popover from the pill. The visible pill label is usually
--- "Work locally" before an Agent session is bound to a worktree.
-tell application "System Events"
-    tell process "${APP_PROCESS_NAME}"
-        my clickButtonContaining(it, {"Work locally", "Workspace checkout", "New worktree"}, "execution-location pill")
+    -- Open the execution-location popover from the pill. The visible pill label is usually
+    -- "Work locally" before an Agent session is bound to a worktree.
+    tell application "System Events"
+        set processRef to process appProcessName
+        my clickButtonContaining(processRef, {"Work locally", "Workspace checkout", "New worktree"}, "execution-location pill")
     end tell
-end tell
 
-delay ${WAIT_SECONDS}
+    delay waitSeconds
 
--- Exercise at least one option if it is present, then switch back to local when available.
-tell application "System Events"
-    tell process "${APP_PROCESS_NAME}"
-        set newWorktreeButton to my firstButtonContaining(it, {"New worktree"})
+    -- Exercise at least one option if it is present, then switch back to local when available.
+    tell application "System Events"
+        set processRef to process appProcessName
+        set newWorktreeButton to my firstButtonContaining(processRef, {"New worktree"})
         if newWorktreeButton is not missing value then
             click newWorktreeButton
             delay 0.5
         end if
-        set localButton to my firstButtonContaining(it, {"Workspace checkout", "Work locally"})
+        set localButton to my firstButtonContaining(processRef, {"Workspace checkout", "Work locally"})
         if localButton is not missing value then
             click localButton
             delay 0.5
         end if
     end tell
-end tell
 
--- If the app survived the popover open, async load, and option click path, the smoke passes.
-tell application "System Events"
-    if not (exists process "${APP_PROCESS_NAME}") then error "${APP_PROCESS_NAME} process exited during execution-location UI smoke"
-end tell
+    -- If the app survived the popover open, async load, and option click path, the smoke passes.
+    tell application "System Events"
+        if not (exists process appProcessName) then error appProcessName & " process exited during execution-location UI smoke"
+    end tell
+end run
 APPLESCRIPT
 
 printf 'OK: Agent execution-location UI smoke passed for process %s.\n' "$APP_PROCESS_NAME"

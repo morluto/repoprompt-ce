@@ -49,6 +49,19 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(environment["ANTHROPIC_SMALL_FAST_MODEL"], "h")
         XCTAssertEqual(environment["CLAUDE_CODE_SUBAGENT_MODEL"], "h")
         XCTAssertEqual(ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(config: config), ["ANTHROPIC_API_KEY"])
+        let customNoModelRemovedKeys = ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(
+            config: ClaudeCompatibleBackendID.custom.defaultPreset
+        )
+        XCTAssertTrue(customNoModelRemovedKeys.isSuperset(of: [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL"
+        ]))
+        XCTAssertFalse(customNoModelRemovedKeys.contains("ANTHROPIC_API_KEY"))
         XCTAssertEqual(defaultGLMEnvironment["ANTHROPIC_MODEL"], "glm-5.2[1m]")
         XCTAssertEqual(defaultGLMEnvironment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "1000000")
 
@@ -159,6 +172,13 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_DEFAULT_OPUS_MODEL"], "deepseek-v4-pro[1m]")
         XCTAssertEqual(deepSeekHaiku.environmentOverrides["ANTHROPIC_SMALL_FAST_MODEL"], "deepseek-v4-flash")
         XCTAssertEqual(deepSeekHaiku.environmentOverrides["CLAUDE_CODE_SUBAGENT_MODEL"], "deepseek-v4-flash")
+
+        do {
+            _ = try await deepSeekResolver.resolve(variant: .customCompatible, requestedModel: "glm-5-turbo")
+            XCTFail("Expected custom slot-mapped backends to reject GLM-only aliases")
+        } catch ClaudeCompatibleProviderError.invalidConfiguration {
+            // Expected.
+        }
 
         let runtimeConfig = ClaudeCompatibleRuntimeConfig(
             pluginID: .claudeCode,
@@ -386,6 +406,20 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         }
 
         do {
+            _ = try await resolver.resolve(variant: .glm, requestedModel: "glm-5-turbo", requestedEffort: "xhigh")
+            XCTFail("Expected glm-5-turbo with separate xhigh effort to be rejected")
+        } catch ClaudeCompatibleProviderError.invalidConfiguration {
+            // Expected.
+        }
+
+        do {
+            _ = try await resolver.resolve(variant: .glm, requestedModel: "haiku", requestedEffort: "x-high")
+            XCTFail("Expected haiku with separate x-high effort to be rejected")
+        } catch ClaudeCompatibleProviderError.invalidConfiguration {
+            // Expected.
+        }
+
+        do {
             _ = try await resolver.resolve(variant: .glm, requestedModel: "glm-5.1:xhigh")
             XCTFail("Expected glm-5.1:xhigh to be rejected")
         } catch ClaudeCompatibleProviderError.invalidConfiguration {
@@ -421,6 +455,13 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         do {
             _ = try await resolver.resolve(variant: .kimi, requestedModel: "kimi-code:xhigh")
             XCTFail("Expected no-model backend to reject effort-encoded selections")
+        } catch ClaudeCompatibleProviderError.invalidConfiguration {
+            // Expected.
+        }
+
+        do {
+            _ = try await resolver.resolve(variant: .kimi, requestedModel: "kimi-code", requestedEffort: "max")
+            XCTFail("Expected no-model backend to reject separate effort selections")
         } catch ClaudeCompatibleProviderError.invalidConfiguration {
             // Expected.
         }
