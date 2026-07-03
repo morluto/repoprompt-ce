@@ -2,6 +2,40 @@
 import XCTest
 
 final class CodexModelPollingServiceTests: XCTestCase {
+    func testActiveSubscriberStopsOwnedClientAfterRefreshAndKeepsCache() async throws {
+        let client = PollingClientSpy()
+        await client.setProcessSnapshot(.init(pid: 4242, appearsAlive: true))
+        let service = CodexModelPollingService(
+            client: client,
+            intervalNanos: 60_000_000_000,
+            stopClientOnShutdown: true,
+            stopClientWhenIdle: true,
+            stopClientAfterRefresh: true
+        )
+
+        let consumer = await makeConsumer(service: service)
+        try await waitUntil { await client.listCallCount >= 1 }
+        try await waitUntil { await client.stopCallCount >= 1 }
+
+        let snapshot = await service.runtimeSnapshot()
+        XCTAssertEqual(snapshot.subscriberCount, 1)
+        XCTAssertTrue(snapshot.isPolling)
+        XCTAssertEqual(snapshot.processSnapshot?.pid, 4242)
+        XCTAssertEqual(snapshot.processSnapshot?.appearsAlive, false)
+        let firstCachedModelIDs = await service.latestSnapshot()?.models.map(\.id)
+        XCTAssertEqual(firstCachedModelIDs, ["polling-test-model-1"])
+
+        await service.refreshNow()
+        try await waitUntil { await client.listCallCount >= 2 }
+        try await waitUntil { await client.stopCallCount >= 2 }
+        let secondCachedModelIDs = await service.latestSnapshot()?.models.map(\.id)
+        XCTAssertEqual(secondCachedModelIDs, ["polling-test-model-2"])
+
+        consumer.cancel()
+        await consumer.value
+        await service.shutdown()
+    }
+
     func testLastSubscriberStopsOwnedClientAndLaterSubscriberRestartsPolling() async throws {
         let client = PollingClientSpy()
         let service = CodexModelPollingService(
@@ -58,7 +92,18 @@ private actor PollingClientSpy: CodexModelListingClient {
 
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel] {
         listCallCount += 1
-        return []
+        processSnapshot = .init(pid: processSnapshot?.pid ?? 4242, appearsAlive: true)
+        return [
+            CodexAppServerClient.RemoteModel(
+                id: "polling-test-model-\(listCallCount)",
+                model: "polling-test-model-\(listCallCount)",
+                displayName: "Polling Test Model \(listCallCount)",
+                description: "",
+                isDefault: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: nil
+            )
+        ]
     }
 
     func stop() async {

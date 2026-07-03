@@ -29,7 +29,8 @@ actor CodexModelPollingService {
     static let shared = CodexModelPollingService(
         client: CodexProviderHelpers.makeOwnedNonAgentAppServerClient(),
         stopClientOnShutdown: true,
-        stopClientWhenIdle: true
+        stopClientWhenIdle: true,
+        stopClientAfterRefresh: true
     )
 
     struct Snapshot: Equatable {
@@ -50,6 +51,7 @@ actor CodexModelPollingService {
     private let intervalNanos: UInt64
     private let stopClientOnShutdown: Bool
     private let stopClientWhenIdle: Bool
+    private let stopClientAfterRefresh: Bool
 
     private var pollingTask: Task<Void, Never>?
     private var inFlightRefresh: Task<Void, Never>?
@@ -65,12 +67,14 @@ actor CodexModelPollingService {
         client: any CodexModelListingClient,
         intervalNanos: UInt64 = 60_000_000_000,
         stopClientOnShutdown: Bool = false,
-        stopClientWhenIdle: Bool = false
+        stopClientWhenIdle: Bool = false,
+        stopClientAfterRefresh: Bool = false
     ) {
         self.client = client
         self.intervalNanos = intervalNanos
         self.stopClientOnShutdown = stopClientOnShutdown
         self.stopClientWhenIdle = stopClientWhenIdle
+        self.stopClientAfterRefresh = stopClientAfterRefresh
     }
 
     /// Returns the most recent snapshot if available (non-blocking).
@@ -250,6 +254,9 @@ actor CodexModelPollingService {
         inFlightRefresh = task
         defer { inFlightRefresh = nil }
         await task.value
+        if stopClientAfterRefresh, !isShutdown {
+            await client.stop()
+        }
     }
 
     private func applyRefreshResult(_ snapshot: Snapshot) {
