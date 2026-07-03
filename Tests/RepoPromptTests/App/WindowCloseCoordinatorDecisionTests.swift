@@ -712,6 +712,10 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
         publishRequestObservation()
     }
 
+    func currentProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot? {
+        nil
+    }
+
     private func cancelRequest(_ requestID: UUID) {
         if let continuation = pendingRequests.removeValue(forKey: requestID) {
             continuation.resume(throwing: CancellationError())

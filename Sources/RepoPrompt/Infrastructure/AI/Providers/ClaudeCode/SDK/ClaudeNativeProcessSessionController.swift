@@ -234,6 +234,16 @@ final actor ClaudeNativeProcessSessionController {
         process != nil
     }
 
+    #if DEBUG
+        func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot? {
+            guard let process else { return nil }
+            return AgentRuntimeProcessSnapshot(
+                pid: process.pid,
+                appearsAlive: AgentRuntimeProcessSnapshot.appearsAlive(pid: process.pid)
+            )
+        }
+    #endif
+
     deinit {
         performSynchronousDeinitCleanup()
     }

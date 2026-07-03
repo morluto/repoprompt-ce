@@ -344,6 +344,19 @@ actor CodexAppServerClient {
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
     }
 
+    struct ProcessSnapshot: Equatable {
+        let pid: pid_t
+        let appearsAlive: Bool
+    }
+
+    func currentProcessSnapshot() -> ProcessSnapshot? {
+        guard let process else { return nil }
+        return ProcessSnapshot(
+            pid: process.pid,
+            appearsAlive: livenessProbe(process)
+        )
+    }
+
     func updateConfig(_ config: Config) {
         self.config = config
     }

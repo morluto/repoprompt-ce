@@ -55,6 +55,7 @@ protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
     var events: AsyncStream<CodexNativeSessionController.Event> { get }
 
+    func appServerProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot?
     func ensureEventsStreamReady()
     func startOrResume(
         existing: CodexNativeSessionController.SessionRef?,
@@ -722,6 +723,10 @@ final class CodexNativeSessionController {
             return try await requestExecutor(method, params, timeout)
         }
         return try await client.request(method: method, params: params, timeout: timeout)
+    }
+
+    func appServerProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot? {
+        await client.currentProcessSnapshot()
     }
 
     init(
@@ -8175,6 +8180,10 @@ enum CodexSessionControllerError: LocalizedError {
 }
 
 extension CodexSessionControlling {
+    func appServerProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot? {
+        nil
+    }
+
     func acknowledgePendingTurnFailure(
         turnID _: String?,
         failure _: CodexNativeSessionController.TurnFailure

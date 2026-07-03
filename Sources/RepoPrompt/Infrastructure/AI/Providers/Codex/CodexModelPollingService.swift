@@ -3,6 +3,7 @@ import Foundation
 protocol CodexModelListingClient: Sendable {
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel]
     func stop() async
+    func currentProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot?
 }
 
 extension CodexAppServerClient: CodexModelListingClient {}
@@ -36,6 +37,15 @@ actor CodexModelPollingService {
         let fetchedAt: Date
     }
 
+    struct RuntimeSnapshot: Equatable {
+        let subscriberCount: Int
+        let isPolling: Bool
+        let hasInFlightRefresh: Bool
+        let isShutdown: Bool
+        let latestFetchedAt: Date?
+        let processSnapshot: CodexAppServerClient.ProcessSnapshot?
+    }
+
     private let client: any CodexModelListingClient
     private let intervalNanos: UInt64
     private let stopClientOnShutdown: Bool
@@ -66,6 +76,17 @@ actor CodexModelPollingService {
     /// Returns the most recent snapshot if available (non-blocking).
     func latestSnapshot() -> Snapshot? {
         latest
+    }
+
+    func runtimeSnapshot() async -> RuntimeSnapshot {
+        await RuntimeSnapshot(
+            subscriberCount: continuations.count,
+            isPolling: pollingTask != nil,
+            hasInFlightRefresh: inFlightRefresh != nil,
+            isShutdown: isShutdown,
+            latestFetchedAt: latest?.fetchedAt,
+            processSnapshot: client.currentProcessSnapshot()
+        )
     }
 
     #if DEBUG

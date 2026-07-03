@@ -328,6 +328,16 @@ actor ACPAgentSessionController {
         state == .sessionOpen && process != nil && sessionID != nil
     }
 
+    #if DEBUG
+        func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot? {
+            guard let process else { return nil }
+            return AgentRuntimeProcessSnapshot(
+                pid: process.pid,
+                appearsAlive: AgentRuntimeProcessSnapshot.appearsAlive(pid: process.pid)
+            )
+        }
+    #endif
+
     func isCompatibleWith(request: ACPRunRequest) -> Bool {
         guard let providerID = request.agentKind.acpProviderID,
               provider.providerID == providerID,

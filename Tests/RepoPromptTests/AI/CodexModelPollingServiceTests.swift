@@ -54,6 +54,7 @@ final class CodexModelPollingServiceTests: XCTestCase {
 private actor PollingClientSpy: CodexModelListingClient {
     private(set) var listCallCount = 0
     private(set) var stopCallCount = 0
+    private var processSnapshot: CodexAppServerClient.ProcessSnapshot?
 
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel] {
         listCallCount += 1
@@ -62,5 +63,16 @@ private actor PollingClientSpy: CodexModelListingClient {
 
     func stop() async {
         stopCallCount += 1
+        if let snapshot = processSnapshot {
+            processSnapshot = .init(pid: snapshot.pid, appearsAlive: false)
+        }
+    }
+
+    func currentProcessSnapshot() async -> CodexAppServerClient.ProcessSnapshot? {
+        processSnapshot
+    }
+
+    func setProcessSnapshot(_ snapshot: CodexAppServerClient.ProcessSnapshot?) {
+        processSnapshot = snapshot
     }
 }

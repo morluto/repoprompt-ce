@@ -584,4 +584,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {}
+
+    #if DEBUG
+        func debugProcessSnapshot() async -> AgentRuntimeProcessSnapshot? {
+            nil
+        }
+    #endif
 }
