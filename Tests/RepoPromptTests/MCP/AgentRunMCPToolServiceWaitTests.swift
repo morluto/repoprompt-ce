@@ -27,7 +27,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 "timeout": .double(2)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             fixture.runningSnapshot,
@@ -65,7 +65,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 "timeout": .double(2)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
         let terminalRunID = UUID()
         let terminal = makeSnapshot(sessionID: fixture.sessionID, runID: terminalRunID, status: .completed)
         await liveSnapshots.set(terminal)
@@ -108,7 +108,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 "timeout": .double(2)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
         waitTask.cancel()
 
         do {
@@ -155,8 +155,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 "timeout": .double(2)
             ])
         }
-        try await waitForWaiter(registration: first.registration)
-        try await waitForWaiter(registration: second.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: first.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             second.runningSnapshot,
@@ -230,8 +230,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 "timeout": .double(2)
             ])
         }
-        try await waitForWaiter(registration: first.registration)
-        try await waitForWaiter(registration: second.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: first.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
         waitTask.cancel()
 
         do {
@@ -278,15 +278,15 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 "timeout": .double(2)
             ])
         }
-        try await waitForWaiter(registration: first.registration)
-        try await waitForWaiter(registration: second.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: first.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             second.runningSnapshot,
             cursor: second.cursor,
             reason: .instructionDelivered
         )
-        try await waitForWaiter(registration: second.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
 
         let terminal = makeSnapshot(sessionID: first.sessionID, status: .completed)
         await liveSnapshots.set(terminal)
@@ -357,7 +357,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 "timeout": .double(2)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
 
         let terminal = makeSnapshot(
             sessionID: fixture.sessionID,
@@ -487,20 +487,6 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         }
         service.testAgentModeViewModel = viewModel
         return service
-    }
-
-    private func waitForWaiter(
-        registration: AgentRunSessionStore.Registration,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) async throws {
-        for _ in 0 ..< 300 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        XCTFail("Timed out waiting for store waiter", file: file, line: line)
     }
 
     private func makeSnapshot(
