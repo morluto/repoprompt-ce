@@ -92,30 +92,51 @@ enum HistorySessionScannerError: Error, Equatable, LocalizedError {
 /// workspaces under `Workspaces/*/`. Each workspace directory is expected to contain an
 /// `AgentSessions/AgentSessionIndex.json` file.
 actor HistorySessionScanner: HistorySessionScanning {
+    private static let defaultScanCacheTTL: TimeInterval = 10 * 60
+
     private let fileManager: FileManager
     private let decoder: JSONDecoder
 
     /// Base URL for application support. Defaults to ``MCPFilesystemIdentity.applicationSupportRootURL()``.
     /// Injectable for testing.
     private let applicationSupportRoot: URL
+    private let scanCacheTTL: TimeInterval
+    private var cachedScanResults: [HistoryWorkspaceScanResult]?
+    private var cachedScanResultsAt: Date?
 
     init(
         fileManager: FileManager = .default,
         decoder: JSONDecoder = JSONDecoder(),
-        applicationSupportRoot: URL? = nil
+        applicationSupportRoot: URL? = nil,
+        scanCacheTTL: TimeInterval = HistorySessionScanner.defaultScanCacheTTL
     ) {
         self.fileManager = fileManager
         self.decoder = decoder
         self.applicationSupportRoot = applicationSupportRoot
             ?? MCPFilesystemConstants.identity.applicationSupportRootURL(fileManager: fileManager)
+        self.scanCacheTTL = scanCacheTTL
     }
 
     // MARK: - Workspace Discovery
 
     func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
+        let now = Date()
+        // History queries are usually iterative model investigations, not live tailing.
+        // Keep the expensive cross-workspace inventory warm for several minutes so
+        // list/search/time calls in the same reasoning loop do not repeatedly reopen
+        // thousands of tiny stale index files.
+        if let cachedScanResults,
+           let cachedScanResultsAt,
+           now.timeIntervalSince(cachedScanResultsAt) < scanCacheTTL
+        {
+            return cachedScanResults
+        }
+
         let workspacesRoot = applicationSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
 
         guard fileManager.fileExists(atPath: workspacesRoot.path) else {
+            cachedScanResults = []
+            cachedScanResultsAt = now
             return []
         }
 
@@ -132,9 +153,12 @@ actor HistorySessionScanner: HistorySessionScanning {
             return []
         }
 
-        return workspaceDirs.map { workspaceDir in
+        let results = workspaceDirs.map { workspaceDir in
             scanWorkspace(workspaceDir)
         }
+        cachedScanResults = results
+        cachedScanResultsAt = Date()
+        return results
     }
 
     // MARK: - Filtering
@@ -173,10 +197,12 @@ actor HistorySessionScanner: HistorySessionScanning {
                     guard record.agentModelRaw?.localizedCaseInsensitiveContains(model) == true else { continue }
                 }
 
-                // File path filter: match against keyPaths
+                // File path filter: match against keyPaths using basename/suffix-aware
+                // semantics so callers can provide a basename, repo-relative path, or
+                // absolute/worktree path without silently missing an indexed session.
                 if let filePath {
                     let matchesFile = record.keyPaths.contains { keyPath in
-                        keyPath.localizedCaseInsensitiveContains(filePath)
+                        HistoryMCPToolService.historyPath(keyPath, matches: filePath)
                     }
                     guard matchesFile else { continue }
                 }
@@ -246,71 +272,73 @@ actor HistorySessionScanner: HistorySessionScanning {
 
     private func scanWorkspace(_ workspaceDir: URL) -> HistoryWorkspaceScanResult {
         let dirName = workspaceDir.lastPathComponent
-        let (workspaceName, workspaceID) = resolveWorkspaceNameAndID(from: workspaceDir, dirName: dirName, fileManager: fileManager)
+        let fallbackIdentity = WorkspaceDirectoryName.parse(dirName)
+
+        func result(
+            records: [AgentSessionMetadataRecord] = [],
+            indexReadFailed: Bool = false,
+            indexSchemaVersion: Int? = nil,
+            identity: (name: String, id: UUID?) = fallbackIdentity
+        ) -> HistoryWorkspaceScanResult {
+            HistoryWorkspaceScanResult(
+                workspaceDir: workspaceDir,
+                workspaceName: identity.name,
+                workspaceID: identity.id,
+                records: records,
+                indexReadFailed: indexReadFailed,
+                indexSchemaVersion: indexSchemaVersion
+            )
+        }
 
         let agentSessionsDir = workspaceDir.appendingPathComponent("AgentSessions", isDirectory: true)
         guard fileManager.fileExists(atPath: agentSessionsDir.path) else {
-            // No AgentSessions directory — this workspace has no sessions.
-            return HistoryWorkspaceScanResult(
-                workspaceDir: workspaceDir,
-                workspaceName: workspaceName,
-                workspaceID: workspaceID,
-                records: [],
-                indexReadFailed: false,
-                indexSchemaVersion: nil
-            )
+            // No AgentSessions directory — this workspace has no sessions. Avoid reading
+            // workspace.json on the cold scan path; the directory name is sufficient.
+            return result()
         }
 
         let indexFile = agentSessionsDir.appendingPathComponent("AgentSessionIndex.json")
         guard fileManager.fileExists(atPath: indexFile.path) else {
             // No index file — return empty records (no failure flag; index may not exist yet).
-            return HistoryWorkspaceScanResult(
-                workspaceDir: workspaceDir,
-                workspaceName: workspaceName,
-                workspaceID: workspaceID,
-                records: [],
-                indexReadFailed: false,
-                indexSchemaVersion: nil
-            )
+            return result()
         }
 
         do {
             let data = try Data(contentsOf: indexFile, options: .mappedIfSafe)
-            let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
-
-            // Reject stale indexes whose schema version doesn't match the current version.
-            // Older indexes decode successfully but their v4+ fields (keyPaths,
-            // activeDurationSeconds, toolCallCount, etc.) fall back to empty/zero
-            // defaults, producing misleading records.
-            if index.schemaVersion != AgentSessionMetadataIndex.currentSchemaVersion {
-                return HistoryWorkspaceScanResult(
-                    workspaceDir: workspaceDir,
-                    workspaceName: workspaceName,
-                    workspaceID: workspaceID,
-                    records: [],
-                    indexReadFailed: false,
-                    indexSchemaVersion: index.schemaVersion
-                )
+            guard let schemaVersion = schemaVersionSniff(from: data) else {
+                return result(indexReadFailed: true)
             }
 
-            return HistoryWorkspaceScanResult(
-                workspaceDir: workspaceDir,
-                workspaceName: workspaceName,
-                workspaceID: workspaceID,
-                records: index.entries,
-                indexReadFailed: false,
-                indexSchemaVersion: nil
-            )
+            // Reject stale indexes before full metadata decode. Most user installs carry many
+            // tiny stale indexes; fully decoding them dominates cold history scans even though
+            // the records will be discarded immediately afterward.
+            guard schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
+                return result(indexSchemaVersion: schemaVersion)
+            }
+
+            let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
+            let identity = resolveWorkspaceNameAndID(from: workspaceDir, dirName: dirName, fileManager: fileManager)
+            return result(records: index.entries, identity: identity)
         } catch {
-            return HistoryWorkspaceScanResult(
-                workspaceDir: workspaceDir,
-                workspaceName: workspaceName,
-                workspaceID: workspaceID,
-                records: [],
-                indexReadFailed: true,
-                indexSchemaVersion: nil
-            )
+            return result(indexReadFailed: true)
         }
+    }
+
+    private nonisolated func schemaVersionSniff(from data: Data) -> Int? {
+        guard let text = String(data: data, encoding: .utf8),
+              let keyRange = text.range(of: "\"schemaVersion\"")
+        else { return nil }
+        guard let colon = text[keyRange.upperBound...].firstIndex(of: ":") else { return nil }
+        var index = text.index(after: colon)
+        while index < text.endIndex, text[index].isWhitespace {
+            index = text.index(after: index)
+        }
+        let start = index
+        while index < text.endIndex, text[index].isNumber || text[index] == "-" {
+            index = text.index(after: index)
+        }
+        guard start < index else { return nil }
+        return Int(text[start ..< index])
     }
 
     /// Resolve workspace name and ID from the directory.

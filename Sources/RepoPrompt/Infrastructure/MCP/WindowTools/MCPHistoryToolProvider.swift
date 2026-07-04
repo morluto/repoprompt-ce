@@ -8,7 +8,7 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
     let group: MCPWindowToolGroup = .history
 
     private let runtime: MCPWindowToolRuntime
-    private let scannerFactory: @Sendable () -> any HistorySessionScanning
+    private let scanner: any HistorySessionScanning
 
     init(
         runtime: MCPWindowToolRuntime,
@@ -16,7 +16,7 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
         scannerFactory: @escaping @Sendable () -> any HistorySessionScanning = { HistorySessionScanner() }
     ) {
         self.runtime = runtime
-        self.scannerFactory = scannerFactory
+        scanner = scannerFactory()
     }
 
     func buildTools() -> [Tool] {
@@ -83,7 +83,7 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                 required: ["op"]
             )
         ) { _, args in
-            let reply = try await HistoryMCPToolService.execute(args: args, scanner: self.scannerFactory())
+            let reply = try await HistoryMCPToolService.execute(args: args, scanner: self.scanner)
             return try Self.encode(reply)
         }
     }

@@ -253,17 +253,27 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(loads, 0, "indexed records must not trigger transcript loads")
     }
 
-    func testListSessions_surfacesSkippedWorkspaceDiagnostics() async throws {
+    func testListSessions_surfacesAggregatedSkippedWorkspaceDiagnostics() async throws {
         let record = makeRecord(name: "OK", keyPaths: ["ok.swift"])
         mockScanner.scanResults = [
             makeScanResult(workspaceName: "OKWorkspace", records: [record]),
             makeScanResult(workspaceName: "Unreadable", indexReadFailed: true),
+            makeScanResult(workspaceName: "Unreadable", indexReadFailed: true),
+            makeScanResult(workspaceName: "Stale", indexSchemaVersion: 4),
             makeScanResult(workspaceName: "Stale", indexSchemaVersion: 4)
         ]
 
         let result = try await HistoryMCPToolService.execute(args: ["op": "list_sessions"], scanner: mockScanner)
         let dto = try listReply(result)
-        XCTAssertEqual(dto.skippedWorkspaces, ["Unreadable: unreadable index", "Stale: stale index schema v4"])
+        XCTAssertEqual(dto.skippedWorkspaces, ["unreadable index: 2", "stale index schema v4: 2"])
+    }
+
+    func testHistoryPathMatchingAcceptsBasenameSuffixAndAbsoluteQueries() {
+        let keyPath = "Sources/RepoPrompt/Features/AgentMode/History/HistoryMCPToolService.swift"
+        XCTAssertTrue(HistoryMCPToolService.historyPath(keyPath, matches: "HistoryMCPToolService.swift"))
+        XCTAssertTrue(HistoryMCPToolService.historyPath(keyPath, matches: "Features/AgentMode/History/HistoryMCPToolService.swift"))
+        XCTAssertTrue(HistoryMCPToolService.historyPath(keyPath, matches: "/tmp/worktree/Sources/RepoPrompt/Features/AgentMode/History/HistoryMCPToolService.swift"))
+        XCTAssertFalse(HistoryMCPToolService.historyPath(keyPath, matches: "HistorySessionScanner.swift"))
     }
 
     func testListSessions_invalidSort_returnsError() async throws {

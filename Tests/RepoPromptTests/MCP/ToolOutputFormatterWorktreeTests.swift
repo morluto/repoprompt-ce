@@ -705,6 +705,49 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
     }
 
+    func testHistoryFormatterTreatsNoMatchesAsSuccessfulEmptyResult() throws {
+        struct HistoryList: Encodable {
+            let total_sessions = 0
+            let truncated = false
+            let sessions_scanned = 20
+            let scan_truncated = true
+            let skipped_workspaces: [String] = []
+            let sessions: [String] = []
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("list_sessions"), "touched_file": .string("Sources/App.swift")],
+            value: Self.value(HistoryList())
+        ))
+        XCTAssertTrue(text.contains("## History Sessions ✅"))
+        XCTAssertTrue(text.contains("No matching sessions found"))
+        XCTAssertTrue(text.contains("touched_file"))
+        XCTAssertFalse(text.contains("## History Sessions ❌"))
+    }
+
+    func testHistoryFormatterSummarizesSkippedWorkspaces() throws {
+        struct HistoryList: Encodable {
+            let total_sessions = 1
+            let truncated = false
+            let sessions_scanned = 1
+            let scan_truncated = false
+            let skipped_workspaces = [
+                "stale index schema v2: 2",
+                "unreadable index: 1"
+            ]
+            let sessions: [String] = []
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("list_sessions")],
+            value: Self.value(HistoryList())
+        ))
+        XCTAssertTrue(text.contains("- **Skipped workspaces**: 3"))
+        XCTAssertTrue(text.contains("stale index schema v2: 2"))
+        XCTAssertTrue(text.contains("unreadable index: 1"))
+        XCTAssertFalse(text.contains("Workspace A: stale index schema v2; Workspace B"))
+    }
+
     func testHistoryFormatterUsesCompactMarkdownInsteadOfGenericJSON() throws {
         struct HistorySession: Encodable {
             let session_id = "ABC"

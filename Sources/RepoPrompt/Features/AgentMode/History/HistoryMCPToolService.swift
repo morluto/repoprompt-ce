@@ -94,7 +94,7 @@ enum HistoryMCPToolService {
             let totalSessions: Int
             if let filePathFilter {
                 hydrated = hydrated.filter { session in
-                    session.record.keyPaths.contains { $0.localizedCaseInsensitiveContains(filePathFilter) }
+                    session.record.keyPaths.contains { historyPath($0, matches: filePathFilter) }
                 }
                 totalSessions = hydrated.count
             } else {
@@ -838,17 +838,45 @@ enum HistoryMCPToolService {
         return String(text.prefix(maxLength - 1)) + "…"
     }
 
+    static func historyPath(_ keyPath: String, matches query: String) -> Bool {
+        let normalizedKey = normalizedHistoryPath(keyPath)
+        let normalizedQuery = normalizedHistoryPath(query)
+        guard !normalizedKey.isEmpty, !normalizedQuery.isEmpty else { return false }
+
+        if normalizedKey == normalizedQuery { return true }
+        if normalizedKey.hasSuffix("/\(normalizedQuery)") { return true }
+        if normalizedQuery.hasSuffix("/\(normalizedKey)") { return true }
+        if URL(fileURLWithPath: normalizedKey).lastPathComponent == normalizedQuery { return true }
+        if URL(fileURLWithPath: normalizedQuery).lastPathComponent == normalizedKey { return true }
+        return normalizedKey.localizedCaseInsensitiveContains(normalizedQuery)
+    }
+
+    private static func normalizedHistoryPath(_ path: String) -> String {
+        path.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .joined(separator: "/")
+            .lowercased()
+    }
+
     private static func scanDiagnostics(from scanResults: [HistoryWorkspaceScanResult]) -> [String] {
-        let diagnostics = scanResults.compactMap { result -> String? in
-            if result.indexReadFailed {
-                return "\(result.workspaceName): unreadable index"
+        var counts: [String: Int] = [:]
+        var order: [String] = []
+        for result in scanResults {
+            let reason: String? = if result.indexReadFailed {
+                "unreadable index"
+            } else if let schemaVersion = result.indexSchemaVersion {
+                "stale index schema v\(schemaVersion)"
+            } else {
+                nil
             }
-            if let schemaVersion = result.indexSchemaVersion {
-                return "\(result.workspaceName): stale index schema v\(schemaVersion)"
-            }
-            return nil
+            guard let reason else { continue }
+            if counts[reason] == nil { order.append(reason) }
+            counts[reason, default: 0] += 1
         }
-        return Array(diagnostics.prefix(10))
+        return order.prefix(10).map { reason in
+            "\(reason): \(counts[reason] ?? 0)"
+        }
     }
 
     static func clampLimit(_ value: Int?, default defaultValue: Int, max maxValue: Int) -> Int {

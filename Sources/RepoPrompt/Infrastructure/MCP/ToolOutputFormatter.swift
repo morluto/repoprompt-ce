@@ -967,8 +967,12 @@ extension ToolOutputFormatter {
         case "list_sessions":
             let total = object["total_sessions"]?.intValue ?? 0
             let sessions = object["sessions"]?.arrayValue ?? []
-            lines.append("## History Sessions \(statusIcon(success: total > 0))")
+            lines.append("## History Sessions \(statusIcon(success: true))")
             lines.append("- **Total sessions**: \(total) • **Returned**: \(sessions.count)")
+            if total == 0 { lines.append("- **Status**: No matching sessions found") }
+            if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
+                lines.append("- **Hint**: `touched_file` matches basenames, suffixes, repo-relative paths, and absolute/worktree paths.")
+            }
             appendHistoryScanMetadata(object, to: &lines)
             for sessionValue in sessions.prefix(20) {
                 guard let session = sessionValue.objectValue else { continue }
@@ -985,8 +989,9 @@ extension ToolOutputFormatter {
         case "search":
             let total = object["total_matches"]?.intValue ?? 0
             let results = object["results"]?.arrayValue ?? []
-            lines.append("## History Search \(statusIcon(success: total > 0))")
+            lines.append("## History Search \(statusIcon(success: true))")
             lines.append("- **Total matches**: \(total) • **Returned**: \(results.count)")
+            if total == 0 { lines.append("- **Status**: No matching turns found") }
             appendHistoryScanMetadata(object, to: &lines)
             for resultValue in results.prefix(20) {
                 guard let result = resultValue.objectValue else { continue }
@@ -1000,8 +1005,9 @@ extension ToolOutputFormatter {
             let totalSessions = object["total_sessions"]?.intValue ?? 0
             let totalDuration = object["total_active_duration_seconds"]?.intValue ?? 0
             let groups = object["groups"]?.arrayValue ?? []
-            lines.append("## History Time \(statusIcon(success: totalSessions > 0))")
+            lines.append("## History Time \(statusIcon(success: true))")
             lines.append("- **Total sessions**: \(totalSessions) • **Active duration**: \(totalDuration)s • **Groups**: \(groups.count)")
+            if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
             appendHistoryScanMetadata(object, to: &lines)
             for groupValue in groups.prefix(20) {
                 guard let group = groupValue.objectValue else { continue }
@@ -1022,7 +1028,40 @@ extension ToolOutputFormatter {
         if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
         let skipped = object["skipped_workspaces"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        if !skipped.isEmpty { lines.append("- **Skipped workspaces**: \(skipped.joined(separator: "; "))") }
+        if !skipped.isEmpty {
+            lines.append(historySkippedWorkspacesSummary(skipped))
+        }
+    }
+
+    private static func historySkippedWorkspacesSummary(_ skipped: [String]) -> String {
+        var counts: [String: Int] = [:]
+        var order: [String] = []
+        for item in skipped {
+            let parsed = parseHistorySkippedWorkspaceDiagnostic(item)
+            if counts[parsed.reason] == nil { order.append(parsed.reason) }
+            counts[parsed.reason, default: 0] += parsed.count
+        }
+        let totalSkipped = counts.values.reduce(0, +)
+        let details = order.prefix(3).map { reason in
+            "\(reason): \(counts[reason] ?? 0)"
+        }.joined(separator: "; ")
+        var line = "- **Skipped workspaces**: \(totalSkipped)"
+        if !details.isEmpty { line += " (\(details))" }
+        if order.count > 3 { line += "; +\(order.count - 3) more reason\(order.count - 3 == 1 ? "" : "s")" }
+        return line
+    }
+
+    private static func parseHistorySkippedWorkspaceDiagnostic(_ item: String) -> (reason: String, count: Int) {
+        if let separator = item.range(of: ": ", options: .backwards) {
+            let tail = item[separator.upperBound...]
+            if let count = Int(tail) {
+                return (String(item[..<separator.lowerBound]), count)
+            }
+        }
+        if let separator = item.range(of: ": ") {
+            return (String(item[separator.upperBound...]), 1)
+        }
+        return (item, 1)
     }
 
     // MARK: - App Settings
