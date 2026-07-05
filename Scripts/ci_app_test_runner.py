@@ -17,7 +17,13 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, TextIO
+from typing import Any, Callable, Iterable, Sequence, TextIO
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from test_suite_optimizer import OptimizerError, ci_suite_plan
 
 DEFAULT_SUITE_TIMEOUT_SECONDS = 180.0
 DEFAULT_SILENT_TIMEOUT_RETRIES = 1
@@ -64,6 +70,23 @@ class OutputState:
                 first_failure_line=self.first_failure_line,
                 last_started_test=self.last_started_test,
             )
+
+
+@dataclass(frozen=True)
+class SuitePlanEntry:
+    suite: str
+    estimated_seconds: float
+    batch_eligible: bool
+
+
+@dataclass(frozen=True)
+class SuiteGroup:
+    suites: tuple[str, ...]
+    estimated_seconds: float
+
+    @property
+    def label(self) -> str:
+        return self.suites[0] if len(self.suites) == 1 else "+".join(self.suites)
 
 
 @dataclass(frozen=True)
@@ -338,6 +361,58 @@ def create_suite_process(
     )
 
 
+def suite_filter_regex(suites: Sequence[str]) -> str:
+    if not suites:
+        raise ValueError("cannot build a suite filter without suites")
+    if len(suites) == 1:
+        return suites[0]
+    return "^(?:" + "|".join(re.escape(suite) for suite in suites) + ")$"
+
+
+def create_suite_group_process(
+    suites: Sequence[str],
+    *,
+    swift_binary: str,
+    cwd: Path | None,
+    test_bundle: Path | None = None,
+    xctest_binary: list[str] | None = None,
+) -> subprocess.Popen[str]:
+    if not suites:
+        raise ValueError("cannot run an empty suite group")
+    if len(suites) == 1:
+        return create_suite_process(
+            suites[0],
+            swift_binary=swift_binary,
+            cwd=cwd,
+            test_bundle=test_bundle,
+            xctest_binary=xctest_binary,
+        )
+    if test_bundle is not None:
+        xctest_prefix = xctest_binary if xctest_binary is not None else ["xcrun", "xctest"]
+        filters: list[str] = []
+        for suite in suites:
+            filters.extend(["-XCTest", suite])
+        return subprocess.Popen(
+            [*xctest_prefix, *filters, str(test_bundle)],
+            cwd=cwd,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    return subprocess.Popen(
+        [swift_binary, "test", "--skip-build", "--filter", suite_filter_regex(suites)],
+        cwd=cwd,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+
+
 def relay_output(process: subprocess.Popen[str], state: OutputState, output: TextIO) -> None:
     stream = process.stdout
     if stream is None:
@@ -537,6 +612,108 @@ def report_suite_result(result: SuiteRunResult, output: TextIO) -> None:
     )
 
 
+def validate_shard_args(shard_count: int, shard_index: int) -> None:
+    if shard_count <= 0:
+        raise ValueError("--shard-count must be greater than zero")
+    if shard_index < 1 or shard_index > shard_count:
+        raise ValueError("--shard-index must be between 1 and --shard-count")
+
+
+def plan_selected_suites(
+    suites: Sequence[str],
+    *,
+    ledger: Path | None,
+    shard_count: int,
+    shard_index: int,
+    strict_ledger: bool,
+    slow_first: bool,
+    batch_max_seconds: float,
+    require_runtime_for_batching: bool,
+) -> tuple[list[SuitePlanEntry], dict[str, Any] | None]:
+    validate_shard_args(shard_count, shard_index)
+    if ledger is None:
+        ordered = sorted(suites)
+        return [
+            SuitePlanEntry(suite=suite, estimated_seconds=1.0, batch_eligible=False)
+            for suite in ordered
+        ], None
+    plan = ci_suite_plan(
+        ledger,
+        shard_count,
+        suites=suites,
+        batch_max_seconds=batch_max_seconds,
+        require_runtime_for_batching=require_runtime_for_batching,
+    )
+    missing = list(plan.get("missing_suites") or [])
+    if strict_ledger and missing:
+        raise ValueError(f"ledger is missing discovered suites: {missing[:10]}")
+    entries_by_suite: dict[str, SuitePlanEntry] = {}
+    for shard in plan["shards"]:
+        for entry in shard["suites"]:
+            entries_by_suite[str(entry["suite"])] = SuitePlanEntry(
+                suite=str(entry["suite"]),
+                estimated_seconds=float(entry["estimated_seconds"]),
+                batch_eligible=bool(entry["batch_eligible"]),
+            )
+    selected_shard = plan["shards"][shard_index - 1]
+    selected = [entries_by_suite[str(entry["suite"])] for entry in selected_shard["suites"]]
+    if slow_first:
+        selected.sort(key=lambda entry: (-entry.estimated_seconds, entry.suite))
+    else:
+        selected.sort(key=lambda entry: entry.suite)
+    return selected, plan
+
+
+def batch_suite_entries(
+    entries: Sequence[SuitePlanEntry],
+    *,
+    batch_fast_suites: bool,
+    batch_max_suites: int,
+    batch_max_seconds: float,
+    bundle_selector: Callable[[str], Path | None],
+) -> list[SuiteGroup]:
+    if batch_max_suites <= 0:
+        raise ValueError("--batch-max-suites must be greater than zero")
+    if batch_max_seconds <= 0:
+        raise ValueError("--batch-max-seconds must be greater than zero")
+    groups: list[SuiteGroup] = []
+    pending: list[SuitePlanEntry] = []
+    pending_bundle: Path | None = None
+
+    def flush() -> None:
+        nonlocal pending, pending_bundle
+        if pending:
+            groups.append(
+                SuiteGroup(
+                    tuple(entry.suite for entry in pending),
+                    sum(entry.estimated_seconds for entry in pending),
+                )
+            )
+            pending = []
+            pending_bundle = None
+
+    for entry in entries:
+        selected_bundle = bundle_selector(entry.suite)
+        if not batch_fast_suites or not entry.batch_eligible:
+            flush()
+            groups.append(SuiteGroup((entry.suite,), entry.estimated_seconds))
+            continue
+        if (
+            pending
+            and (
+                len(pending) >= batch_max_suites
+                or sum(item.estimated_seconds for item in pending) + entry.estimated_seconds > batch_max_seconds
+                or selected_bundle != pending_bundle
+            )
+        ):
+            flush()
+        pending.append(entry)
+        pending_bundle = selected_bundle
+    flush()
+    return groups
+
+
+
 def run_all_suites(
     suites: Iterable[str],
     *,
@@ -549,7 +726,17 @@ def run_all_suites(
     test_bundle: Path | None = None,
     test_bundles: dict[str, Path] | None = None,
     xctest_binary: list[str] | None = None,
+    ledger: Path | None = None,
+    shard_count: int = 1,
+    shard_index: int = 1,
+    strict_ledger: bool = False,
+    slow_first: bool = False,
+    batch_fast_suites: bool = False,
+    batch_max_suites: int = 4,
+    batch_max_seconds: float = 5.0,
+    require_runtime_for_batching: bool = True,
 ) -> int:
+    suite_list = list(suites)
     passed_results: list[SuiteRunResult] = []
     if test_bundle is not None:
         print(
@@ -564,19 +751,51 @@ def run_all_suites(
             flush=True,
             file=output,
         )
-    for suite in suites:
-        selected_bundle = test_bundle if test_bundle is not None else bundle_for_suite(suite, test_bundles)
+    try:
+        selected_entries, plan = plan_selected_suites(
+            suite_list,
+            ledger=ledger,
+            shard_count=shard_count,
+            shard_index=shard_index,
+            strict_ledger=strict_ledger,
+            slow_first=slow_first,
+            batch_max_seconds=batch_max_seconds,
+            require_runtime_for_batching=require_runtime_for_batching,
+        )
+        groups = batch_suite_entries(
+            selected_entries,
+            batch_fast_suites=batch_fast_suites,
+            batch_max_suites=batch_max_suites,
+            batch_max_seconds=batch_max_seconds,
+            bundle_selector=lambda suite: (
+                test_bundle if test_bundle is not None else bundle_for_suite(suite, test_bundles)
+            ),
+        )
+    except (OptimizerError, ValueError) as error:
+        print(f"::error::{error}", flush=True, file=output)
+        return 1
+    if ledger is not None:
+        total = plan["shards"][shard_index - 1]["estimated_seconds"] if plan is not None else 0.0
+        print(
+            f"Selected app test shard {shard_index}/{shard_count}: "
+            f"{len(selected_entries)} suites, estimated {total:.1f}s, {len(groups)} process groups",
+            flush=True,
+            file=output,
+        )
+    for group in groups:
+        suite = group.label
+        selected_bundle = test_bundle if test_bundle is not None else bundle_for_suite(group.suites[0], test_bundles)
         if test_bundles is not None and selected_bundle is None:
             print(
-                f"::error::No XCTest bundle found for suite target {test_target_for_suite(suite)} "
+                f"::error::No XCTest bundle found for suite target {test_target_for_suite(group.suites[0])} "
                 f"while routing {suite}; available bundles: {sorted(test_bundles)}",
                 flush=True,
                 file=output,
             )
             return 1
         print(f"::group::{suite}", flush=True, file=output)
-        process_factory = lambda selected_suite: create_suite_process(  # noqa: E731
-            selected_suite,
+        process_factory = lambda _selected_suite: create_suite_group_process(  # noqa: E731
+            group.suites,
             swift_binary=swift_binary,
             cwd=cwd,
             test_bundle=selected_bundle,
@@ -630,6 +849,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Exact built .xctest bundle name to auto-select when multiple bundles exist, "
         "for example RepoPromptTests.xctest.",
     )
+    parser.add_argument("--ledger", type=Path, default=None)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=1)
+    parser.add_argument("--strict-ledger", action="store_true", default=False)
+    parser.add_argument("--slow-first", action="store_true", default=False)
+    parser.add_argument("--batch-fast-suites", action="store_true", default=False)
+    parser.add_argument("--batch-max-suites", type=int, default=4)
+    parser.add_argument("--batch-max-seconds", type=float, default=5.0)
+    parser.add_argument("--require-runtime-for-batching", action="store_true", default=False)
     parser.add_argument(
         "--no-xctest-bundle",
         action="store_true",
@@ -696,6 +924,15 @@ def main(argv: list[str]) -> int:
         test_bundle=test_bundle,
         test_bundles=test_bundles,
         xctest_binary=xctest_binary,
+        ledger=args.ledger,
+        shard_count=args.shard_count,
+        shard_index=args.shard_index,
+        strict_ledger=args.strict_ledger,
+        slow_first=args.slow_first,
+        batch_fast_suites=args.batch_fast_suites,
+        batch_max_suites=args.batch_max_suites,
+        batch_max_seconds=args.batch_max_seconds,
+        require_runtime_for_batching=args.require_runtime_for_batching or args.batch_fast_suites,
     )
 
 
