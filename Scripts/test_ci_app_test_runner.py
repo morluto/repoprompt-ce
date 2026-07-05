@@ -872,7 +872,7 @@ class CIAppTestRunnerTests(unittest.TestCase):
             ],
         )
 
-    def test_create_suite_group_process_repeats_xctest_filters_for_batch(self) -> None:
+    def test_create_suite_group_process_uses_single_comma_separated_xctest_filter_for_batch(self) -> None:
         captured_args: list[list[str]] = []
 
         class FakePopen:
@@ -897,9 +897,7 @@ class CIAppTestRunnerTests(unittest.TestCase):
             [
                 "/usr/bin/xctest",
                 "-XCTest",
-                "RepoPromptTests.A",
-                "-XCTest",
-                "RepoPromptTests.B",
+                "RepoPromptTests.A,RepoPromptTests.B",
                 str(bundle),
             ],
         )
@@ -953,7 +951,16 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertIn("::group::RepoPromptTests.A+RepoPromptTests.B", output.getvalue())
         self.assertIn("RepoPromptTests.B testOne", output.getvalue())
 
-    def test_create_suite_group_process_uses_anchored_swift_filter_without_bundle(self) -> None:
+    def test_suite_filter_regex_matches_swiftpm_suite_method_identifiers(self) -> None:
+        pattern = ci_app_test_runner.suite_filter_regex(["RepoPromptTests.A", "RepoPromptTests.B"])
+
+        self.assertRegex("RepoPromptTests.A/testOne", pattern)
+        self.assertRegex("RepoPromptTests.B/testTwo", pattern)
+        self.assertRegex("RepoPromptTests.A", pattern)
+        self.assertNotRegex("RepoPromptTests.Ab/testOne", pattern)
+        self.assertNotRegex("OtherTests.A/testOne", pattern)
+
+    def test_create_suite_group_process_uses_suite_prefix_swift_filter_without_bundle(self) -> None:
         captured_args: list[list[str]] = []
 
         class FakePopen:
@@ -977,7 +984,7 @@ class CIAppTestRunnerTests(unittest.TestCase):
                 "test",
                 "--skip-build",
                 "--filter",
-                "^(?:RepoPromptTests\\.A|RepoPromptTests\\.B)$",
+                "^(?:RepoPromptTests\\.A|RepoPromptTests\\.B)(/|$)",
             ],
         )
 

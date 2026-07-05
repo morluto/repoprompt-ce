@@ -391,7 +391,7 @@ def suite_filter_regex(suites: Sequence[str]) -> str:
         raise ValueError("cannot build a suite filter without suites")
     if len(suites) == 1:
         return suites[0]
-    return "^(?:" + "|".join(re.escape(suite) for suite in suites) + ")$"
+    return "^(?:" + "|".join(re.escape(suite) for suite in suites) + r")(/|$)"
 
 
 def create_suite_group_process(
@@ -414,11 +414,9 @@ def create_suite_group_process(
         )
     if test_bundle is not None:
         xctest_prefix = xctest_binary if xctest_binary is not None else ["xcrun", "xctest"]
-        filters: list[str] = []
-        for suite in suites:
-            filters.extend(["-XCTest", suite])
+        filter_list = ",".join(suites)
         return subprocess.Popen(
-            [*xctest_prefix, *filters, str(test_bundle)],
+            [*xctest_prefix, "-XCTest", filter_list, str(test_bundle)],
             cwd=cwd,
             start_new_session=True,
             stdout=subprocess.PIPE,
