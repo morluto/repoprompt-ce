@@ -12,15 +12,15 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertNil(MCPToolAdmissionPolicy.classification(forCanonicalToolName: "future_unreviewed_tool"))
         XCTAssertNil(ServerNetworkManager.callLane(forCanonicalToolName: "future_unreviewed_tool"))
 
-        // history is read-only (list_sessions/search/time) but `search` can load up to
-        // maxSessionsScanned transcripts, so it rides the small-read lane whose per-window
-        // cap (2) bounds concurrent heavy reads more tightly than file_search.
+        // Cheap read-only tools sharing a tight per-window cap. history is excluded:
+        // `search`/calendar `time` can decode up to maxSessionsScanned transcripts on the
+        // shared scanner actor — heavier than these per-file reads, so history rides the
+        // .control lane to avoid starving read_file/get_code_structure under the small-read cap.
         assertClass(.smallRead, tools: [
             MCPWindowToolName.getCodeStructure,
             MCPWindowToolName.getFileTree,
             MCPWindowToolName.readFile,
-            MCPWindowToolName.oracleChatLog,
-            MCPWindowToolName.history
+            MCPWindowToolName.oracleChatLog
         ])
         assertClass(.gitRead, tools: [MCPWindowToolName.git])
         assertClass(.fileSearch, tools: [MCPWindowToolName.search])
@@ -35,7 +35,8 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
             MCPWindowToolName.agentManage,
             MCPWindowToolName.shareThoughts,
             MCPWindowToolName.setStatus,
-            MCPWindowToolName.waitForNextInstruction
+            MCPWindowToolName.waitForNextInstruction,
+            MCPWindowToolName.history
         ])
         assertClass(.exclusive, tools: [
             MCPGlobalToolName.appSettings,
