@@ -608,14 +608,30 @@ def source_domains_for_changed_path(path: str) -> set[str]:
     return set()
 
 
-def changed_files_for_range(repo_root: Path, range_spec: str) -> list[str]:
+DEFAULT_IMPACTED_RANGE = "default"
+DEFAULT_IMPACTED_BRANCH_RANGE = "origin/main...HEAD"
+
+
+def changed_files_for_git_diff(repo_root: Path, args: Sequence[str], label: str) -> list[str]:
     completed = run_command(
-        ["git", "diff", "--name-only", "--diff-filter=ACMRT", range_spec, "--"],
+        ["git", "diff", "--name-only", "--diff-filter=ACMRT", *args, "--"],
         repo_root,
     )
     if completed.returncode != 0:
-        raise OptimizerError(f"git diff failed for {range_spec}: {completed.stderr.strip()}")
-    return sorted(path for path in completed.stdout.splitlines() if path)
+        raise OptimizerError(f"git diff failed for {label}: {completed.stderr.strip()}")
+    return [path for path in completed.stdout.splitlines() if path]
+
+
+def changed_files_for_range(repo_root: Path, range_spec: str) -> list[str]:
+    if range_spec == DEFAULT_IMPACTED_RANGE:
+        branch_changed = changed_files_for_git_diff(
+            repo_root,
+            [DEFAULT_IMPACTED_BRANCH_RANGE],
+            DEFAULT_IMPACTED_BRANCH_RANGE,
+        )
+        worktree_changed = changed_files_for_git_diff(repo_root, [], "worktree")
+        return sorted(set(branch_changed).union(worktree_changed))
+    return sorted(set(changed_files_for_git_diff(repo_root, [range_spec], range_spec)))
 
 
 def listed_root_test_ids(repo_root: Path) -> tuple[set[str], str]:
@@ -656,11 +672,12 @@ def impacted_tests(
     if validate_live_list:
         live_ids, list_log_path = listed_root_test_ids(repo_root)
         ledger_ids = {row.method_id for row in rows}
+        missing = sorted(live_ids - ledger_ids)
         stale = sorted(ledger_ids - live_ids)
-        if stale:
+        if missing or stale:
             raise OptimizerError(
-                f"ledger contains {len(stale)} root rows absent from live dev-test-list; "
-                f"examples={stale[:5]} list_log={list_log_path}"
+                f"ledger mismatch against live dev-test-list: missing={len(missing)} stale={len(stale)} "
+                f"missing_examples={missing[:5]} stale_examples={stale[:5]} list_log={list_log_path}"
             )
     changed = changed_files_for_range(repo_root, range_spec)
     selected: dict[str, set[str]] = defaultdict(set)
@@ -671,10 +688,6 @@ def impacted_tests(
     for path in changed:
         if path.startswith(BROAD_IMPACT_PATH_PREFIXES):
             broad_reasons.append(f"{path}: broad test/build/tooling boundary")
-        if path.startswith("Tests/RepoPromptTests/") and path.endswith(".swift"):
-            for row in rows:
-                if row.file == path:
-                    selected[row.method_id].add(f"{path}: changed test file")
         for domain in source_domains_for_changed_path(path):
             domains.add(domain)
     if broad_reasons:
@@ -701,7 +714,7 @@ def impacted_tests(
         if row.domain in domains or any(row.domain.startswith(f"{domain}/") for domain in domains):
             selected[row.method_id].add(f"domain impacted by changed sources: {row.domain}")
         if row.file in files:
-            selected[row.method_id].add(f"{row.file}: changed ledger test file")
+            selected[row.method_id].add(f"{row.file}: changed test file")
     selected_rows = {row.method_id: row for row in rows if row.method_id in selected}
     for method_id, row in list(selected_rows.items()):
         if row.execution_tier in HEAVY_TEST_EXECUTION_TIERS and not include_heavy:
@@ -2072,7 +2085,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="select and optionally run impacted root XCTest methods from git diff and the contract ledger",
     )
     impacted_parser.add_argument("--ledger", type=Path, required=True)
-    impacted_parser.add_argument("--range", dest="range_spec", default="HEAD", help="git diff range/spec")
+    impacted_parser.add_argument(
+        "--range",
+        dest="range_spec",
+        default=DEFAULT_IMPACTED_RANGE,
+        help="git diff range/spec; default unions origin/main...HEAD with working-tree changes",
+    )
     impacted_parser.add_argument(
         "--include-heavy",
         action="store_true",

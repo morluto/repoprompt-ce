@@ -584,6 +584,27 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertEqual(captured["test_bundles"], bundles)
         self.assertEqual(captured["xctest_binary"], ["/usr/bin/xctest"])
 
+    def test_main_rejects_single_discovered_bundle_for_mismatched_suite_targets(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                ci_app_test_runner,
+                "list_suites",
+                return_value=["RepoPromptWorkspaceTests.B"],
+            ),
+            mock.patch.object(
+                ci_app_test_runner,
+                "discover_test_bundles",
+                return_value={"RepoPromptTests": Path("/fake/RepoPromptTests.xctest")},
+            ),
+            mock.patch.object(ci_app_test_runner, "xctest_binary_path", return_value=["/usr/bin/xctest"]),
+            mock.patch("sys.stdout", output),
+        ):
+            exit_code = ci_app_test_runner.main([])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("No XCTest bundle found for suite target RepoPromptWorkspaceTests", output.getvalue())
+
     def test_main_rejects_bundle_name_when_list_contains_other_targets(self) -> None:
         output = io.StringIO()
         with (

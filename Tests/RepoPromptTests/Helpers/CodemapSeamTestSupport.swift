@@ -1402,7 +1402,8 @@ final class CodemapSelectionGraphProbe: @unchecked Sendable {
         let graphs = lock.withLock { Array(graphsByRootEpoch.values) }
         var count: UInt64 = 0
         for graph in graphs {
-            await count += (graph.accounting()).materializedQueryResultCount
+            let accounting = await graph.accounting()
+            count += accounting.materializedQueryResultCount
         }
         return count
     }

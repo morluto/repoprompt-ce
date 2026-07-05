@@ -349,6 +349,34 @@ class SourceAndLedgerTests(unittest.TestCase):
             with self.assertRaisesRegex(optimizer.OptimizerError, "unsupported execution_tier"):
                 optimizer.read_ledger_rows(ledger)
 
+    def test_default_impacted_range_unions_branch_and_worktree_changes(self) -> None:
+        calls: list[list[str]] = []
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str) -> None:
+                self.returncode = 0
+                self.stdout = stdout
+                self.stderr = ""
+
+        def fake_run_command(command, cwd, timeout_seconds=None):
+            calls.append(list(command))
+            if optimizer.DEFAULT_IMPACTED_BRANCH_RANGE in command:
+                return FakeCompletedProcess("Sources/Branch.swift\nShared.swift\n")
+            return FakeCompletedProcess("Shared.swift\nTests/WorktreeTests.swift\n")
+
+        with mock.patch.object(optimizer, "run_command", side_effect=fake_run_command):
+            changed = optimizer.changed_files_for_range(Path("/repo"), optimizer.DEFAULT_IMPACTED_RANGE)
+
+        self.assertEqual(changed, ["Shared.swift", "Sources/Branch.swift", "Tests/WorktreeTests.swift"])
+        self.assertEqual(
+            calls[0],
+            ["git", "diff", "--name-only", "--diff-filter=ACMRT", "origin/main...HEAD", "--"],
+        )
+        self.assertEqual(
+            calls[1],
+            ["git", "diff", "--name-only", "--diff-filter=ACMRT", "--"],
+        )
+
     def test_impacted_tests_selects_test_file_smoke_floor_and_skips_heavy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -477,6 +505,70 @@ class SourceAndLedgerTests(unittest.TestCase):
         self.assertEqual(payload["live_root_test_count"], 1)
         self.assertEqual(payload["list_log_path"], "/tmp/root-list.log")
         self.assertEqual(payload["selected_count"], 1)
+
+    def test_impacted_tests_rejects_live_root_methods_missing_from_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.ExampleTests/testOne",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/MCP/ExampleTests.swift",
+                    "suite": "RepoPromptTests.ExampleTests",
+                    "method": "testOne",
+                    "domain": "MCP",
+                    "execution_tier": "routine",
+                }],
+            )
+            run = optimizer.ConductorRun(
+                command=["/repo/conductor", "test", "--list", "--json"],
+                process_exit_code=0,
+                stdout="{}",
+                stderr="",
+                result={"state": "completed", "exitCode": 0, "logPath": "/tmp/root-list.log"},
+                log_text="RepoPromptTests.ExampleTests/testOne\nRepoPromptWorkspaceTests.SplitTests/testTwo\n",
+                ticket="list-ticket",
+            )
+
+            with (
+                mock.patch.object(optimizer, "run_conductor", return_value=run),
+                mock.patch.object(optimizer, "changed_files_for_range", return_value=[]),
+            ):
+                with self.assertRaisesRegex(optimizer.OptimizerError, "missing=1 stale=0"):
+                    optimizer.impacted_tests(root, ledger, "HEAD")
+
+    def test_impacted_tests_selects_changed_split_root_test_file_by_ledger_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptWorkspaceTests.SplitTests/testTwo",
+                    "target": "root",
+                    "file": "Tests/RepoPromptWorkspaceTests/SplitTests.swift",
+                    "suite": "RepoPromptWorkspaceTests.SplitTests",
+                    "method": "testTwo",
+                    "domain": "Workspace",
+                    "execution_tier": "routine",
+                }],
+            )
+
+            with mock.patch.object(
+                optimizer,
+                "changed_files_for_range",
+                return_value=["Tests/RepoPromptWorkspaceTests/SplitTests.swift"],
+            ):
+                payload = optimizer.impacted_tests(root, ledger, "HEAD", validate_live_list=False)
+
+        self.assertEqual(payload["selected_count"], 1)
+        self.assertEqual(payload["selected"][0]["method_id"], "root/RepoPromptWorkspaceTests.SplitTests/testTwo")
+        self.assertIn(
+            "Tests/RepoPromptWorkspaceTests/SplitTests.swift: changed test file",
+            payload["selected"][0]["reasons"],
+        )
 
     def test_shard_root_tests_balances_by_runtime_and_excludes_heavy_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

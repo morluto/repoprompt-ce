@@ -674,7 +674,12 @@ def main(argv: list[str]) -> int:
         else:
             discovered = discover_test_bundles(args.swift_binary, args.cwd)
             if len(discovered) == 1:
-                test_bundle = next(iter(discovered.values()))
+                suite_targets = {test_target_for_suite(suite) for suite in suites}
+                discovered_target = next(iter(discovered))
+                if suite_targets == {discovered_target}:
+                    test_bundle = next(iter(discovered.values()))
+                else:
+                    test_bundles = discovered
             elif discovered:
                 test_bundles = discovered
     xctest_binary = xctest_binary_path() if test_bundle is not None or test_bundles else None
@@ -685,6 +690,7 @@ def main(argv: list[str]) -> int:
         silent_timeout_retries=args.silent_timeout_retries,
         swift_binary=args.swift_binary,
         cwd=args.cwd,
+        output=sys.stdout,
         silent_startup_seconds=args.silent_startup_seconds,
         test_bundle=test_bundle,
         test_bundles=test_bundles,

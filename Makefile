@@ -18,7 +18,7 @@ help:
 	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
-	@printf '  %-30s %s\n' 'dev-test-impacted' 'Run impacted root tests; override with RANGE=origin/main...HEAD'
+	@printf '  %-30s %s\n' 'dev-test-impacted' 'Run impacted root tests; default includes branch and worktree changes; override with RANGE=...'
 	@printf '  %-30s %s\n' 'dev-test-shard-plan' 'Print weighted full-root shard filters; override with SHARDS=N'
 	@printf '  %-30s %s\n' 'dev-test-list' 'List XCTest methods through conductor'
 	@printf '  %-30s %s\n' 'dev-provider-test' 'Run provider package tests; override with FILTER=name'
@@ -177,7 +177,7 @@ dev-test:
 	./conductor test$(if $(TEST_PRODUCT), --test-product $(TEST_PRODUCT))$(if $(FILTER), --filter $(FILTER))
 
 dev-test-impacted:
-	@python3 Scripts/test_suite_optimizer.py impacted --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --range "$(if $(RANGE),$(RANGE),HEAD)" --run$(if $(INCLUDE_HEAVY), --include-heavy)
+	@python3 Scripts/test_suite_optimizer.py impacted --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --range "$(if $(RANGE),$(RANGE),default)" --run$(if $(INCLUDE_HEAVY), --include-heavy)
 
 dev-test-shard-plan:
 	@python3 Scripts/test_suite_optimizer.py shard-plan --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv --shards $(if $(SHARDS),$(SHARDS),4)$(if $(INCLUDE_HEAVY), --include-heavy)
