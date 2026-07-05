@@ -867,19 +867,34 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             ],
             codemapAutoEnabled: false
         )
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let sourceIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: sourceTabID)
         var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: sourceTabID))
-        composeTab.selection = storedSelection
         composeTab.activeAgentSessionID = parentSessionID
         window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+        _ = await window.selectionCoordinator.persistSelection(
+            storedSelection,
+            for: sourceIdentity,
+            source: .runtimeMutation,
+            mirrorToUIIfActive: false
+        )
         // Wait for post-switch git-data root load to complete so any selection revision
         // published by the async git-data load settles before we diverge the UI selection.
         await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
-        await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
+        await window.selectionCoordinator.withApplyingSelectionMirror {
+            await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
+        }
         let divergentUISelection = window.workspaceFilesViewModel.snapshotSelection()
         XCTAssertTrue(divergentUISelection.selectedPaths.isEmpty)
         XCTAssertNotEqual(divergentUISelection, storedSelection)
+        _ = await window.selectionCoordinator.persistSelection(
+            storedSelection,
+            for: sourceIdentity,
+            source: .runtimeMutation,
+            mirrorToUIIfActive: false
+        )
+        XCTAssertEqual(window.workspaceManager.composeTab(for: sourceIdentity)?.selection, storedSelection)
 
-        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let launchSnapshot = AgentRunOracleReviewLaunchSnapshot(
             route: .explicitTabContext,
             windowID: window.windowID,
