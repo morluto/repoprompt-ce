@@ -2765,8 +2765,10 @@ public class APISettingsViewModel: ObservableObject {
             )
 
             let models = try await provider.getAvailableModels()
+            guard !Task.isCancelled else { return }
             availableCustomModels = models
         } catch {
+            guard !Task.isCancelled else { return }
             availableCustomModels = []
             apiSettingsViewModelDebugLog("Error fetching custom models: \(error)")
         }

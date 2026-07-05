@@ -389,7 +389,7 @@ import XCTest
         private func failNestedConnectionWaiter(id: UUID, error: Error) async {
             if let continuation = nestedConnectionWaiters.removeValue(forKey: id) {
                 continuation.resume(throwing: error)
-            } else if nestedConnectionID == nil && !grantedNestedConnectionWaiterIDs.contains(id) {
+            } else if nestedConnectionID == nil, !grantedNestedConnectionWaiterIDs.contains(id) {
                 failedNestedConnectionWaiters[id] = error
             }
         }
