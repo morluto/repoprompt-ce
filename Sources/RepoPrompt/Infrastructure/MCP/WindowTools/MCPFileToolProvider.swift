@@ -92,16 +92,27 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
             try Task.checkCancellation()
 
-            let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)
+            let reply: ToolResultDTOs.FileActionReply
+            do {
+                let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)
+                reply = ToolResultDTOs.FileActionReply(
+                    status: "ok",
+                    action: action,
+                    path: path,
+                    newPath: newPath,
+                    warning: warning
+                )
+            } catch let failure as MCPMutationRetryableFailure {
+                reply = ToolResultDTOs.FileActionReply.retryableFailure(
+                    action: action,
+                    path: path,
+                    newPath: newPath,
+                    failure: failure
+                )
+            }
             try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction)
-            let value = try Value(ToolResultDTOs.FileActionReply(
-                status: "ok",
-                action: action,
-                path: path,
-                newPath: newPath,
-                warning: warning
-            ))
+            let value = try Value(reply)
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction, transition: .completed)
             try Task.checkCancellation()
             return value
