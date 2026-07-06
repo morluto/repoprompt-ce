@@ -4885,7 +4885,7 @@ final class AgentModeViewModel: ObservableObject {
                 return existing
             }
             if canonicalTerminalState == nil, session.mcpFollowUpRunPending {
-                return "Queued to start"
+                return AgentRunMCPSnapshot.startupPendingStatusText
             }
             switch status {
             case .failed:
@@ -5238,18 +5238,23 @@ final class AgentModeViewModel: ObservableObject {
         expectedParentSessionID: UUID,
         target: MCPSessionTarget
     ) throws -> [AgentSessionWorktreeBinding] {
-        guard let sourceSession = sessions[sourceTabID],
-              sourceSession.activeAgentSessionID == expectedParentSessionID
-        else {
+        guard let sourceSession = sessions[sourceTabID] else {
             throw MCPError.invalidParams(
-                "agent_run.start could not validate the routed source Agent session for worktree inheritance."
+                "agent_run.start could not find the routed source Agent session for worktree inheritance."
+            )
+        }
+        guard sourceSession.activeAgentSessionID == expectedParentSessionID else {
+            throw MCPError.invalidParams(
+                "agent_run.start routed source Agent session identity changed before worktree inheritance."
             )
         }
         let expectedBindings = sourceSession.worktreeBindings
-        if !expectedBindings.isEmpty {
-            guard sourceSession.mcpControlContext?.sessionID == expectedParentSessionID else {
+        if !expectedBindings.isEmpty,
+           let controlContext = sourceSession.mcpControlContext
+        {
+            guard controlContext.sessionID == expectedParentSessionID else {
                 throw MCPError.invalidParams(
-                    "agent_run.start could not validate the routed source Agent session for worktree inheritance."
+                    "agent_run.start routed source MCP control context changed before worktree inheritance."
                 )
             }
         }

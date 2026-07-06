@@ -4429,6 +4429,11 @@ actor WorkspaceFileContextStore {
         }
 
         var pausedHandoffSubscriptions: [WorkspaceFileSystemIngressCoordinator.Subscription] = []
+        defer {
+            for subscription in pausedHandoffSubscriptions {
+                _ = publisherIngressCoordinator.resumeDrainAfterHandoff(subscription)
+            }
+        }
         for pending in pendingRoots {
             guard let attachment = pending.attachment else {
                 throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
