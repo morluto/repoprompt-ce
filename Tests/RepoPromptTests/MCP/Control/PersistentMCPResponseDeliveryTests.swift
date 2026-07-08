@@ -321,7 +321,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         Self.closeIfOpen(stdinPipe[1])
         stdinPipe[1] = -1
         let forwardedRequest = try await Task.detached {
-            try Self.readLine(from: sockets[1])
+            try Self.readLine(from: sockets[1], timeout: 2)
         }.value
         XCTAssertEqual(forwardedRequest, requestFrame)
         let observedStdinClose = await poller.waitUntilStdinClosed()
@@ -342,7 +342,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         await poller.resumeNext(.events(Int16(POLLIN)))
         try await bridgeTask.value
 
-        let deliveredResponse = try Self.readLine(from: stdoutPipe[0])
+        let deliveredResponse = try Self.readLine(from: stdoutPipe[0], timeout: 2)
         XCTAssertEqual(deliveredResponse, responseFrame)
         let snapshot = await ledger.snapshot()
         XCTAssertEqual(snapshot.activeRequestCount, 0)
@@ -395,7 +395,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         Self.closeIfOpen(stdinPipe[1])
         stdinPipe[1] = -1
         let forwardedRequest = try await Task.detached {
-            try Self.readLine(from: sockets[1])
+            try Self.readLine(from: sockets[1], timeout: 2)
         }.value
         XCTAssertEqual(forwardedRequest, requestFrame)
         let observedStdinClose = await poller.waitUntilStdinClosed()
