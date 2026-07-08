@@ -501,32 +501,83 @@ class CodemapBindingEngineTestCase: XCTestCase {
 final class EngineDemandResultTimeoutRace: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<WorkspaceCodemapBindingDemandResult?, Never>?
+    private var observerTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var observerCompleted = false
     private var resolved = false
 
     func wait(
         for task: Task<WorkspaceCodemapBindingDemandResult, Never>,
         timeout: Duration
     ) async -> WorkspaceCodemapBindingDemandResult? {
-        await withCheckedContinuation { continuation in
+        let result = await withCheckedContinuation { continuation in
             lock.withLock { self.continuation = continuation }
-            Task { [self] in
-                await finish(task.value)
+
+            let observer = Task { [weak self] in
+                let result = await task.value
+                self?.finish(result, observerCompleted: true)
             }
-            Task { [self] in
+            let timer = Task { [weak self] in
                 try? await Task.sleep(for: timeout)
-                finish(nil)
+                guard !Task.isCancelled else { return }
+                task.cancel()
+                self?.finish(nil)
+            }
+
+            lock.withLock {
+                observerTask = observer
+                timeoutTask = timer
             }
         }
+
+        let tasks = lock.withLock { () -> (observer: Task<Void, Never>?, timer: Task<Void, Never>?) in
+            let tasks = (observerTask, timeoutTask)
+            observerTask = nil
+            timeoutTask = nil
+            return tasks
+        }
+        if let timer = tasks.timer {
+            timer.cancel()
+            await timer.value
+        }
+        if result == nil {
+            await assertObservedTaskDrainedAfterTimeout()
+        }
+        tasks.observer?.cancel()
+        return result
     }
 
-    private func finish(_ result: WorkspaceCodemapBindingDemandResult?) {
+    private var hasObserverCompleted: Bool {
+        lock.withLock { observerCompleted }
+    }
+
+    private func finish(
+        _ result: WorkspaceCodemapBindingDemandResult?,
+        observerCompleted: Bool = false
+    ) {
         let continuation = lock.withLock { () -> CheckedContinuation<WorkspaceCodemapBindingDemandResult?, Never>? in
+            if observerCompleted {
+                self.observerCompleted = true
+            }
             guard !resolved else { return nil }
             resolved = true
             defer { self.continuation = nil }
             return self.continuation
         }
         continuation?.resume(returning: result)
+    }
+
+    private func assertObservedTaskDrainedAfterTimeout() async {
+        do {
+            try await AsyncTestWait.waitUntil(
+                "codemap binding demand task cancellation drain",
+                timeout: 1
+            ) {
+                self.hasObserverCompleted
+            }
+        } catch {
+            XCTFail("Timed out waiting for cancelled codemap binding demand task to drain: \(error.localizedDescription)")
+        }
     }
 }
 

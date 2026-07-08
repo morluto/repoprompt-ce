@@ -40,6 +40,7 @@ final class TestReleaseFence: @unchecked Sendable {
     private var released = false
     private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var cancelledWaiters = Set<UUID>()
+    private var timedOutWaiters = Set<UUID>()
 
     init(name: String = "test release fence") {
         self.name = name
@@ -61,18 +62,21 @@ final class TestReleaseFence: @unchecked Sendable {
     ///
     /// Use this only for tests whose contract is that a cancelled owner does not
     /// release the underlying body/resource until the test explicitly releases it.
-    /// A detached timeout fails open so a missed release cannot wedge the suite.
+    /// A retained/cancelled timeout fails open so a missed release cannot wedge the suite.
     func enterAndWaitIgnoringCancellationUntilRelease(
         timeout: TimeInterval = TestFenceDefaults.releaseWait
     ) async {
         let waiterID = UUID()
-        Task.detached { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+        let timeoutTask = Task.detached { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0, timeout)))
+            guard !Task.isCancelled else { return }
             self?.timeout(waiterID: waiterID, timeout: timeout)
         }
         await withCheckedContinuation { continuation in
             registerIgnoringCancellation(continuation, waiterID: waiterID)
         }
+        timeoutTask.cancel()
+        await timeoutTask.value
     }
 
     /// Alias used by older engine call sites (`EngineBuildGate.enter`).
@@ -157,6 +161,7 @@ final class TestReleaseFence: @unchecked Sendable {
         let pending = Array(continuations.values)
         continuations.removeAll()
         cancelledWaiters.removeAll()
+        timedOutWaiters.removeAll()
         condition.broadcast()
         condition.unlock()
         for continuation in pending {
@@ -195,7 +200,7 @@ final class TestReleaseFence: @unchecked Sendable {
         condition.lock()
         entered = true
         condition.broadcast()
-        if released {
+        if released || timedOutWaiters.remove(waiterID) != nil {
             condition.unlock()
             continuation.resume()
         } else {
@@ -229,10 +234,14 @@ final class TestReleaseFence: @unchecked Sendable {
     private func timeout(waiterID: UUID, timeout: TimeInterval) {
         condition.lock()
         let continuation = continuations.removeValue(forKey: waiterID)
+        let shouldFail = continuation != nil || !released
+        if continuation == nil, !released {
+            timedOutWaiters.insert(waiterID)
+        }
         condition.unlock()
-        guard let continuation else { return }
+        guard shouldFail else { return }
         XCTFail("Timed out waiting for \(name) release after \(String(format: "%.1f", timeout))s")
-        continuation.resume()
+        continuation?.resume()
     }
 }
 
@@ -360,8 +369,12 @@ final class TestCancellationGate: @unchecked Sendable {
         }
     }
 
-    func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
-        if hasEnteredForTesting { return }
+    @discardableResult
+    func waitUntilEntered(
+        timeout: TimeInterval = TestFenceDefaults.enterWait,
+        failOnTimeout: Bool = true
+    ) async -> Bool {
+        if hasEnteredForTesting { return true }
         do {
             try await AsyncTestWait.waitUntil(
                 "\(name) entered",
@@ -369,8 +382,12 @@ final class TestCancellationGate: @unchecked Sendable {
             ) {
                 self.hasEnteredForTesting
             }
+            return true
         } catch {
-            XCTFail(error.localizedDescription)
+            if failOnTimeout {
+                XCTFail(error.localizedDescription)
+            }
+            return hasEnteredForTesting
         }
     }
 

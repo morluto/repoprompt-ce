@@ -1956,8 +1956,11 @@ import XCTest
         func waitUntilEntered(
             timeout: Duration = synchronizationTimeout
         ) async throws {
-            await gate.waitUntilEntered(timeout: TestFenceDefaults.timeInterval(timeout))
-            guard gate.hasEnteredForTesting else {
+            let entered = await gate.waitUntilEntered(
+                timeout: TestFenceDefaults.timeInterval(timeout),
+                failOnTimeout: false
+            )
+            guard entered else {
                 throw MCPExecutionWatchdogIntegrationFixtureError.cooperativeGateDidNotEnter
             }
         }
