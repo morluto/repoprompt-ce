@@ -13,7 +13,8 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
 
             try assertOrdered([
                 "let roots = await store.rootRefs(scope: lookupRootScope)",
-                "await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)",
+                "await readableService.awaitFreshnessForExplicitRequest(",
+                "timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout",
                 "await readableService.resolveReadFileRequest("
             ], in: readFile, label: caseLabel)
             XCTAssertEqual(readFile.components(separatedBy: "store.rootRefs(scope: lookupRootScope)").count - 1, 1, caseLabel)

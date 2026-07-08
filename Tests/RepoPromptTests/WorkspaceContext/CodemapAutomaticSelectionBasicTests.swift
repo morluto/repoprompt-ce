@@ -1010,8 +1010,7 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
         var readyByFileID: [UUID: WorkspaceCodemapArtifactDemandReady] = [:]
         for file in [source, target] {
-            let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: file.id))
-            readyByFileID[file.id] = try await readyResult(settledResult(store: store, ticket: ticket))
+            readyByFileID[file.id] = try await readyArtifactDemand(store: store, forFileID: file.id).ready
         }
         let sourceReady = try XCTUnwrap(readyByFileID[source.id])
         let targetReady = try XCTUnwrap(readyByFileID[target.id])
@@ -1096,9 +1095,8 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
         var sourceTicket: WorkspaceCodemapArtifactDemandTicket?
         for file in files {
-            let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: file.id))
-            _ = try await readyResult(settledResult(store: store, ticket: ticket))
-            if file.id == source.id { sourceTicket = ticket }
+            let demand = try await readyArtifactDemand(store: store, forFileID: file.id)
+            if file.id == source.id { sourceTicket = demand.ticket }
         }
         let identities = await store.codemapAutomaticSelectionSourceIdentities(
             forFileIDs: [source.id],

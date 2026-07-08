@@ -111,7 +111,7 @@ final class SearchPathFilteringTests: XCTestCase {
         let result = await task.value
 
         XCTAssertTrue(result.cancelled)
-        XCTAssertLessThan(result.visitedSnapshotCount, snapshots.count)
+        XCTAssertEqual(result.visitedSnapshotCount, 0)
     }
 }
 

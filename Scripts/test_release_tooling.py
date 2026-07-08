@@ -31,11 +31,16 @@ class ReleaseToolingTests(unittest.TestCase):
                 key, value = line.split("=", 1)
                 metadata[key] = value.strip('"')
 
+        package_manifest = (root / "Package.swift").read_text(encoding="utf-8")
         policy = (
             root / "Sources" / "RepoPrompt" / "Infrastructure" / "Security" / "RuntimeCodeSigningPolicy.swift"
         ).read_text(encoding="utf-8")
         entitlements = (root / "AppBundle" / "RepoPrompt.entitlements.template").read_text(encoding="utf-8")
         info_plist = plistlib.loads((root / "AppBundle" / "Info.plist.template").read_bytes())
+
+        self.assertIn('environment["REPOPROMPT_ENABLE_SENTRY"] == "1"', package_manifest)
+        self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertNotIn("let sentryEnabled = true", package_manifest)
 
         self.assertIn(
             f'static let developerIDBundleIdentifier = "{metadata["BUNDLE_ID"]}"',
@@ -58,6 +63,8 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("RepoPromptDebugSecureStorageBackend", info_plist)
         self.assertIn("RepoPromptLocalSigningCertificateSHA256", info_plist)
         self.assertIn("RepoPromptLocalSecureStorageGeneration", info_plist)
+        self.assertIn("RepoPromptSentryDSN", info_plist)
+        self.assertEqual(info_plist["RepoPromptSentryDSN"], "")
         self.assertIn(
             'static let localSelfSignedCertificateName = "RepoPrompt CE Local Self-Signed Code Signing"',
             policy,
@@ -501,6 +508,38 @@ esac
         self.assertIsNone(manifest_content["bundle_signing"]["leaf_certificate_sha256"])
         for executable in manifest_content["executables"]:
             self.assertIsNone(executable["signing"]["leaf_certificate_sha256"])
+        # The RC fixture has no DSN, so telemetry is disabled.
+        self.assertFalse(manifest_content["bundle"]["telemetry_enabled"])
+
+        # With a DSN present, the manifest records telemetry_enabled=True but never the DSN value.
+        dsn_value = "https://examplepublickey@o9999.ingest.sentry.io/424242"
+        info_with_dsn = dict(info)
+        info_with_dsn["RepoPromptSentryDSN"] = dsn_value
+        (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info_with_dsn))
+        dsn_manifest = app.parent / "telemetry-manifest.json"
+        dsn_written = subprocess.run(
+            [
+                str(writer),
+                "write",
+                "--app",
+                str(app),
+                "--output",
+                str(dsn_manifest),
+                "--expected-architectures",
+                "arm64,x86_64",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(dsn_written.returncode, 0, dsn_written.stderr)
+        dsn_manifest_text = dsn_manifest.read_text(encoding="utf-8")
+        self.assertNotIn(dsn_value, dsn_manifest_text)
+        self.assertNotIn("examplepublickey", dsn_manifest_text)
+        self.assertTrue(json.loads(dsn_manifest_text)["bundle"]["telemetry_enabled"])
+        # Restore the no-DSN RC Info.plist so the remainder of the test is unaffected.
+        (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+
         accepted = subprocess.run(
             [
                 str(writer),
@@ -1106,6 +1145,110 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('rm -f "$CERTIFICATE_PATH"', final_cleanup)
         self.assertIn('rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"', final_cleanup)
 
+    def test_sentry_symbol_upload_helper_uses_token_file_without_logging_secret(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        symbols = temp_dir / "symbols"
+        symbols.mkdir()
+        (symbols / "RepoPrompt.dSYM").mkdir()
+        ambient_token = "sntrys_wrong_ambient_secret_token"
+        token = "sntrys_fixture_secret_token"
+        token_file = temp_dir / "sentry-token"
+        token_file.write_text(token + "\n", encoding="utf-8")
+        argv_capture = temp_dir / "argv.txt"
+        token_capture = temp_dir / "token.txt"
+        fake_cli = temp_dir / "sentry-cli"
+        fake_cli.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > "$ARGV_CAPTURE"
+printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
+""",
+            encoding="utf-8",
+        )
+        fake_cli.chmod(0o755)
+        env = os.environ.copy()
+        env["SENTRY_AUTH_TOKEN"] = ambient_token
+        env.update(
+            {
+                "PATH": f"{temp_dir}:{env.get('PATH', '')}",
+                "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE": str(token_file),
+                "REPOPROMPT_SENTRY_ORG": "fixture-org",
+                "REPOPROMPT_SENTRY_PROJECT": "fixture-project",
+                "ARGV_CAPTURE": str(argv_capture),
+                "TOKEN_CAPTURE": str(token_capture),
+            }
+        )
+
+        result = subprocess.run(
+            [str(SCRIPT_DIR / "upload_sentry_debug_symbols.sh"), str(symbols)],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(token, result.stdout)
+        self.assertNotIn(token, result.stderr)
+        argv = argv_capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            argv,
+            [
+                "debug-files",
+                "upload",
+                "--org",
+                "fixture-org",
+                "--project",
+                "fixture-project",
+                str(symbols),
+            ],
+        )
+        self.assertNotIn("--include-sources", argv)
+        self.assertNotIn(token, "\n".join(argv))
+        self.assertEqual(token_capture.read_text(encoding="utf-8"), token)
+
+    def test_sentry_symbol_flow_is_explicit_secret_safe_and_release_only_by_default(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        universal_builder = (SCRIPT_DIR / "build_swiftpm_release_products.sh").read_text(encoding="utf-8")
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        release_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        conductor = (SCRIPT_DIR / "conductor.py").read_text(encoding="utf-8")
+
+        self.assertIn('SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"', package_script)
+        self.assertNotIn("REPOPROMPT_SENTRY_SYMBOLS_DIR", package_script)
+        self.assertIn("SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)", package_script)
+        self.assertIn('run xcrun dsymutil "$BUILD_DIR/$exe" -o "$SENTRY_SYMBOLS_DIR/$exe.dSYM"', package_script)
+        self.assertIn('if truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}"; then', package_script)
+        self.assertIn("REPOPROMPT_UPLOAD_SENTRY_SYMBOLS requires REPOPROMPT_ENABLE_SENTRY=1", package_script)
+        self.assertIn("REPOPROMPT_UPLOAD_SENTRY_SYMBOLS requires SENTRY_AUTH_TOKEN or REPOPROMPT_SENTRY_AUTH_TOKEN_FILE", package_script)
+        self.assertIn("SWIFT_BUILD_ARGS+=(-debug-info-format dwarf)", universal_builder)
+
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"', release_script)
+        self.assertIn('SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"', release_script)
+        self.assertIn('ditto "$SENTRY_SYMBOLS_DIR" "$stage_root/.build/sentry-symbols/release"', release_script)
+        self.assertIn('upload_sentry_symbols_if_configured', release_script)
+
+        stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
+        publish_job = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', stage_job)
+        self.assertNotIn("SENTRY_AUTH_TOKEN", stage_job)
+        self.assertIn("Install Sentry CLI when symbol upload is configured", publish_job)
+        self.assertIn("brew install getsentry/tools/sentry-cli", publish_job)
+        self.assertIn("SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}", publish_job)
+        self.assertLess(
+            publish_job.index("Install Sentry CLI when symbol upload is configured"),
+            publish_job.index("Sign, notarize, and create draft release"),
+        )
+        self.assertIn("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}", publish_job)
+        self.assertIn("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}", publish_job)
+
+        self.assertIn('"REPOPROMPT_ENABLE_SENTRY"', conductor)
+        self.assertIn('"REPOPROMPT_UPLOAD_SENTRY_SYMBOLS"', conductor)
+        self.assertIn('"REPOPROMPT_SENTRY_AUTH_TOKEN_FILE"', conductor)
+        self.assertIn('"REPOPROMPT_SENTRY_ORG"', conductor)
+        self.assertIn('"REPOPROMPT_SENTRY_PROJECT"', conductor)
+        self.assertNotIn('"SENTRY_AUTH_TOKEN"', conductor)
+
     def test_staged_release_extractor_rejects_alternate_in_app_cli_target(self) -> None:
         for relative, alternate_target in (
             ("Contents/Resources/repoprompt-mcp", "../MacOS/RepoPrompt"),
@@ -1311,6 +1454,51 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('gitleaks git --redact --log-opts="$range" .', workflow)
         self.assertIn("gitleaks dir --redact .", workflow)
 
+    def test_swift_style_lint_uses_config_discovery_without_script_input_overhead(self) -> None:
+        root = SCRIPT_DIR.parent
+        style_script = (SCRIPT_DIR / "swift_style.sh").read_text(encoding="utf-8")
+        swiftlint_config = (root / ".swiftlint.yml").read_text(encoding="utf-8")
+        lint_body = style_script.split("run_swiftlint(){", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn('local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)', lint_body)
+        self.assertNotIn("SCRIPT_INPUT_FILE", lint_body)
+        self.assertNotIn("--use-script-input-files", lint_body)
+
+        style_paths_body = style_script.split("STYLE_PATHS=(", 1)[1].split("\n)", 1)[0]
+        style_paths = [
+            line.strip().strip('"')
+            for line in style_paths_body.splitlines()
+            if line.strip().startswith('"')
+        ]
+        for style_path in style_paths:
+            self.assertIn(f"  - {style_path}", swiftlint_config)
+
+        for excluded_path in (
+            ".build",
+            ".swiftpm",
+            "build",
+            "Carthage",
+            "DerivedData",
+            "Generated",
+            "Pods",
+            "Vendor",
+            "Packages/RepoPromptAgentProviders/.build",
+            "Sources/CSwiftPCRE2",
+            "Sources/RepoPromptC",
+            "Sources/RepoPrompt/ThirdParty/SwiftPCRE2",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift",
+            "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift",
+        ):
+            self.assertIn(f"  - {excluded_path}", swiftlint_config)
+
     def test_publish_staged_validates_before_creating_dist(self) -> None:
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}", 1)[0]
@@ -1323,6 +1511,37 @@ SIGNING_TEAM_ID=648A27MST5
             publish_staged.index('"$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"'),
             publish_staged.index("prepare_dist"),
         )
+
+    def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
+        root = SCRIPT_DIR.parent
+        package_manifest = (root / "Package.swift").read_text(encoding="utf-8")
+        package_resolved = json.loads((root / "Package.resolved").read_text(encoding="utf-8"))
+        notice_inventory = (root / "ThirdPartyLicenses" / "swiftpm" / "inventory.tsv").read_text(encoding="utf-8")
+        release_workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        bootstrap_source = (
+            root
+            / "Sources"
+            / "RepoPrompt"
+            / "Infrastructure"
+            / "Telemetry"
+            / "SentryTelemetryBootstrap.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('.package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1")', package_manifest)
+        self.assertIn('repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
+        self.assertIn('repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', release_workflow)
+        self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", release_workflow)
+        self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", release_script)
+        self.assertIn('if [[ -n "${SENTRY_DSN:-}" ]]; then', staged_signing_script)
+        self.assertIn('plutil -replace RepoPromptSentryDSN -string "$SENTRY_DSN"', staged_signing_script)
+        self.assertIn('Bundle.main.object(forInfoDictionaryKey: "RepoPromptSentryDSN")', bootstrap_source)
+
+        pins = {pin["identity"]: pin for pin in package_resolved["pins"]}
+        self.assertEqual(pins["sentry-cocoa"]["state"]["version"], "9.17.1")
+        self.assertIn("sentry-cocoa\t9.17.1\thttps://github.com/getsentry/sentry-cocoa", notice_inventory)
 
     def test_modern_sparkle_key_seed_derives_public_key(self) -> None:
         descriptor, key_path = tempfile.mkstemp()

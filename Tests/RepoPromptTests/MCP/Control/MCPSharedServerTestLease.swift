@@ -1,6 +1,8 @@
 import Foundation
 
 #if DEBUG
+    import Foundation
+
     actor MCPSharedServerTestLease {
         struct Ownership {
             fileprivate init() {}
@@ -14,22 +16,41 @@ import Foundation
         private let waiterState = LeaseWaiterState()
 
         func withLease<T>(_ operation: (Ownership) async throws -> T) async throws -> T {
-            if occupied {
-                try await waitForTurn()
-                if Task.isCancelled {
-                    releaseLease()
-                    throw CancellationError()
-                }
-            }
-            occupied = true
+            var ownsLease = false
+            try await acquireLease()
+            ownsLease = true
             defer {
-                releaseLease()
+                if ownsLease {
+                    ownsLease = false
+                    releaseLease()
+                }
             }
             return try await operation(Ownership())
         }
 
         func waiterCountForTesting() -> Int {
             waiterState.waiterCount
+        }
+
+        private func acquireLease() async throws {
+            guard occupied else {
+                occupied = true
+                do {
+                    try Task.checkCancellation()
+                } catch {
+                    releaseLease()
+                    throw error
+                }
+                return
+            }
+
+            try await waitForTurn()
+            do {
+                try Task.checkCancellation()
+            } catch {
+                releaseLease()
+                throw error
+            }
         }
 
         private func waitForTurn() async throws {

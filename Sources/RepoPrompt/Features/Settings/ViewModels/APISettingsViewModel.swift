@@ -349,6 +349,7 @@ public class APISettingsViewModel: ObservableObject {
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
     private var openRouterModelsTask: Task<Void, Never>?
+    private var customModelsTask: Task<Void, Never>?
     private var initialLoadTask: Task<Void, Never>?
     private var cliConnectionCancellables = Set<AnyCancellable>()
     private var hasLoadedStoredData = false
@@ -624,6 +625,7 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Claude Code binary probe started")
         await CLIEnvironmentCache.shared.invalidate()
         var config = CLIProcessConfiguration(
+            shellLookupMode: .fallbackOnly,
             captureStdoutTailBytes: 16 * 1024,
             captureStderrTailBytes: 16 * 1024
         )
@@ -1008,6 +1010,8 @@ public class APISettingsViewModel: ObservableObject {
         cursorModelsTask = nil
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
+        customModelsTask?.cancel()
+        customModelsTask = nil
         contextBuilderProviderValidationTask?.cancel()
         contextBuilderProviderValidationTask = nil
         cliConnectionCancellables.removeAll()
@@ -1026,6 +1030,7 @@ public class APISettingsViewModel: ObservableObject {
         openCodeModelsTask?.cancel()
         cursorModelsTask?.cancel()
         openRouterModelsTask?.cancel()
+        customModelsTask?.cancel()
         contextBuilderProviderValidationTask?.cancel()
     }
 
@@ -1185,6 +1190,7 @@ public class APISettingsViewModel: ObservableObject {
         }
 
         var config = CLIProcessConfiguration(
+            shellLookupMode: .fallbackOnly,
             captureStdoutTailBytes: 8 * 1024,
             captureStderrTailBytes: 8 * 1024
         )
@@ -1324,6 +1330,8 @@ public class APISettingsViewModel: ObservableObject {
         cursorModelsTask = nil
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
+        customModelsTask?.cancel()
+        customModelsTask = nil
 
         keychainAccessDiagnostics.removeAll()
         loadNonSecretStoredData()
@@ -1477,7 +1485,7 @@ public class APISettingsViewModel: ObservableObject {
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
-        if isCustomProviderValid { Task { await self.fetchCustomModels() } }
+        if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
 
         // ----------------------------------------------------------------
         // 5. Build initial UI list from whatever caches we already have
@@ -2759,8 +2767,10 @@ public class APISettingsViewModel: ObservableObject {
             )
 
             let models = try await provider.getAvailableModels()
+            guard !Task.isCancelled else { return }
             availableCustomModels = models
         } catch {
+            guard !Task.isCancelled else { return }
             availableCustomModels = []
             apiSettingsViewModelDebugLog("Error fetching custom models: \(error)")
         }

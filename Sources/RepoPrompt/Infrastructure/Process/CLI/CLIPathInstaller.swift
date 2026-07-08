@@ -87,7 +87,17 @@ enum CLIPathInstaller {
         # Disabled tools: \(disallowedToolsArg)
 
         \(environmentExports)
-        exec claude --mcp-config "\(configPath)" --strict-mcp-config --disallowedTools \(disallowedToolsArg) "$@"
+
+        claude_bin="$(command -v claude 2>/dev/null || true)"
+        if [[ -z "$claude_bin" && -x "$HOME/.claude/local/claude" ]]; then
+            claude_bin="$HOME/.claude/local/claude"
+        fi
+        if [[ -z "$claude_bin" ]]; then
+            echo "claude-rpce: Claude Code CLI not found. Install Claude Code, add claude to PATH, or ensure ~/.claude/local/claude is executable." >&2
+            exit 127
+        fi
+
+        exec "$claude_bin" --mcp-config "\(configPath)" --strict-mcp-config --disallowedTools \(disallowedToolsArg) "$@"
         """
     }
 

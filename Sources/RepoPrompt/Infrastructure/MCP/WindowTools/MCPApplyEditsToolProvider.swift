@@ -76,6 +76,15 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
     }
 
     private func executeApplyEdits(args: [String: Value]) async throws -> EditSummary {
+        try await WorkspaceToolSentryTelemetry.span(
+            operation: .fileEditApply,
+            toolName: .applyEdits
+        ) {
+            try await executeApplyEditsBody(args: args)
+        }
+    }
+
+    private func executeApplyEditsBody(args: [String: Value]) async throws -> EditSummary {
         var requestPath: String? = nil
         do {
             let request = try EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.requestBuild) {
@@ -84,6 +93,12 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             requestPath = request.path
             let metadata = await dependencies.captureRequestMetadata()
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
+                for: lookupContext,
+                store: dependencies.promptVM.workspaceFileContextStore
+            ) {
+                return Self.retryableFailureSummary(request: request, failure: failure)
+            }
             let effectivePath = lookupContext.translateInputPath(request.path)
             let displayPath = lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: effectivePath, display: .relative) ?? request.path
             _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
@@ -275,6 +290,35 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
         } catch {
             throw MCPError.internalError(error.localizedDescription)
         }
+    }
+
+    private static func retryableFailureSummary(
+        request: ApplyEditsRequest,
+        failure: MCPMutationRetryableFailure
+    ) -> EditSummary {
+        EditSummary(
+            status: "failed",
+            editsRequested: request.editCount,
+            editsApplied: 0,
+            addedLines: nil,
+            deletedLines: nil,
+            totalLinesChanged: nil,
+            totalChunks: nil,
+            results: nil,
+            unifiedDiff: nil,
+            cardUnifiedDiff: nil,
+            note: nil,
+            fileCreated: nil,
+            fileOverwritten: nil,
+            reviewStatus: nil,
+            rejectionReason: nil,
+            requiresUserApproval: nil,
+            errorMessage: failure.errorMessage,
+            errorCode: failure.errorCode,
+            retryable: failure.retryable,
+            retryAfterMilliseconds: failure.retryAfterMilliseconds,
+            suggestion: failure.suggestion
+        )
     }
 
     private static func resolveApplyEditsAgentModeTabID(

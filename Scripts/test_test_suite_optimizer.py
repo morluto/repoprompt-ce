@@ -753,6 +753,152 @@ class SourceAndLedgerTests(unittest.TestCase):
         self.assertIn("shared_state_tag_counts", payload["shards"][0])
         self.assertIn("parallelization_warning", payload)
 
+    def test_runtime_import_updates_matching_rows_and_preserves_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            output = root / "candidate.tsv"
+            baseline = root / "baseline.json"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.A/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.A",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.B/testTwo",
+                        "target": "root",
+                        "suite": "RepoPromptTests.B",
+                        "method": "testTwo",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "1.000000",
+                    },
+                ],
+            )
+            baseline.write_text(
+                json.dumps({
+                    "target": "root",
+                    "slowest_tests": [
+                        {"suite": "RepoPromptTests.A", "method": "testOne", "median_seconds": 2.5},
+                        {"suite": "RepoPromptTests.C", "method": "testMissing", "median_seconds": 9.0},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+
+            summary = optimizer.runtime_import(ledger, baseline, output)
+
+            self.assertEqual(summary["rows_updated"], 1)
+            self.assertEqual(summary["rows_unchanged"], 1)
+            self.assertEqual(summary["artifact_methods_missing_from_ledger"], ["root/RepoPromptTests.C/testMissing"])
+            self.assertEqual(summary["ledger_methods_missing_from_artifact"], ["root/RepoPromptTests.B/testTwo"])
+            with output.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+            self.assertEqual([row["method_id"] for row in rows], [
+                "root/RepoPromptTests.A/testOne",
+                "root/RepoPromptTests.B/testTwo",
+            ])
+            self.assertEqual(rows[0]["runtime_seconds"], "2.500000")
+            self.assertEqual(rows[1]["runtime_seconds"], "1.000000")
+
+    def test_runtime_import_refuses_to_overwrite_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            output = root / "candidate.tsv"
+            baseline = root / "baseline.json"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.A/testOne",
+                    "target": "root",
+                    "suite": "RepoPromptTests.A",
+                    "method": "testOne",
+                    "execution_tier": "routine",
+                }],
+            )
+            baseline.write_text(json.dumps({"target": "root", "slowest_tests": []}), encoding="utf-8")
+            output.write_text("existing", encoding="utf-8")
+
+            with self.assertRaisesRegex(optimizer.OptimizerError, "refusing to overwrite"):
+                optimizer.runtime_import(ledger, baseline, output)
+
+    def test_ci_suite_plan_balances_suites_and_marks_batch_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [
+                    {
+                        "method_id": "root/RepoPromptTests.Slow/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Slow",
+                        "method": "testOne",
+                        "execution_tier": "routine",
+                        "runtime_seconds": "8",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.Fast/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Fast",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                        "runtime_seconds": "1.5",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.MissingRuntime/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.MissingRuntime",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                    },
+                    {
+                        "method_id": "root/RepoPromptTests.Shared/testOne",
+                        "target": "root",
+                        "suite": "RepoPromptTests.Shared",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                        "runtime_seconds": "1",
+                        "shared_state_tags": "UserDefaults",
+                    },
+                    {
+                        "method_id": "provider/ProviderTests.Ignored/testOne",
+                        "target": "provider",
+                        "suite": "ProviderTests.Ignored",
+                        "method": "testOne",
+                        "execution_tier": "fast",
+                        "runtime_seconds": "100",
+                    },
+                ],
+            )
+
+            plan = optimizer.ci_suite_plan(ledger, 2, suites=[
+                "RepoPromptTests.Slow",
+                "RepoPromptTests.Fast",
+                "RepoPromptTests.MissingRuntime",
+                "RepoPromptTests.Shared",
+                "RepoPromptTests.NotLive",
+            ])
+
+        self.assertEqual(plan["shard_count"], 2)
+        self.assertEqual(plan["missing_suites"], ["RepoPromptTests.NotLive"])
+        all_suites = {entry["suite"]: entry for shard in plan["shards"] for entry in shard["suites"]}
+        self.assertEqual(set(all_suites), {
+            "RepoPromptTests.Slow",
+            "RepoPromptTests.Fast",
+            "RepoPromptTests.MissingRuntime",
+            "RepoPromptTests.Shared",
+        })
+        self.assertEqual(all_suites["RepoPromptTests.MissingRuntime"]["missing_runtime_count"], 1)
+        self.assertTrue(all_suites["RepoPromptTests.Fast"]["batch_eligible"])
+        self.assertFalse(all_suites["RepoPromptTests.MissingRuntime"]["batch_eligible"])
+        self.assertFalse(all_suites["RepoPromptTests.Shared"]["batch_eligible"])
+        self.assertGreaterEqual(plan["shards"][0]["estimated_seconds"], plan["shards"][1]["estimated_seconds"])
+
     def test_source_mapping_supports_multiple_root_test_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -144,6 +144,29 @@ final class CLIPathInstallerTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: linkURL.path), foreign.path)
     }
 
+    func testManagedDestinationsRecognizeNoSpaceAndLegacyUserSpaceLinks() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let destinations = ManagedCLIPathPolicy.managedDestinations(currentBundledCLIPath: nil)
+
+        XCTAssertTrue(
+            destinations.contains(home.appendingPathComponent("RepoPrompt/repoprompt_ce_cli_debug").standardizedFileURL.path)
+        )
+        XCTAssertTrue(
+            destinations.contains(
+                home.appendingPathComponent(
+                    "Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug"
+                ).standardizedFileURL.path
+            )
+        )
+        XCTAssertTrue(
+            destinations.contains(
+                home.appendingPathComponent(
+                    "Library/Application Support/RepoPrompt CE/repoprompt_cli_debug"
+                ).standardizedFileURL.path
+            )
+        )
+    }
+
     func testPrivilegedShellCommandReplacesAndRemovesOnlyManagedLinks() throws {
         let installURL = root.appendingPathComponent("bin/rpce-cli-debug")
         try FileManager.default.createDirectory(at: installURL.deletingLastPathComponent(), withIntermediateDirectories: true)

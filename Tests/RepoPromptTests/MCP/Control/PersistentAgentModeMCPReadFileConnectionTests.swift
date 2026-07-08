@@ -4004,6 +4004,49 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
     }
 
+    private final class SocketPairResponseWaiter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String, Error>?
+
+        init(_ continuation: CheckedContinuation<String, Error>) {
+            self.continuation = continuation
+        }
+
+        func resume(returning value: String) {
+            take()?.resume(returning: value)
+        }
+
+        func resume(throwing error: Error) {
+            take()?.resume(throwing: error)
+        }
+
+        private func take() -> CheckedContinuation<String, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            defer { continuation = nil }
+            return continuation
+        }
+    }
+
+    private final class SocketPairResponseWaiterHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var waiter: SocketPairResponseWaiter?
+
+        func install(_ waiter: SocketPairResponseWaiter) {
+            lock.lock()
+            self.waiter = waiter
+            lock.unlock()
+        }
+
+        func resume(throwing error: Error) {
+            lock.lock()
+            let waiter = waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume(throwing: error)
+        }
+    }
+
     private final class SocketPairJSONRPCClient: @unchecked Sendable {
         enum ClientError: Error {
             case closed

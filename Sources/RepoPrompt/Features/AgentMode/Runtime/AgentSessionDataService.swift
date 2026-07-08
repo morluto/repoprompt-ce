@@ -688,6 +688,14 @@ actor AgentSessionDataService {
         for fileURL in files {
             let values = metadataResourceValues(for: fileURL)
             do {
+                // Load a lightweight stub (transcript=nil). Transcript-derived v5 fields
+                // (duration primitives, keyPaths, toolCount, activity bounds) are left empty
+                // here and computed on demand by the `history` tool — see
+                // `AgentSessionMetadataRecord.enrichingTranscriptDerivedFields(from:)`. This
+                // keeps the shared index rebuild — which feeds the agent-mode sidebar and
+                // workspace restore — from decoding every full session transcript just to
+                // precompute fields only history consumes. The save/load path still populates
+                // these fields for free for sessions touched through normal app use.
                 let stub = try await loadAgentSessionStub(
                     from: fileURL,
                     recoverMissingMetadata: false,
@@ -926,18 +934,36 @@ actor AgentSessionDataService {
         let filename = "AgentSession-\(session.id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
 
-        let sessionToSave = sessionPreparedForStorage(
-            session,
-            fileURL: fileURL,
-            savedAt: Date(),
-            preparation: preparation,
-            trustedCanonicalItemCount: trustedCanonicalItemCount
-        )
-        let freshEncoder = JSONEncoder()
-        let data = try freshEncoder.encode(sessionToSave)
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL)
-        await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
-        return fileURL
+        AgentSessionPersistenceSentryTelemetry.recordScheduled(session: session)
+        do {
+            return try await SentryTelemetryBootstrap.spanAsync(
+                .agentSessionPersist,
+                attributes: AgentSessionPersistenceSentryTelemetry.attributes(session: session, outcome: .started)
+            ) { parentSpan in
+                let sessionToSave = try await SentryTelemetryBootstrap.childSpanAsync(
+                    parent: parentSpan,
+                    operation: .agentSessionPrepare,
+                    attributes: AgentSessionPersistenceSentryTelemetry.attributes(session: session, outcome: .started)
+                ) {
+                    sessionPreparedForStorage(
+                        session,
+                        fileURL: fileURL,
+                        savedAt: Date(),
+                        preparation: preparation,
+                        trustedCanonicalItemCount: trustedCanonicalItemCount
+                    )
+                }
+                let freshEncoder = JSONEncoder()
+                let data = try freshEncoder.encode(sessionToSave)
+                try await diskWriter.enqueueAndWait(data: data, url: fileURL)
+                await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
+                AgentSessionPersistenceSentryTelemetry.recordCompleted(session: sessionToSave)
+                return fileURL
+            }
+        } catch {
+            AgentSessionPersistenceSentryTelemetry.recordFailed(session: session)
+            throw error
+        }
     }
 
     func renameAgentSession(
@@ -1386,7 +1412,7 @@ actor AgentSessionDataService {
             if !FileManager.default.fileExists(atPath: root.path) {
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             }
-            let folderName = "Workspace-\(workspace.name)-\(workspace.id.uuidString)"
+            let folderName = WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id)
             let workspaceDir = root.appendingPathComponent(folderName)
             if !FileManager.default.fileExists(atPath: workspaceDir.path) {
                 try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)

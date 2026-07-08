@@ -395,6 +395,46 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         )
     }
 
+    func testSingleWaitTimeoutSurfacesStartupPendingSnapshot() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        let service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder
+        )
+        let startupPending = makeSnapshot(
+            sessionID: fixture.sessionID,
+            status: .running,
+            statusText: AgentRunMCPSnapshot.startupPendingStatusText
+        )
+        await liveSnapshots.set(startupPending)
+        await AgentRunSessionStore.signalSnapshot(startupPending, cursor: fixture.cursor)
+
+        let value = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_id": .string(fixture.sessionID.uuidString),
+            "timeout": .double(0.05)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        let meta = try XCTUnwrap(object["_meta"]?.objectValue)
+        XCTAssertEqual(meta["wait_result"]?.stringValue, "startup_pending")
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+        XCTAssertEqual(object["status_text"]?.stringValue, AgentRunMCPSnapshot.startupPendingStatusText)
+        let completions = await recorder.completions()
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions[0].reason, .startupPending)
+        XCTAssertEqual(completions[0].result, "startup_pending")
+        XCTAssertEqual(completions[0].pendingSessionIDs, [fixture.sessionID])
+    }
+
     private func makeWindow() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -493,6 +533,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         sessionID: UUID,
         runID: UUID? = nil,
         status: AgentRunMCPSnapshot.Status,
+        statusText: String? = nil,
         latestAssistantPreview: String? = nil
     ) -> AgentRunMCPSnapshot {
         AgentRunMCPSnapshot(
@@ -505,7 +546,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             modelRaw: "codex",
             reasoningEffortRaw: nil,
             status: status,
-            statusText: status.rawValue,
+            statusText: statusText ?? status.rawValue,
             latestAssistantPreview: latestAssistantPreview,
             interaction: nil,
             transcriptItemCount: 1,

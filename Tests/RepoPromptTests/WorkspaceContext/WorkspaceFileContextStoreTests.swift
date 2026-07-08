@@ -23,6 +23,8 @@ private actor UUIDRecorder {
 }
 
 final class WorkspaceFileContextStoreTests: XCTestCase {
+    private var cancellables = Set<AnyCancellable>()
+
     func testRootLoadIndexesFilesFoldersReadsContentAndLooksUpPaths() async throws {
         let rootA = try makeTemporaryRoot(name: "RootA")
         let rootB = try makeTemporaryRoot(name: "RootB")
@@ -720,7 +722,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await service.setMutationIOWillBeginHandlerForTesting(nil)
             await store.stopWatchingRoot(id: record.id)
-            withExtendedLifetime(publicationCancellable) {}
+            cancellables.insert(publicationCancellable)
 
             let postTokenRoot = try makeTemporaryRoot(name: "CancelledOverwriteAfterDeferredToken")
             let postTokenFileURL = postTokenRoot.appendingPathComponent("PostToken.swift")
@@ -776,7 +778,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             await postTokenStore.setStoreEditDeferredPublicationDidRegisterHandlerForTesting(nil)
             await postTokenStore.stopWatchingRoot(id: postTokenRecord.id)
-            withExtendedLifetime(postTokenCancellable) {}
+            cancellables.insert(postTokenCancellable)
         }
 
         func testCancelledMoveDeleteAndTrashSettleBeforeIOAndReconcileAfterCompletion() async throws {
@@ -3186,6 +3188,81 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await store.stopWatchingRoot(id: rootID)
         }
 
+        func testReadFreshnessTimeoutThrowsBeforeCanonicalFlightCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ReadFreshnessTimeout")
+            let fileURL = root.appendingPathComponent("Seed.swift")
+            try write("seed", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootRef = WorkspaceRootRef(id: record.id, name: record.name, fullPath: record.standardizedFullPath)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let completed = AsyncSignal()
+            let request = Task { () -> WorkspaceAppliedIngressWaitError? in
+                let observedError: WorkspaceAppliedIngressWaitError?
+                do {
+                    let service = WorkspaceReadableFileService(store: store)
+                    try await service.awaitFreshnessForExplicitRequest(
+                        fileURL.path,
+                        rootRefs: [rootRef],
+                        timeout: .milliseconds(25)
+                    )
+                    observedError = nil
+                } catch let error as WorkspaceAppliedIngressWaitError {
+                    observedError = error
+                } catch {
+                    observedError = nil
+                }
+                await completed.mark()
+                return observedError
+            }
+            let flushStarted = await waitForAsyncCondition {
+                await flushGate.startCount() == 1
+            }
+            XCTAssertTrue(flushStarted)
+            let timedOutPromptly = await waitForAsyncCondition {
+                await completed.isMarked()
+            }
+            XCTAssertTrue(timedOutPromptly)
+
+            await flushGate.release()
+            let error = await request.value
+            XCTAssertEqual(error, WorkspaceAppliedIngressWaitError.timedOut)
+            let settled = await waitForAsyncCondition {
+                let roots = await store.readSearchRootDiagnosticsSnapshot()
+                return roots.first { $0.rootID == record.id }?.barrier.active == nil
+            }
+            XCTAssertTrue(settled)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testTimedExplicitFreshnessReturnsSamplesWhenBarrierCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ReadFreshnessTimeoutSuccess")
+            let fileURL = root.appendingPathComponent("Seed.swift")
+            try write("seed", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootRef = WorkspaceRootRef(id: record.id, name: record.name, fullPath: record.standardizedFullPath)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
+            let service = WorkspaceReadableFileService(store: store)
+
+            try await service.awaitFreshnessForExplicitRequest(
+                fileURL.path,
+                rootRefs: [rootRef],
+                timeout: .seconds(1)
+            )
+            let stats = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
+            let roots = await store.readSearchRootDiagnosticsSnapshot()
+            let settledRoot = try XCTUnwrap(roots.first { $0.rootID == record.id })
+            XCTAssertEqual(stats.launchCount, 1)
+            XCTAssertNotNil(settledRoot.barrier.lastCompleted)
+        }
+
         func testCancelledReadFreshnessJoinThrowsBeforeCanonicalFlightCompletes() async throws {
             let root = try makeTemporaryRoot(name: "ReadFreshnessCancellation")
             let fileURL = root.appendingPathComponent("Seed.swift")
@@ -5218,7 +5295,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(directPublications.flatMap(\.deltas).count, 1, caseLabel)
             let pendingAfterDirectEdit = await serviceB.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterDirectEdit, 0, caseLabel)
-            withExtendedLifetime((cancellableA, cancellableB)) {}
+            cancellables.insert(cancellableA)
+            cancellables.insert(cancellableB)
         }
 
         do {
@@ -5244,7 +5322,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(publications.snapshot().isEmpty, caseLabel)
             let pendingAfterMissingEdit = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterMissingEdit, 0, caseLabel)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         do {
@@ -5275,7 +5353,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(managedOnlyPublications.flatMap(\.deltas).count, 1, caseLabel)
             let pendingAfterManagedOnlyEdit = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterManagedOnlyEdit, 0, caseLabel)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
 
         do {
@@ -5322,7 +5400,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let pendingAfterStaleLifetime = await service.pendingDeferredEditPublicationCountForTesting()
             XCTAssertEqual(pendingAfterStaleLifetime, 0, caseLabel)
             await service.setMutationIOWillBeginHandlerForTesting(nil)
-            withExtendedLifetime(cancellable) {}
+            cancellables.insert(cancellable)
         }
     }
 

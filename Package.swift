@@ -4,9 +4,10 @@ import PackageDescription
 
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 
-// Telemetry (Sentry) is linked only when explicitly requested. The official
-// Developer ID release pipeline sets REPOPROMPT_ENABLE_SENTRY=1; local builds use
-// the same gate for intentional Sentry testing.
+// Telemetry (Sentry) is resolved deterministically but linked only when explicitly
+// requested. The official Developer ID release pipeline sets
+// REPOPROMPT_ENABLE_SENTRY=1; local builds use the same gate for intentional
+// Sentry testing.
 let environment = ProcessInfo.processInfo.environment
 let sentryEnabled = environment["REPOPROMPT_ENABLE_SENTRY"] == "1"
 let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
@@ -39,6 +40,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(path: "Vendor/UniversalCharsetDetection"),
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
+    .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
     .package(path: "Packages/RepoPromptAgentProviders")
 ]
 
@@ -89,7 +91,6 @@ var repoPromptTestSwiftSettings: [SwiftSetting] = [
 ]
 
 if sentryEnabled {
-    packageDependencies.append(.package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"))
     repoPromptDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))
     repoPromptSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
 }
