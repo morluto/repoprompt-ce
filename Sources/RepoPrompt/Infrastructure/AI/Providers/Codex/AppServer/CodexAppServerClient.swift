@@ -672,8 +672,9 @@ actor CodexAppServerClient {
         process.stderr.readabilityHandler = nil
         process.stdin?.closeFile()
         let pid = process.pid
+        let processGroupID = process.processGroupID
         Task.detached {
-            _ = await ProcessTermination.terminateAndReap(pid: pid)
+            _ = await ProcessTermination.terminateAndReap(pid: pid, processGroupID: processGroupID)
         }
     }
 
@@ -693,6 +694,7 @@ actor CodexAppServerClient {
         let pid = process.pid
         _ = await ProcessTermination.terminateAndReap(
             pid: pid,
+            processGroupID: process.processGroupID,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : { _ in }
         )
     }
@@ -1631,6 +1633,7 @@ actor CodexAppServerClient {
             let stderrPipe = Pipe()
             process = SpawnedProcess(
                 pid: pid_t.max,
+                processGroupID: nil,
                 stdin: stdinPipe.fileHandleForWriting,
                 stdinDescriptor: stdinPipe.fileHandleForWriting.fileDescriptor,
                 stdout: stdoutPipe.fileHandleForReading,
