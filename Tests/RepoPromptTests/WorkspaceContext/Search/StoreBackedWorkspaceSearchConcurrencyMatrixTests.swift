@@ -382,7 +382,9 @@ import XCTest
             }
         }
 
-        func release() { fence.release() }
+        func release() {
+            fence.release()
+        }
     }
 
     /// K-way barrier: wait for arrivals then park on a cancellable async release fence.

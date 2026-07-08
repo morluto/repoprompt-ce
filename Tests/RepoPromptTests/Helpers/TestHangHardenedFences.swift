@@ -57,6 +57,24 @@ final class TestReleaseFence: @unchecked Sendable {
         }
     }
 
+    /// Mark entered, then park until `release()` while ignoring task cancellation.
+    ///
+    /// Use this only for tests whose contract is that a cancelled owner does not
+    /// release the underlying body/resource until the test explicitly releases it.
+    /// A detached timeout fails open so a missed release cannot wedge the suite.
+    func enterAndWaitIgnoringCancellationUntilRelease(
+        timeout: TimeInterval = TestFenceDefaults.releaseWait
+    ) async {
+        let waiterID = UUID()
+        Task.detached { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+            self?.timeout(waiterID: waiterID, timeout: timeout)
+        }
+        await withCheckedContinuation { continuation in
+            registerIgnoringCancellation(continuation, waiterID: waiterID)
+        }
+    }
+
     /// Alias used by older engine call sites (`EngineBuildGate.enter`).
     /// Multi-waiter: a second concurrent enter parks another waiter until `release()`.
     func enter() async {
@@ -77,11 +95,11 @@ final class TestReleaseFence: @unchecked Sendable {
     }
 
     /// Synchronous enter wait for **true sync call sites only**
-    /// (e.g. `XCTAssertTrue(gate.waitUntilEntered())` off the main actor).
+    /// (e.g. from a DispatchQueue callback or another non-async context).
     /// Do **not** call this from an `async` function that also needs the enter producer
-    /// on the same serial executor — use the `async` overload instead.
+    /// on the same serial executor — use `await waitUntilEntered(...)` instead.
     @discardableResult
-    func waitUntilEntered(
+    func waitUntilEnteredBlocking(
         timeout: TimeInterval = TestFenceDefaults.enterWait,
         failOnTimeout: Bool = true
     ) -> Bool {
@@ -102,7 +120,7 @@ final class TestReleaseFence: @unchecked Sendable {
     /// Cooperative async enter wait — does **not** block the calling executor.
     @discardableResult
     func waitUntilEntered(
-        timeout: TimeInterval = TestFenceDefaults.enterWait,
+        timeout: TimeInterval,
         failOnTimeout: Bool = true
     ) async -> Bool {
         if hasEntered { return true }
@@ -173,6 +191,19 @@ final class TestReleaseFence: @unchecked Sendable {
         }
     }
 
+    private func registerIgnoringCancellation(_ continuation: CheckedContinuation<Void, Never>, waiterID: UUID) {
+        condition.lock()
+        entered = true
+        condition.broadcast()
+        if released {
+            condition.unlock()
+            continuation.resume()
+        } else {
+            continuations[waiterID] = continuation
+            condition.unlock()
+        }
+    }
+
     private func registerParkOnly(_ continuation: CheckedContinuation<Void, Never>, waiterID: UUID) {
         condition.lock()
         if released || Task.isCancelled || cancelledWaiters.remove(waiterID) != nil {
@@ -193,6 +224,15 @@ final class TestReleaseFence: @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
         continuation?.resume()
+    }
+
+    private func timeout(waiterID: UUID, timeout: TimeInterval) {
+        condition.lock()
+        let continuation = continuations.removeValue(forKey: waiterID)
+        condition.unlock()
+        guard let continuation else { return }
+        XCTFail("Timed out waiting for \(name) release after \(String(format: "%.1f", timeout))s")
+        continuation.resume()
     }
 }
 

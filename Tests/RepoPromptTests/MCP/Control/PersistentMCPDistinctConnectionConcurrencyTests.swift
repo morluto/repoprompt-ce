@@ -161,7 +161,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 return TimeInterval(components.seconds)
                     + (TimeInterval(components.attoseconds) / 1e18)
             }()
-            try await withThrowingTaskGroup(of: T.self) { group in
+            return try await withThrowingTaskGroup(of: T.self) { group in
                 group.addTask {
                     try await operation()
                 }

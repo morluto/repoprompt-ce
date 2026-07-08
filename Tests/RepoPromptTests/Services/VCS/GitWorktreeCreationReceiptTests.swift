@@ -1854,13 +1854,17 @@ private actor MutationTokenBox {
     private final class ReceiptMutationLockGate: @unchecked Sendable {
         private let fence = TestReleaseFence(name: "receipt mutation lock gate")
 
-        func enterAndWaitForRelease() async { await fence.enterAndWait() }
+        func enterAndWaitForRelease() async {
+            await fence.enterAndWait()
+        }
 
         func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
             _ = await fence.waitUntilEntered(timeout: timeout)
         }
 
-        func release() { fence.release() }
+        func release() {
+            fence.release()
+        }
     }
 #endif
 

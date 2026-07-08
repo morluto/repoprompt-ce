@@ -4069,7 +4069,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     queue.async {
                         let result: Result<String, Error>
                         do {
-                            result = .success(try self.readResponse(
+                            result = try .success(self.readResponse(
                                 matching: expectedID,
                                 deadline: deadline,
                                 isCancelled: { waitState.isCancelled }
@@ -4214,7 +4214,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
             self.cancelled = self.cancelled || cancelled
             completed = true
-            let continuation = self.continuation
+            let continuation = continuation
             self.continuation = nil
             lock.unlock()
             return continuation

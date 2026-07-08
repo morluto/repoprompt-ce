@@ -1309,7 +1309,7 @@ private final class AsyncGate: @unchecked Sendable {
     private let fence = TestReleaseFence(name: "file system content loading async gate")
 
     func markStartedAndWaitForRelease() async {
-        await fence.enterAndWait()
+        await fence.enterAndWaitIgnoringCancellationUntilRelease()
     }
 
     func waitUntilStarted(timeout: TimeInterval = TestFenceDefaults.enterWait) async {

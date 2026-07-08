@@ -106,8 +106,10 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
         let catalogTask = Task {
             await catalog.resolveManifestBinding(rootEpoch, bindingIdentity.standardizedRelativePath)
         }
-        await sourceGate.waitUntilEntered()
-        await catalogGate.waitUntilEntered()
+        let sourceEntered = await sourceGate.waitUntilEntered()
+        let catalogEntered = await catalogGate.waitUntilEntered()
+        XCTAssertTrue(sourceEntered)
+        XCTAssertTrue(catalogEntered)
         let didUnregister = await registry.unregister(token)
         XCTAssertTrue(didUnregister)
         await sourceGate.release()
@@ -177,8 +179,10 @@ final class WorkspaceCodemapBindingIntegrationRegistryTests: XCTestCase {
         let catalogTask = Task {
             await catalog.resolveManifestBinding(rootEpoch, identity.standardizedRelativePath)
         }
-        await sourceGate.waitUntilEntered()
-        await catalogGate.waitUntilEntered()
+        let sourceEntered = await sourceGate.waitUntilEntered()
+        let catalogEntered = await catalogGate.waitUntilEntered()
+        XCTAssertTrue(sourceEntered)
+        XCTAssertTrue(catalogEntered)
 
         routeEndpoint = nil
         XCTAssertNil(weakEndpoint.value)

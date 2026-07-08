@@ -1719,7 +1719,6 @@ actor CodemapAutomaticSelectionSequenceHarness {
             return waiterInvocationCount >= expectedCount
         }
     }
-
 }
 
 private final class CodemapAutomaticSelectionWaitState: @unchecked Sendable {
@@ -1984,7 +1983,9 @@ private final class CodemapRetrySleepGateState: @unchecked Sendable {
 final class CodemapSuspensionGate: @unchecked Sendable {
     private let fence = TestReleaseFence(name: "codemap suspension gate")
 
-    func enterAndWait() async { await fence.enterAndWait() }
+    func enterAndWait() async {
+        await fence.enterAndWait()
+    }
 
     @discardableResult
     func waitUntilEntered(
@@ -1994,7 +1995,9 @@ final class CodemapSuspensionGate: @unchecked Sendable {
         await fence.waitUntilEntered(timeout: timeout, failOnTimeout: failOnTimeout)
     }
 
-    func release() { fence.release() }
+    func release() {
+        fence.release()
+    }
 }
 
 /// Armable suspension: only parks after `arm()`.

@@ -2765,13 +2765,17 @@ private final class ManifestLockedMergeGate: @unchecked Sendable {
 private final class ManifestAccessRefreshGate: @unchecked Sendable {
     private let fence = TestReleaseFence(name: "manifest access refresh gate")
 
-    func block() async { await fence.enterAndWait() }
+    func block() async {
+        await fence.enterAndWait()
+    }
 
     func waitUntilBlocked(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
         _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
-    func release() { fence.release() }
+    func release() {
+        fence.release()
+    }
 }
 
 private final class ManifestRootReplacementHook: @unchecked Sendable {

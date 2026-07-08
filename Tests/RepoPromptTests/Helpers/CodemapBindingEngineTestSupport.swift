@@ -674,8 +674,17 @@ final class EngineLockedFlag: @unchecked Sendable {
 final class EngineBuildGate: @unchecked Sendable {
     private let fence = TestReleaseFence(name: "engine build gate")
 
-    func enter() async { await fence.enter() }
-    func enterAndWait() async { await fence.enterAndWait() }
+    func enter() async {
+        await fence.enter()
+    }
+
+    func enterAndWait() async {
+        await fence.enterAndWait()
+    }
+
+    func enterIgnoringCancellationUntilRelease() async {
+        await fence.enterAndWaitIgnoringCancellationUntilRelease()
+    }
 
     @discardableResult
     func waitUntilEntered(
@@ -686,14 +695,16 @@ final class EngineBuildGate: @unchecked Sendable {
     }
 
     @discardableResult
-    func waitUntilEntered(
+    func waitUntilEnteredBlocking(
         timeout: TimeInterval = TestFenceDefaults.enterWait,
         failOnTimeout: Bool = true
     ) -> Bool {
-        fence.waitUntilEntered(timeout: timeout, failOnTimeout: failOnTimeout)
+        fence.waitUntilEnteredBlocking(timeout: timeout, failOnTimeout: failOnTimeout)
     }
 
-    func release() { fence.release() }
+    func release() {
+        fence.release()
+    }
 }
 
 actor EngineOneShotFileMutation {
@@ -750,22 +761,25 @@ final class EngineBlockingGate: @unchecked Sendable {
         fence.waitUntilEntered(timeout: timeout, failOnTimeout: failOnTimeout)
     }
 
-    func release() { fence.release() }
+    func release() {
+        fence.release()
+    }
 }
 
 /// Async engine fence — named thin wrapper over `TestReleaseFence`.
 final class EngineAsyncGate: @unchecked Sendable {
     private let fence = TestReleaseFence(name: "engine async gate")
 
-    func enterAndWait() async { await fence.enterAndWait() }
+    func enterAndWait() async {
+        await fence.enterAndWait()
+    }
 
     @discardableResult
-    func waitUntilEntered(
+    func waitUntilEnteredBlocking(
         timeout: TimeInterval = TestFenceDefaults.enterWait,
         failOnTimeout: Bool = true
     ) -> Bool {
-        // Sync call sites: `XCTAssertTrue(gate.waitUntilEntered())`.
-        fence.waitUntilEntered(timeout: timeout, failOnTimeout: failOnTimeout)
+        fence.waitUntilEnteredBlocking(timeout: timeout, failOnTimeout: failOnTimeout)
     }
 
     @discardableResult
@@ -776,7 +790,9 @@ final class EngineAsyncGate: @unchecked Sendable {
         await fence.waitUntilEntered(timeout: timeout, failOnTimeout: failOnTimeout)
     }
 
-    func release() { fence.release() }
+    func release() {
+        fence.release()
+    }
 }
 
 enum EngineBulkCancellationOperation: CaseIterable {

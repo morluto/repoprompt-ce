@@ -259,7 +259,8 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
                     folderPolicy: .expandFolders
                 )
             }
-            await gate.waitUntilEntered()
+            let gateEntered = await gate.waitUntilEntered()
+            XCTAssertTrue(gateEntered)
             await store.releaseSessionWorktreeOwnership(ownerID: fixture.sessionID)
             let replacement = try await store.loadRoot(
                 path: worktreeRoot.path,

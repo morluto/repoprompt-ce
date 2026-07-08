@@ -503,13 +503,17 @@ final class WindowCloseCoordinatorPolicyTests: XCTestCase {
 private final class APISettingsInitialLoadGate: @unchecked Sendable {
     private let fence = TestReleaseFence(name: "API settings initial load gate")
 
-    func arriveAndWait() async { await fence.enterAndWait() }
+    func arriveAndWait() async {
+        await fence.enterAndWait()
+    }
 
     func waitUntilEntered(timeout: TimeInterval = TestFenceDefaults.enterWait) async {
         _ = await fence.waitUntilEntered(timeout: timeout)
     }
 
-    func release() { fence.release() }
+    func release() {
+        fence.release()
+    }
 }
 
 private actor APISettingsProviderValidationProbe {
@@ -541,9 +545,9 @@ private final class GitContextRefreshGate: @unchecked Sendable {
         lock.unlock()
 
         await withTaskCancellationHandler {
-            await fence.enterAndWait()
+            await fence.enterAndWaitIgnoringCancellationUntilRelease()
         } onCancel: {
-            // Fence resumes the park via sticky cancel; record observation here.
+            // Record cancellation, but keep the simulated refresh body parked until release.
             self.recordCancellation()
         }
 
