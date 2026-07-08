@@ -197,13 +197,25 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             throw CursorACPLaunchResolutionError.environmentDiscoveryRequired(configuredCommand)
         }
         let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
-        _ = shellEnvironmentSource
-        return try validatedLaunch(
-            entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
-            configuredCommand: configuredCommand,
-            additionalPathHints: effectiveHints,
-            environment: environment
-        )
+        do {
+            return try validatedLaunch(
+                entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
+                configuredCommand: configuredCommand,
+                additionalPathHints: effectiveHints,
+                environment: environment
+            )
+        } catch {
+            // Explicit-path failures intentionally keep their specific errors
+            // (exactPathNotFound / unsafeApplicationPath / unsafeCanonicalBasename) and omit the
+            // fallback-PATH hint: an exact configured path does not depend on PATH discovery.
+            // Still record the same resolution-failure telemetry OpenCode emits for explicit paths.
+            AgentCLILaunchDiagnostics.recordPathResolutionFailure(
+                providerKind: .cursor,
+                shellEnvironmentSource: shellEnvironmentSource,
+                candidateCount: 1
+            )
+            throw error
+        }
     }
 
     private func validatedConfiguredCommand(_ config: CursorAgentConfig) throws -> String {
