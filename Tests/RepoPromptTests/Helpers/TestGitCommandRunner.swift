@@ -31,13 +31,15 @@ enum TestGitCommandRunner {
     static func runResult(
         _ arguments: [String],
         cwd: URL,
-        environment: Environment = .hermetic
+        environment: Environment = .hermetic,
+        timeout: TimeInterval = TestProcessRunner.defaultTimeout
     ) throws -> TestProcessResult {
         try TestProcessRunner.run(
             executableURL: executableURL,
             arguments: arguments,
             currentDirectoryURL: cwd,
-            environment: processEnvironment(environment)
+            environment: processEnvironment(environment),
+            timeout: timeout
         )
     }
 
@@ -46,9 +48,10 @@ enum TestGitCommandRunner {
         _ arguments: [String],
         cwd: URL,
         environment: Environment = .hermetic,
+        timeout: TimeInterval = TestProcessRunner.defaultTimeout,
         failureDomain: String
     ) throws -> String {
-        let result = try runResult(arguments, cwd: cwd, environment: environment)
+        let result = try runResult(arguments, cwd: cwd, environment: environment, timeout: timeout)
         guard result.terminationStatus == 0 else {
             throw NSError(
                 domain: failureDomain,
