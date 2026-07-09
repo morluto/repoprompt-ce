@@ -7,9 +7,8 @@ public enum CodexReasoningEffort: String, CaseIterable, Codable, Sendable {
     case medium
     case high
     case xhigh
-    case max
 
-    static let displayOrder: [CodexReasoningEffort] = [.none, .minimal, .low, .medium, .high, .xhigh, .max]
+    static let displayOrder: [CodexReasoningEffort] = [.none, .minimal, .low, .medium, .high, .xhigh]
 
     static func parse(_ raw: String?) -> CodexReasoningEffort? {
         let normalized = raw?
@@ -29,8 +28,6 @@ public enum CodexReasoningEffort: String, CaseIterable, Codable, Sendable {
             return .high
         case "xhigh", "x-high":
             return .xhigh
-        case "max", "maximum":
-            return .max
         default:
             return nil
         }
@@ -50,8 +47,6 @@ public enum CodexReasoningEffort: String, CaseIterable, Codable, Sendable {
             "High"
         case .xhigh:
             "XHigh"
-        case .max:
-            "Max"
         }
     }
 }

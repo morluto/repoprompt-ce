@@ -1622,7 +1622,6 @@ public enum AIModel: Equatable, Hashable {
 
         let suffixes = [
             "-xhigh", " xhigh", "-x-high", " x-high",
-            "-maximum", " maximum", "-max", " max",
             "-medium", " medium", "-med", " med",
             "-minimal", " minimal",
             "-high", " high",

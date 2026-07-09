@@ -373,7 +373,7 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt56SolLow
             case .some(.high):
                 .gpt56SolHigh
-            case .some(.xhigh), .some(.max):
+            case .some(.xhigh):
                 .gpt56SolXHigh
             case .some(.none), .some(.minimal), .some(.medium):
                 .gpt56SolMedium
@@ -388,7 +388,7 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt56TerraLow
             case .some(.high):
                 .gpt56TerraHigh
-            case .some(.xhigh), .some(.max):
+            case .some(.xhigh):
                 .gpt56TerraXHigh
             case .some(.none), .some(.minimal), .some(.medium):
                 .gpt56TerraMedium
@@ -403,7 +403,7 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt56LunaLow
             case .some(.high):
                 .gpt56LunaHigh
-            case .some(.xhigh), .some(.max):
+            case .some(.xhigh):
                 .gpt56LunaXHigh
             case .some(.none), .some(.minimal), .some(.medium):
                 .gpt56LunaMedium

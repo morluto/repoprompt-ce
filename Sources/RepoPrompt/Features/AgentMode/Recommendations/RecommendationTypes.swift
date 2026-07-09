@@ -307,9 +307,9 @@ enum BestPracticeProfiles {
     static let bestPlanning = UseCase(
         id: "bestPlanning",
         title: "Best Planning",
-        modelLabel: "GPT-5.6 Sol Max",
+        modelLabel: "GPT-5.6 Sol XHigh",
         accessLabel: "ChatGPT Pro export",
-        modelString: "gpt-5.6-sol-max",
+        modelString: "gpt-5.6-sol-xhigh",
         agentKind: nil,
         agentModel: nil,
         strengths: [
@@ -383,7 +383,7 @@ enum BestPracticeProfiles {
     GPT-5.6 Sol is available to RepoPrompt through Codex CLI; do not configure it as an OpenAI API/OpenRouter model.
 
     Use GPT‑5.6 Sol Low via Codex CLI for Context Builder discovery and explore, \
-    GPT‑5.6 Sol Medium for Engineer/default implementation, and GPT‑5.6 Sol High for Oracle, review, and pair-agent work. Use GPT‑5.6 Sol Max for ChatGPT Pro export/planning.
+    GPT‑5.6 Sol Medium for Engineer/default implementation, and GPT‑5.6 Sol High for Oracle, review, and pair-agent work. Use GPT‑5.6 Sol XHigh for ChatGPT Pro export/planning.
     """
 
     static let contextBuilderRationale = "Codex with GPT-5.6 Sol Low provides the best Context Builder/discovery default – strong codebase exploration with practical usage burn."
