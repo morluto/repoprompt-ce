@@ -223,7 +223,7 @@ struct ChatGlobalSettings: Codable {
 /// Stores the global Context Builder agent/model selection (single source of truth).
 /// This is NOT per-workspace - it's the same across all workspaces.
 /// Persisted field names still use the legacy discover-agent keys for compatibility.
-struct GlobalDefaults: Codable {
+struct GlobalDefaults: Codable, Equatable {
     /// Global Context Builder agent selection (shared across all workspaces).
     var discoverAgentRaw: String?
     /// Maps agent rawValue to last-used model rawValue for that agent (global)
@@ -293,6 +293,9 @@ class GlobalSettingsStore: ObservableObject {
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
+    /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
+    /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
+    @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason?
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
     private var scalarPreferences = GlobalScalarPreferences()
 
@@ -303,6 +306,7 @@ class GlobalSettingsStore: ObservableObject {
     private static let defaultSelectedFilesSortMethodRaw = "nameAscending"
     private static let defaultFileEditFormatRaw = "Diff"
     private static let defaultComplexEditStrategyRaw = "Sequential split"
+    private static let telemetryEnabledDefaultsKey = "telemetry.enabled"
     private static let settingsWriteDiagnosticsLimit = 80
 
     private var settingsWriteDiagnostics: [GlobalSettingsWriteDiagnostic] = []
@@ -494,6 +498,22 @@ class GlobalSettingsStore: ObservableObject {
         updateUIScalar(commit: commit) { settings in
             settings.enableKeyboardShortcuts = enabled
         }
+    }
+
+    // MARK: - History
+
+    func historyIdleThresholdMinutes() -> Int {
+        let raw = (defaults.object(forKey: HistoryMCPToolService.idleThresholdSettingsKey) as? Int)
+            ?? AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        // Defense for out-of-band writes; the UI slider caps 0...60 but `defaults write`
+        // can store anything. Clamp to the spec's 0...1440 range.
+        return min(max(0, raw), 1440)
+    }
+
+    func setHistoryIdleThresholdMinutes(_ minutes: Int) {
+        let clamped = min(max(0, minutes), 1440)
+        defaults.set(clamped, forKey: HistoryMCPToolService.idleThresholdSettingsKey)
+        objectWillChange.send()
     }
 
     func fontScaleBodySize() -> Double {
@@ -1031,6 +1051,47 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func telemetryEnabled() -> Bool {
+        if let mirrored = defaults.object(forKey: Self.telemetryEnabledDefaultsKey) as? Bool {
+            return mirrored
+        }
+        return scalarPreferences.telemetry?.enabled ?? Self.defaultTelemetryEnabled
+    }
+
+    func setTelemetryEnabled(_ enabled: Bool, commit: Bool = true) {
+        defaults.set(enabled, forKey: Self.telemetryEnabledDefaultsKey)
+        updateTelemetryScalar(commit: commit) { settings in
+            settings.enabled = enabled
+        }
+        if enabled {
+            SentryTelemetryBootstrap.start()
+        } else {
+            SentryTelemetryBootstrap.disableAndClose()
+        }
+    }
+
+    func telemetryAppHangReportsEnabled() -> Bool {
+        scalarPreferences.telemetry?.appHangReportsEnabled ?? false
+    }
+
+    func setTelemetryAppHangReportsEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateTelemetryScalar(commit: commit) { settings in
+            settings.appHangReportsEnabled = enabled
+        }
+        SentryTelemetryBootstrap.restartIfStarted()
+    }
+
+    func telemetryPerformanceTracingEnabled() -> Bool {
+        scalarPreferences.telemetry?.performanceTracingEnabled ?? false
+    }
+
+    func setTelemetryPerformanceTracingEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateTelemetryScalar(commit: commit) { settings in
+            settings.performanceTracingEnabled = enabled
+        }
+        SentryTelemetryBootstrap.restartIfStarted()
+    }
+
     func modelResponsesOverrides() -> [String: Bool] {
         scalarPreferences.modelOverrides?.responsesOverrides ?? [:]
     }
@@ -1111,6 +1172,17 @@ class GlobalSettingsStore: ObservableObject {
             var settings = preferences.agentMode ?? GlobalScalarPreferences.AgentModeSettings()
             mutation(&settings)
             preferences.agentMode = settings
+        }
+    }
+
+    private func updateTelemetryScalar(
+        commit: Bool,
+        _ mutation: (inout GlobalScalarPreferences.TelemetrySettings) -> Void
+    ) {
+        updateScalarPreferences(commit: commit) { preferences in
+            var settings = preferences.telemetry ?? GlobalScalarPreferences.TelemetrySettings()
+            mutation(&settings)
+            preferences.telemetry = settings
         }
     }
 
@@ -1340,6 +1412,19 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    /// Publishes `objectWillChange` when `globalDefaults` changed and persists if `commit`.
+    /// Centralizes the publish-on-mutate contract for the global-defaults surface (Context
+    /// Builder agent, MCP role overrides, recommendation provider filter) so any change
+    /// propagates to every observing window; route all `globalDefaults` mutations through here.
+    private func persistGlobalDefaultsChange(before: GlobalDefaults, commit: Bool) {
+        if before != globalDefaults {
+            objectWillChange.send()
+        }
+        if commit {
+            save()
+        }
+    }
+
     // MARK: - Global Context Builder Agent Selection (Single Source of Truth)
 
     /// Returns the raw persisted global Context Builder selection without synthesizing a fallback.
@@ -1400,6 +1485,7 @@ class GlobalSettingsStore: ObservableObject {
         function: StaticString = #function
     ) {
         let oldSelection = globalContextBuilderAgentSelection()
+        let globalDefaultsBeforeMutation = globalDefaults
         let normalized = AgentModelCatalog.normalizeSelection(agentRaw: agentRaw, modelRaw: modelRaw)
         globalDefaults.discoverAgentRaw = normalized.agent.rawValue
         if globalDefaults.discoverModelsByAgent == nil {
@@ -1422,7 +1508,7 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
-        save()
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: true)
     }
 
     /// Sets the global Context Builder agent and optionally updates/clears that agent's
@@ -1439,6 +1525,7 @@ class GlobalSettingsStore: ObservableObject {
         function: StaticString = #function
     ) {
         let oldSelection = globalContextBuilderAgentSelection()
+        let globalDefaultsBeforeMutation = globalDefaults
         let trimmedAgentRaw = agentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let agent = AgentProviderKind(rawValue: trimmedAgentRaw)
             ?? AgentModelCatalog.normalizeSelection(agentRaw: trimmedAgentRaw, modelRaw: modelRaw).agent
@@ -1477,7 +1564,7 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
-        save()
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: true)
     }
 
     /// Returns whether the user has explicitly set the global Context Builder agent defaults.
@@ -1525,10 +1612,9 @@ class GlobalSettingsStore: ObservableObject {
     /// Updates global MCP Agent Mode role-default overrides.
     /// Empty dictionaries are normalized to nil.
     func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool = true) {
+        let globalDefaultsBeforeMutation = globalDefaults
         globalDefaults.mcpAgentRoleOverrides = Self.normalizedMCPAgentRoleOverrides(overrides)
-        if commit {
-            save()
-        }
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: commit)
     }
 
     // MARK: - Recommendation Provider Filter (Global)
@@ -1567,6 +1653,7 @@ class GlobalSettingsStore: ObservableObject {
 
     /// Updates the global provider filter. Passing all providers clears the override.
     func setGlobalRecommendationProviderFilter(_ providers: Set<RecommendationProviderKind>, commit: Bool = true) {
+        let globalDefaultsBeforeMutation = globalDefaults
         if providers == Set(RecommendationProviderKind.allCases) {
             globalDefaults.recommendationProviderFilterRaw = nil
         } else {
@@ -1574,9 +1661,7 @@ class GlobalSettingsStore: ObservableObject {
                 .filter { providers.contains($0) }
                 .map(\.rawValue)
         }
-        if commit {
-            save()
-        }
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: commit)
     }
 
     private func normalizedRoleOverrides(_ overrides: [String: String]?) -> [String: String]? {
@@ -1641,12 +1726,59 @@ class GlobalSettingsStore: ObservableObject {
     // MARK: - Persistence
 
     private func load() {
-        let document = fileStore.loadOrCreateDefault()
+        let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
+        let loadedExistingDocument = fileExists ? try? fileStore.load() : nil
+        let existingFileWasCorrupt = fileExists && loadedExistingDocument == nil
+        if !fileExists {
+            defaults.removeObject(forKey: Self.telemetryEnabledDefaultsKey)
+        } else if existingFileWasCorrupt {
+            defaults.set(false, forKey: Self.telemetryEnabledDefaultsKey)
+        }
+        let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
         copySettings = document.copySettings
         chatSettings = document.chatSettings
         globalDefaults = document.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+        if !existingFileWasCorrupt {
+            syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
+        }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
+        persistenceBlockReason = fileStore.blockReason
+    }
+
+    /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
+    /// up the offending on-disk file, writes the current in-memory settings as a fresh
+    /// current-schema document, and clears the block; this method then re-reads state so the
+    /// store and observers refresh.
+    /// Returns true only when recovery completed successfully.
+    @discardableResult
+    func recoverBlockedPersistenceAfterBackup() -> Bool {
+        let backedUp = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
+        objectWillChange.send()
+        load()
+        return backedUp
+    }
+
+    /// User-initiated compatible import from a blocked newer/different-schema settings file.
+    /// The file store backs up the original, writes a current-schema document containing only
+    /// CE-known fields, then this store reloads those imported settings.
+    @discardableResult
+    func importBlockedPersistenceAfterBackup() -> Bool {
+        let imported = fileStore.performUserInitiatedCompatibleImport()
+        objectWillChange.send()
+        if imported {
+            load()
+        } else {
+            persistenceBlockReason = fileStore.blockReason
+        }
+        return imported
+    }
+
+    /// Retries writing the current in-memory settings after a transient save failure, without
+    /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
+    @discardableResult
+    func retryBlockedPersistenceSave() -> Bool {
+        save()
     }
 
     @discardableResult
@@ -1658,9 +1790,12 @@ class GlobalSettingsStore: ObservableObject {
             chatSettings = document.chatSettings
             globalDefaults = document.globalDefaults
             scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
+            syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
+            persistenceBlockReason = fileStore.blockReason
             return true
         } catch {
+            persistenceBlockReason = fileStore.blockReason
             print("⚠️ Failed to reload global settings JSON at \(fileStore.fileURL.path): \(error)")
             return false
         }
@@ -1695,18 +1830,45 @@ class GlobalSettingsStore: ObservableObject {
         return "\(trimmed).snap_to_planning"
     }
 
-    private func save() {
-        let document = GlobalSettingsDocument(
+    private func syncTelemetryMirrorFromLoadedSettings(_ preferences: GlobalScalarPreferences) {
+        if let enabled = preferences.telemetry?.enabled {
+            defaults.set(enabled, forKey: Self.telemetryEnabledDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: Self.telemetryEnabledDefaultsKey)
+        }
+    }
+
+    private static var defaultTelemetryEnabled: Bool {
+        #if REPOPROMPT_SENTRY_ENABLED
+            true
+        #else
+            false
+        #endif
+    }
+
+    private func makeDocument() -> GlobalSettingsDocument {
+        GlobalSettingsDocument(
             copySettings: copySettings,
             chatSettings: chatSettings,
             globalDefaults: globalDefaults,
             scalarPreferences: scalarPreferences
         )
+    }
 
+    @discardableResult
+    private func save() -> Bool {
         do {
-            try fileStore.save(document)
+            try fileStore.save(makeDocument())
+            if persistenceBlockReason != fileStore.blockReason {
+                persistenceBlockReason = fileStore.blockReason
+            }
+            return true
         } catch {
+            if persistenceBlockReason != fileStore.blockReason {
+                persistenceBlockReason = fileStore.blockReason
+            }
             print("⚠️ Failed to save global settings JSON at \(fileStore.fileURL.path): \(error)")
+            return false
         }
     }
 }

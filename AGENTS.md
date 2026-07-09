@@ -147,6 +147,7 @@ These settings are intentionally DEBUG-only. If a key is unavailable, confirm `r
 Prefer the developer daemon as the default way to build, run, and validate. Two properties are the whole reason it exists — and the reason to reach for it instead of a bare `swift build` / `swift test`:
 
 - **Lane-serialized job queue** — every job claims named lanes (`build`, `debugArtifact`, `liveApp`, `release`, `style`); the daemon runs jobs that share a lane one at a time while letting unrelated lanes proceed concurrently. That serial queue is what stops multiple agents from building, launching, or running style tooling over each other and corrupting `.build` or the live app.
+- **Machine-wide heavy-job slot** — Swift/Xcode-heavy daemon jobs also acquire a per-user global heavy slot before spawning their subprocess. This coordinates expensive work across worktree-local conductor daemons. If `job status` or `job wait` shows `global-wait` or "waiting for global heavy slot", another checkout/worktree is already running heavy work; wait on the ticket instead of bypassing conductor with direct `swift`/`xcodebuild` commands or starting duplicate jobs.
 - **Tickets + async jobs** — every job gets a ticket and can run detached (`--async`). Fire a build, keep working, and query or wait on it later (`job status` / `job wait`) instead of blocking on a long compile. Jobs survive reconnects and are reusable by `--request-key`.
 
 `conductor` is repo-internal developer tooling for this checkout; the daemon auto-starts on first use.
@@ -213,11 +214,12 @@ These do not claim daemon lanes or lifecycle supersession, so when multiple agen
 
 See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). In short:
 
+- The shipped `RepoPrompt` executable target lives under `Sources/RepoPromptExecutable` and must remain a one-file entry shell over the internal `RepoPromptApp` target; do not add implementation code there.
 - Product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
-- App lifecycle, launch/configuration, command, and composition-root wiring stays under `Sources/RepoPrompt/App`.
-- Cross-cutting service/platform substrate goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
+- App lifecycle, launch/configuration, command, and composition-root wiring stays under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
+- Cross-cutting service/platform substrate stays under `Sources/RepoPrompt/Infrastructure/<Area>` in the `RepoPromptApp` target.
 - App-wide notification names and root app views/view models belong under `Sources/RepoPrompt/App`.
-- Bridging-header-sensitive support stays under `Sources/RepoPrompt/Support` unless `Package.swift` is updated in the same change.
+- Bridging-header-sensitive support stays under `Sources/RepoPrompt/Support` and is owned by `RepoPromptApp` unless `Package.swift` is updated in the same change.
 - Reusable UI, diffing, regex, networking, process, security, and utility substrate should use the narrowest `Sources/RepoPrompt/Infrastructure/<Area>` owner.
 - App-integrated diagnostics belong under `Sources/RepoPrompt/Features/Diagnostics` and need a documented entry point/purpose.
 - App/CLI protocol code shared by both products belongs under `Sources/RepoPromptShared`.

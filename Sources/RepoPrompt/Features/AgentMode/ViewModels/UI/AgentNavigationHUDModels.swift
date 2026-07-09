@@ -35,6 +35,12 @@ enum AgentNavigationHUDMode: String, Equatable, CaseIterable, Identifiable {
 enum AgentNavigationHUDNotificationUserInfoKey {
     static let windowID = "windowID"
     static let mode = "mode"
+    static let resultIndex = "resultIndex"
+    static let handledRequest = "handledRequest"
+}
+
+final class AgentNavigationHUDHandledRequest {
+    var handled = false
 }
 
 struct AgentNavigationHUDItem: Identifiable, Equatable {
@@ -63,6 +69,8 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
     let mergeAttention: AgentWorktreeMergeAttention?
     let mergeLabel: String?
     let isMCPControlled: Bool
+    let isArchived: Bool
+    let searchFields: AgentSessionSearchFields
 
     var isSubagent: Bool {
         depth > 0
@@ -104,23 +112,10 @@ struct AgentNavigationHUDItem: Identifiable, Equatable {
         return Self.label(for: runState)
     }
 
-    var metadataSearchText: [String] {
-        [
-            title,
-            workspaceTitle,
-            windowTitle,
-            statusLabel,
-            isSubagent ? "sub-agent" : nil,
-            subagentCount > 0 ? "subagents" : nil,
-            worktreeLabel,
-            mergeLabel,
-            isMCPControlled ? "MCP" : nil
-        ].compactMap(\.self)
-    }
-
     var accessibilityStatusText: String {
         var parts: [String] = []
         if let statusLabel { parts.append(statusLabel) }
+        if isArchived { parts.append("Archived") }
         if isMCPControlled { parts.append("MCP controlled") }
         if let worktreeLabel { parts.append("worktree \(worktreeLabel)") }
         if let mergeLabel { parts.append("merge ready to \(mergeLabel)") }
@@ -174,22 +169,25 @@ enum AgentNavigationHUDSnapshotBuilder {
     }
 
     @MainActor
-    static func allAgentsSnapshot(now: Date = Date()) -> AgentNavigationHUDSnapshot {
-        allAgentsSnapshot(windows: WindowStatesManager.shared.allWindows, now: now)
+    static func allAgentsSnapshot(currentWindow: WindowState? = nil, now: Date = Date()) -> AgentNavigationHUDSnapshot {
+        allAgentsSnapshot(windows: WindowStatesManager.shared.allWindows, currentWindow: currentWindow, now: now)
     }
 
     @MainActor
     static func allAgentsSnapshot(
         windows: [WindowState],
+        currentWindow: WindowState? = nil,
         now: Date = Date()
     ) -> AgentNavigationHUDSnapshot {
-        let rows = windows
+        let liveRows = windows
             .filter { !$0.isClosing }
             .flatMap { currentWindowItems(windowState: $0) }
+        let archivedRows = currentWindow.map(currentWorkspaceArchivedItems(windowState:)) ?? []
+        // Archived rows deliberately bypass the live 24h inclusion filter; they are search-only.
         return AgentNavigationHUDSnapshot(
             mode: .allAgents,
             title: AgentNavigationHUDMode.allAgents.title,
-            items: allAgentsSorted(rows, now: now)
+            items: allAgentsSorted(liveRows, now: now) + archivedRows
         )
     }
 
@@ -210,6 +208,19 @@ enum AgentNavigationHUDSnapshotBuilder {
         )
         return rows.map { row in
             let descendantCounts = rootDescendantCounts[row.tabID] ?? (count: 0, attentionCount: 0)
+            let runState = runStateByTabID[row.tabID]
+            let attentionState = attentionRunStateByTabID[row.tabID]
+            let mergeLabel = row.worktreeMergeAttention?.targetLabel
+            let searchFields = AgentSessionSearchFields(
+                fields: row.searchFields.fields + AgentSessionSearchFields(
+                    title: nil,
+                    primary: [workspaceTitle, windowTitle],
+                    status: [attentionState?.searchLabel, runState?.searchLabel, mergeLabel == nil ? nil : "merge"],
+                    worktree: [mergeLabel],
+                    secondary: [row.depth > 0 ? "sub-agent" : nil, row.hasThreadChildren ? "subagents" : nil],
+                    identifier: [workspaceID.uuidString]
+                ).fields
+            )
             return AgentNavigationHUDItem(
                 windowID: windowID,
                 workspaceID: workspaceID,
@@ -223,15 +234,17 @@ enum AgentNavigationHUDSnapshotBuilder {
                 subagentCount: row.depth == 0 ? descendantCounts.count : 0,
                 subagentAttentionCount: row.depth == 0 ? descendantCounts.attentionCount : 0,
                 isActiveTab: row.tabID == currentTabID,
-                runState: runStateByTabID[row.tabID],
-                attentionState: attentionRunStateByTabID[row.tabID],
+                runState: runState,
+                attentionState: attentionState,
                 attentionMarkedAt: attentionMarkedAtByTabID[row.tabID],
                 activityDate: row.threadActivityDate ?? row.lastUserMessageAt ?? row.activityDate,
                 worktree: row.worktree,
                 worktreeLabel: row.worktree?.label,
                 mergeAttention: row.worktreeMergeAttention,
-                mergeLabel: row.worktreeMergeAttention?.targetLabel,
-                isMCPControlled: row.isMCPControlled
+                mergeLabel: mergeLabel,
+                isMCPControlled: row.isMCPControlled,
+                isArchived: false,
+                searchFields: searchFields
             )
         }
     }
@@ -256,6 +269,57 @@ enum AgentNavigationHUDSnapshotBuilder {
             counts[currentRootTabID] = current
         }
         return counts
+    }
+
+    @MainActor
+    private static func currentWorkspaceArchivedItems(windowState: WindowState) -> [AgentNavigationHUDItem] {
+        guard let workspace = windowState.workspaceManager.activeWorkspace,
+              !workspace.isSystemWorkspace
+        else { return [] }
+
+        let agentModeVM = windowState.agentModeViewModel
+        return agentModeVM.archivedHUDSessionDescriptors(workspace.stashedTabs).map { descriptor in
+            let stashed = descriptor.stashedTab
+            let entry = descriptor.entry
+            let title = AgentSessionRestoreSupport.normalizedSessionTitle(entry?.name ?? stashed.tab.name)
+            let runState = entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") }
+            let searchFields = AgentSessionSearchFields(
+                fields: descriptor.searchFields.fields + AgentSessionSearchFields(
+                    title: nil,
+                    primary: [workspace.name, windowState.displayedWindowTitle],
+                    status: ["archived", runState?.searchLabel],
+                    secondary: ["stashed", "restorable"],
+                    identifier: [workspace.id.uuidString]
+                ).fields
+            )
+            return AgentNavigationHUDItem(
+                windowID: windowState.windowID,
+                workspaceID: workspace.id,
+                tabID: stashed.tab.id,
+                sessionID: stashed.tab.activeAgentSessionID ?? entry?.id,
+                title: title,
+                workspaceTitle: workspace.name,
+                windowTitle: windowState.displayedWindowTitle,
+                parentSessionID: entry?.parentSessionID,
+                depth: 0,
+                subagentCount: 0,
+                subagentAttentionCount: 0,
+                isActiveTab: false,
+                runState: runState,
+                attentionState: nil,
+                attentionMarkedAt: nil,
+                activityDate: descriptor.dateInfo.activityDate ?? stashed.stashedAt,
+                worktree: nil,
+                worktreeLabel: entry?.worktreeBindingSummaries.first?.visualLabel
+                    ?? entry?.worktreeBindingSummaries.first?.worktreeName
+                    ?? entry?.worktreeBindingSummaries.first?.branch,
+                mergeAttention: nil,
+                mergeLabel: entry?.activeWorktreeMergeSummaries.max(by: { $0.updatedAt < $1.updatedAt })?.targetLabel,
+                isMCPControlled: entry?.isMCPOriginated == true,
+                isArchived: true,
+                searchFields: searchFields
+            )
+        }
     }
 
     static func allAgentsSorted(_ items: [AgentNavigationHUDItem], now: Date = Date()) -> [AgentNavigationHUDItem] {

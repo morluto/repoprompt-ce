@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemapSeamTestSupport {
@@ -1014,6 +1014,16 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         let loaded = try await store.loadRoot(path: root.path)
         let files = await store.files(inRoot: loaded.id).sorted {
             $0.standardizedRelativePath < $1.standardizedRelativePath
+        }
+        XCTAssertEqual(
+            files.map(\.standardizedRelativePath),
+            ["Sources/First.swift", "Sources/Second.swift"]
+        )
+        try await AsyncTestWait.waitUntil("automatic selection source identities are cataloged", timeout: 5) {
+            await store.codemapAutomaticSelectionSourceIdentities(
+                forFileIDs: files.map(\.id),
+                rootScope: .visibleWorkspace
+            ).count == 2
         }
         let demandCount = CodemapLockedCounter()
         let issuedTickets = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()

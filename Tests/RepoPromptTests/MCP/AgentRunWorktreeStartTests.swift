@@ -2,7 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 private final class AgentRunWorktreeStartGitSeedRepository: @unchecked Sendable {
@@ -867,19 +867,31 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             ],
             codemapAutoEnabled: false
         )
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let sourceIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: sourceTabID)
         var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: sourceTabID))
-        composeTab.selection = storedSelection
         composeTab.activeAgentSessionID = parentSessionID
         window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
         // Wait for post-switch git-data root load to complete so any selection revision
-        // published by the async git-data load settles before we diverge the UI selection.
+        // published by the async git-data load settles before capture.
         await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
-        await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
+        await window.promptManager.createBlankComposeTab(createAgentSession: false)
+        let activeTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        XCTAssertNotEqual(activeTabID, sourceTabID)
         let divergentUISelection = window.workspaceFilesViewModel.snapshotSelection()
         XCTAssertTrue(divergentUISelection.selectedPaths.isEmpty)
         XCTAssertNotEqual(divergentUISelection, storedSelection)
 
-        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        _ = await window.selectionCoordinator.persistSelection(
+            storedSelection,
+            for: sourceIdentity,
+            source: .runtimeMutation,
+            mirrorToUIIfActive: false
+        )
+        try await AsyncTestWait.waitUntil("source review selection remains stored", timeout: 5) {
+            window.workspaceManager.composeTab(for: sourceIdentity)?.selection == storedSelection
+        }
+
         let launchSnapshot = AgentRunOracleReviewLaunchSnapshot(
             route: .explicitTabContext,
             windowID: window.windowID,
@@ -985,6 +997,92 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let pollSessionObject = try XCTUnwrap(pollObject["session"]?.objectValue)
         XCTAssertEqual(pollSessionObject["parent_session_id"]?.stringValue, parentID.uuidString)
         XCTAssertNil(pollObject["worktree_bindings"])
+    }
+
+    func testAgentRunStartInheritsRoutedWorktreeFromUIParentWithoutMCPControlContext() async throws {
+        let root = try makeTemporaryDirectory(named: "ui-routed-root")
+        let worktree = try makeTemporaryDirectory(named: "ui-routed-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentID = UUID()
+        let parentBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        let source = viewModel.session(for: sourceTabID)
+        source.testInstallPersistentSessionBinding(sessionID: parentID)
+        source.hasLoadedPersistedState = true
+        source.worktreeBindings = [parentBinding]
+        source.mcpControlContext = nil
+        source.isMCPOriginated = false
+
+        let service = makeAgentRunStartService(window: window, sourceTabID: sourceTabID)
+        let value = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("inherit routed UI worktree"),
+            "detach": .bool(true),
+            "timeout": .int(0)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        let sessionObject = try XCTUnwrap(object["session"]?.objectValue)
+        let childSessionID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(object["session_id"]?.stringValue))
+        )
+        let childTabID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(sessionObject["context_id"]?.stringValue))
+        )
+        XCTAssertEqual(sessionObject["parent_session_id"]?.stringValue, parentID.uuidString)
+        let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue)
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(bindings.first?.objectValue?["worktree_root_path"]?.stringValue, worktree.path)
+
+        let child = viewModel.session(for: childTabID)
+        XCTAssertEqual(child.activeAgentSessionID, childSessionID)
+        XCTAssertEqual(child.parentSessionID, parentID)
+        XCTAssertEqual(child.worktreeBindings, [parentBinding])
+        XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), worktree.path)
+    }
+
+    func testAgentRunStartInheritsRoutedWorktreeFromFormerMCPParentWithoutControlContext() async throws {
+        let root = try makeTemporaryDirectory(named: "former-mcp-routed-root")
+        let worktree = try makeTemporaryDirectory(named: "former-mcp-routed-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentID = UUID()
+        let parentBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        let source = viewModel.session(for: sourceTabID)
+        source.testInstallPersistentSessionBinding(sessionID: parentID)
+        source.hasLoadedPersistedState = true
+        source.worktreeBindings = [parentBinding]
+        source.mcpControlContext = nil
+        source.isMCPOriginated = true
+
+        let service = makeAgentRunStartService(window: window, sourceTabID: sourceTabID)
+        let value = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("inherit former MCP-routed worktree"),
+            "detach": .bool(true),
+            "timeout": .int(0)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        let sessionObject = try XCTUnwrap(object["session"]?.objectValue)
+        let childSessionID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(object["session_id"]?.stringValue))
+        )
+        let childTabID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(sessionObject["context_id"]?.stringValue))
+        )
+        XCTAssertEqual(sessionObject["parent_session_id"]?.stringValue, parentID.uuidString)
+        let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue)
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(bindings.first?.objectValue?["worktree_root_path"]?.stringValue, worktree.path)
+
+        let child = viewModel.session(for: childTabID)
+        XCTAssertEqual(child.activeAgentSessionID, childSessionID)
+        XCTAssertEqual(child.parentSessionID, parentID)
+        XCTAssertEqual(child.worktreeBindings, [parentBinding])
+        XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), worktree.path)
     }
 
     func testAgentRunAndExploreStartPreserveInheritanceOptOutAndTopLevelBehavior() async throws {

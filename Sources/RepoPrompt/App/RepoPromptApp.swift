@@ -54,8 +54,7 @@ struct RepoPromptFileLogHandler: LogHandler {
     }
 }
 
-@main
-struct RepoPromptApp: App {
+struct RepoPromptSwiftUIApp: App {
     init() {
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
@@ -69,18 +68,22 @@ struct RepoPromptApp: App {
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
+        SentryTelemetryBootstrap.start()
+
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
             "RepoPromptApp.init scheduling ServerNetworkManager.start",
             flushStdout: true
         )
         Task.detached {
+            SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
             ProcessDebugLogging.log(
                 prefix: "MCPStartup",
                 "RepoPromptApp.init start task running",
                 flushStdout: true
             )
             await ServerController.shared.startServer()
+            SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {
@@ -147,7 +150,6 @@ struct RepoPromptApp: App {
 
             // ➜ New File-menu commands (Save Workspace / Exit Workspace)
             WorkspaceCommands(windowStatesManager: windowStatesManager)
-            AgentNavigationCommands(windowStatesManager: windowStatesManager)
 
             CommandGroup(before: .saveItem) {
                 Button("Close Window") {
@@ -161,5 +163,12 @@ struct RepoPromptApp: App {
                     .environmentObject(versionManager)
             }
         }
+    }
+}
+
+@MainActor
+public enum RepoPromptApplication {
+    public static func main() {
+        RepoPromptSwiftUIApp.main()
     }
 }

@@ -570,6 +570,150 @@ def read_ledger_rows(path: Path) -> list[LedgerTest]:
     return rows
 
 
+
+
+def read_ledger_dict_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != LEDGER_COLUMNS:
+            raise OptimizerError("ledger columns do not match the required schema")
+        rows = [dict(row) for row in reader]
+    ids = [str(row.get("method_id") or "") for row in rows]
+    if len(ids) != len(set(ids)):
+        raise OptimizerError("ledger contains duplicate method_id rows")
+    # Reuse typed validation for runtime_seconds and execution_tier checks.
+    read_ledger_rows(path)
+    return rows
+
+
+def baseline_runtime_timings(path: Path) -> dict[tuple[str, str, str], float]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    target = str(payload.get("target") or "root")
+    rows = payload.get("slowest_tests")
+    if not isinstance(rows, list):
+        raise OptimizerError("baseline artifact is missing slowest_tests")
+    timings: dict[tuple[str, str, str], float] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise OptimizerError(f"slowest_tests[{index}] is not an object")
+        suite = str(row.get("suite") or "")
+        method = str(row.get("method") or "")
+        if not suite or not method:
+            raise OptimizerError(f"slowest_tests[{index}] is missing suite or method")
+        seconds_value = row.get("median_seconds")
+        if seconds_value is None:
+            seconds_value = row.get("observed_p95_seconds")
+        if seconds_value is None:
+            raise OptimizerError(f"slowest_tests[{index}] is missing median_seconds")
+        try:
+            seconds = float(seconds_value)
+        except (TypeError, ValueError) as exc:
+            raise OptimizerError(f"invalid baseline runtime for {target}/{suite}/{method}") from exc
+        if not math.isfinite(seconds) or seconds < 0:
+            raise OptimizerError(f"invalid baseline runtime for {target}/{suite}/{method}")
+        timings[(target, suite, method)] = seconds
+    return timings
+
+
+def runtime_import(ledger: Path, baseline_path: Path, output: Path) -> dict[str, Any]:
+    if output.exists():
+        raise OptimizerError(f"refusing to overwrite existing ledger: {output}")
+    rows = read_ledger_dict_rows(ledger)
+    timings = baseline_runtime_timings(baseline_path)
+    timing_keys = set(timings)
+    ledger_keys = {(row["target"], row["suite"], row["method"]) for row in rows}
+    updated = 0
+    unchanged = 0
+    for row in rows:
+        key = (row["target"], row["suite"], row["method"])
+        seconds = timings.get(key)
+        if seconds is None:
+            unchanged += 1
+            continue
+        formatted = f"{seconds:.6f}"
+        if row.get("runtime_seconds") == formatted:
+            unchanged += 1
+            continue
+        row["runtime_seconds"] = formatted
+        updated += 1
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LEDGER_COLUMNS, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    return {
+        "rows_updated": updated,
+        "rows_unchanged": unchanged,
+        "artifact_methods_missing_from_ledger": [
+            f"{target}/{suite}/{method}" for target, suite, method in sorted(timing_keys - ledger_keys)
+        ],
+        "ledger_methods_missing_from_artifact": [
+            f"{target}/{suite}/{method}" for target, suite, method in sorted(ledger_keys - timing_keys)
+        ],
+        "output": str(output),
+    }
+
+
+def ci_suite_plan(
+    ledger: Path,
+    shard_count: int,
+    suites: Sequence[str] | None = None,
+    default_runtime_seconds: float = 1.0,
+    batch_max_seconds: float = 5.0,
+    require_runtime_for_batching: bool = True,
+) -> dict[str, Any]:
+    if shard_count <= 0:
+        raise OptimizerError("--shards must be greater than zero")
+    if default_runtime_seconds <= 0:
+        raise OptimizerError("default runtime seconds must be greater than zero")
+    rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
+    suite_filter = set(suites or [])
+    if suite_filter:
+        rows = [row for row in rows if row.suite in suite_filter]
+    grouped: dict[str, list[LedgerTest]] = defaultdict(list)
+    for row in rows:
+        grouped[row.suite].append(row)
+    missing_suites = sorted(suite_filter - set(grouped))
+    suite_entries: list[dict[str, Any]] = []
+    for suite, suite_rows in sorted(grouped.items()):
+        runtime_values = [row.runtime_seconds for row in suite_rows]
+        missing_runtime_count = sum(value is None for value in runtime_values)
+        estimated = sum(value if value is not None else default_runtime_seconds for value in runtime_values)
+        execution_tiers = sorted({row.execution_tier for row in suite_rows})
+        resource_tags = sorted({tag for row in suite_rows for tag in row.resource_cost_tags})
+        shared_tags = sorted({tag for row in suite_rows for tag in row.shared_state_tags})
+        batch_eligible = (
+            (not require_runtime_for_batching or missing_runtime_count == 0)
+            and not shared_tags
+            and not resource_tags
+            and not (set(execution_tiers) & HEAVY_TEST_EXECUTION_TIERS)
+            and estimated <= batch_max_seconds
+        )
+        suite_entries.append({
+            "suite": suite,
+            "estimated_seconds": estimated,
+            "method_count": len(suite_rows),
+            "missing_runtime_count": missing_runtime_count,
+            "execution_tiers": execution_tiers,
+            "resource_cost_tags": resource_tags,
+            "shared_state_tags": shared_tags,
+            "batch_eligible": batch_eligible,
+        })
+    shards = [{"index": index + 1, "estimated_seconds": 0.0, "suites": []} for index in range(shard_count)]
+    for entry in sorted(suite_entries, key=lambda item: (-float(item["estimated_seconds"]), str(item["suite"]))):
+        shard = min(shards, key=lambda item: (item["estimated_seconds"], item["index"]))
+        shard["estimated_seconds"] += float(entry["estimated_seconds"])
+        shard["suites"].append(entry)
+    for shard in shards:
+        shard["suite_count"] = len(shard["suites"])
+    return {
+        "target": "root",
+        "shard_count": shard_count,
+        "default_runtime_seconds": default_runtime_seconds,
+        "missing_suites": missing_suites,
+        "shards": shards,
+    }
+
 def source_domains_for_changed_path(path: str) -> set[str]:
     parts = Path(path).parts
     if len(parts) >= 4 and parts[0] == "Sources" and parts[1] == "RepoPrompt":
@@ -2150,6 +2294,19 @@ def build_parser() -> argparse.ArgumentParser:
     shard_parser.add_argument("--shards", type=int, required=True)
     shard_parser.add_argument("--include-heavy", action="store_true")
 
+    runtime_import_parser = subparsers.add_parser("runtime-import", help="write a candidate ledger with runtime_seconds from a baseline artifact")
+    runtime_import_parser.add_argument("--ledger", type=Path, required=True)
+    runtime_import_parser.add_argument("--baseline", type=Path, required=True)
+    runtime_import_parser.add_argument("--output", type=Path, required=True)
+
+    ci_suite_plan_parser = subparsers.add_parser("ci-suite-plan", help="partition root XCTest suites for hosted CI planning")
+    ci_suite_plan_parser.add_argument("--ledger", type=Path, required=True)
+    ci_suite_plan_parser.add_argument("--shards", type=int, required=True)
+    ci_suite_plan_parser.add_argument("--suite", action="append", default=[])
+    ci_suite_plan_parser.add_argument("--default-runtime-seconds", type=float, default=1.0)
+    ci_suite_plan_parser.add_argument("--batch-max-seconds", type=float, default=5.0)
+    ci_suite_plan_parser.add_argument("--allow-missing-runtime-for-batching", action="store_true")
+
     verify_parser = subparsers.add_parser("verify-ledger", help="re-list tests and reconcile ledger rows")
     verify_parser.add_argument("--ledger", type=Path, required=True)
     verify_parser.add_argument(
@@ -2213,6 +2370,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "shard-plan":
             payload = shard_root_tests(args.ledger, args.shards, include_heavy=args.include_heavy)
+        elif args.command == "runtime-import":
+            payload = runtime_import(args.ledger, args.baseline, args.output)
+        elif args.command == "ci-suite-plan":
+            payload = ci_suite_plan(
+                args.ledger,
+                args.shards,
+                suites=args.suite,
+                default_runtime_seconds=args.default_runtime_seconds,
+                batch_max_seconds=args.batch_max_seconds,
+                require_runtime_for_batching=not args.allow_missing_runtime_for_batching,
+            )
         elif args.command == "verify-ledger":
             payload = verify_ledger(repo_root, args.ledger, args.list_timeout_seconds)
         else:

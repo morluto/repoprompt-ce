@@ -432,6 +432,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     lookupContext,
                     tabResolution.reviewGitContext
                 )
+
                 let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(selectionReply)
 
                 var planReply: ChatSendReply? = nil

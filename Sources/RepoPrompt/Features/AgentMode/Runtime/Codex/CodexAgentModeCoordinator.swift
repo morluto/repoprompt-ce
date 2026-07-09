@@ -3562,7 +3562,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     trigger: .unexpectedStreamEnd,
                     sourceController: sourceController
                 ) {
-                case .recovered, .skipped:
+                case .recovered:
+                    return
+                case .skipped:
                     return
                 case let .unrecoverable(errorMessage):
                     guard shouldFinalizeAfterRecovery(session: session, expectedRunID: runID, source: "transport-closed-fallback") else { return }
@@ -3820,7 +3822,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         trigger: .unexpectedStreamEnd,
                         sourceController: controller
                     ) {
-                    case .recovered, .skipped:
+                    case .recovered:
+                        return
+                    case .skipped:
                         return
                     case let .unrecoverable(errorMessage):
                         guard shouldFinalizeAfterRecovery(session: session, expectedRunID: taskRunID, source: "unexpected-stream-end") else { return }
@@ -4198,7 +4202,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let hadResumeEligibleCodexHistoryBeforeSend = Self.hasResumeEligibleCodexHistory(session.items)
         session.waitingPrompt = nil
         clearCodexNativeToolLiveness(session)
-        setRunningStatus("Connecting…", source: .transport, session: session, urgent: true)
+        setRunningStatus("Initializing…", source: .transport, session: session, urgent: true)
         session.runState = .running
         let sendStartedAt = Date()
         session.codexLastEventAt = sendStartedAt
@@ -7676,7 +7680,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             var updated = session.items[index]
             let isAgentControlTool = AgentTranscriptIO.isAgentControlToolName(updated.toolName)
             let isRepoPromptTool = MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(updated.toolName)
-            if isRepoPromptTool && !isAgentControlTool {
+            if isRepoPromptTool, !isAgentControlTool {
                 continue
             }
             let agentControlFallback = isAgentControlTool

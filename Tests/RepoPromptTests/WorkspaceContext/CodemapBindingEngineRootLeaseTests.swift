@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class CodemapBindingEngineRootLeaseTests: CodemapBindingEngineTestCase {
@@ -182,7 +182,7 @@ final class CodemapBindingEngineRootLeaseTests: CodemapBindingEngineTestCase {
         let runtime = try CodeMapArtifactRuntime(
             rootURL: artifactRoot,
             manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterReadAdmission: { await loadGate.enter() }
+                afterReadAdmission: { await loadGate.enterIgnoringCancellationUntilRelease() }
             )
         )
         let fixture = try await makeEngineFixture(root: root, runtime: runtime)

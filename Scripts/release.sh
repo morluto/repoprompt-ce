@@ -20,6 +20,7 @@ DMG="$DIST_DIR/$ARCHIVE_BASENAME.dmg"
 APPCAST="$DIST_DIR/appcast.xml"
 CHECKSUMS="$DIST_DIR/SHA256SUMS"
 BUILD_ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"
 FINAL_ARTIFACT_MANIFEST="$DIST_DIR/$ARCHIVE_BASENAME-artifact-manifest.json"
 STAGE_ARCHIVE="$DIST_DIR/$ARCHIVE_BASENAME-stage.zip"
 STAGE_ARCHIVE_CHECKSUM="$STAGE_ARCHIVE.sha256"
@@ -47,6 +48,10 @@ require_file() {
 
 require_env() {
     [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"
+}
+
+sentry_linking_enabled() {
+    [[ "${REPOPROMPT_ENABLE_SENTRY:-}" == "1" ]]
 }
 
 require_release_tag_matches_metadata() {
@@ -77,6 +82,7 @@ run_preflight() {
     require_file "$ROOT_DIR/Vendor/Sparkle/PROVENANCE.md"
     require_file "$ROOT_DIR/Vendor/Sparkle/SHA256SUMS"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/build_swiftpm_release_products.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/compare_swiftpm_release_resources.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"
@@ -169,6 +175,24 @@ write_final_artifact_manifest() {
         --expected-architectures "arm64,x86_64"
 }
 
+require_staged_sentry_symbols_when_enabled() {
+    if sentry_linking_enabled && [[ ! -d "$SENTRY_SYMBOLS_DIR" ]]; then
+        fail "Sentry-enabled release staging did not produce debug symbols at $SENTRY_SYMBOLS_DIR"
+    fi
+}
+
+require_sentry_publish_symbol_upload_configuration() {
+    sentry_linking_enabled || return 0
+    [[ -n "${SENTRY_AUTH_TOKEN:-}" || -n "${REPOPROMPT_SENTRY_AUTH_TOKEN_FILE:-${SENTRY_AUTH_TOKEN_FILE:-}}" ]] || fail "Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN or REPOPROMPT_SENTRY_AUTH_TOKEN_FILE for debug symbol upload."
+    require_env REPOPROMPT_SENTRY_ORG
+    require_env REPOPROMPT_SENTRY_PROJECT
+}
+
+upload_required_sentry_symbols() {
+    require_sentry_publish_symbol_upload_configuration
+    "$CONTROL_PLANE_SCRIPTS_DIR/upload_sentry_debug_symbols.sh" "$SENTRY_SYMBOLS_DIR"
+}
+
 package_release_candidate() {
     resolve_without_lockfile_drift
     run_preflight
@@ -178,6 +202,7 @@ package_release_candidate() {
     "$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY \
         REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
+        REPOPROMPT_ENABLE_SENTRY=1 \
         RELEASE_ALLOW_ADHOC_SIGNING=1 \
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
     run_preflight
@@ -213,6 +238,7 @@ verify_publish_inputs() {
     require_release_tag_matches_metadata
     require_file "$REPOPROMPT_PROVISIONING_PROFILE"
     require_file "$NOTARYTOOL_PRIVATE_KEY"
+    require_sentry_publish_symbol_upload_configuration
 
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
 }
@@ -239,16 +265,22 @@ stage_publish_release() {
     "$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY \
         REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
+        REPOPROMPT_ENABLE_SENTRY=1 \
         RELEASE_ALLOW_ADHOC_SIGNING=1 \
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
     run_preflight
     validate_packaged_legal "$APP_BUNDLE"
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Release staging"
+    require_staged_sentry_symbols_when_enabled
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/release-stage"
     mkdir -p "$stage_root/.build/release"
     ditto "$APP_BUNDLE" "$stage_root/.build/release/$APP_NAME.app"
     cp "$BUILD_ARTIFACT_MANIFEST" "$stage_root/.build/release/$APP_NAME-artifact-manifest.json"
+    if [[ -d "$SENTRY_SYMBOLS_DIR" ]]; then
+        mkdir -p "$stage_root/.build/sentry-symbols"
+        ditto "$SENTRY_SYMBOLS_DIR" "$stage_root/.build/sentry-symbols/release"
+    fi
     cp "$ROOT_DIR/version.env" "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$stage_root/"
     cp -R "$ROOT_DIR/ThirdPartyLicenses" "$stage_root/"
     printf '%s\n' "$RELEASE_COMMIT" > "$stage_root/RELEASE_COMMIT"
@@ -285,6 +317,7 @@ publish_staged_release() {
     xcrun stapler validate "$APP_BUNDLE"
     write_final_artifact_manifest
     validate_public_app "$APP_BUNDLE" "$FINAL_ARTIFACT_MANIFEST" "Final Developer ID app"
+    upload_required_sentry_symbols
 
     local distribution_dir="$TMP_DIR/distribution"
     mkdir -p "$distribution_dir"

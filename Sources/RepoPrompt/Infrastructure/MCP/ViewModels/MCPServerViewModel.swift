@@ -215,6 +215,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // -----------------------------------------------------------------
+
     // MARK: Configuration constants
 
     /// -----------------------------------------------------------------
@@ -273,6 +274,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     // ---------------------------------------------------------------------
+
     // MARK: External dependencies (weak/unowned to avoid retain cycles)
 
     // ---------------------------------------------------------------------
@@ -399,6 +401,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     // ---------------------------------------------------------------------
+
     // MARK: Networking delegation
 
     // ---------------------------------------------------------------------
@@ -1591,7 +1594,8 @@ final class MCPServerViewModel: ObservableObject {
             MCPContextBuilderToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAskUserToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
+            MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
         ]
     )
     private var cancellables: Set<AnyCancellable> = []
@@ -2393,6 +2397,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     // ---------------------------------------------------------------------
+
     // MARK: Initialisation
 
     /// ---------------------------------------------------------------------
@@ -2576,6 +2581,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // -----------------------------------------------------------------
+
     // MARK: Public control API
 
     /// -----------------------------------------------------------------
@@ -2827,6 +2833,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // =====================================================================
+
     // MARK: TOOL capability
 
     // =====================================================================
@@ -2863,6 +2870,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // ────────────────────────────────────────────────────────────────
+
     //  MARK: - Shared wrappers for every MCP tool        🆕 NEW
 
     // ────────────────────────────────────────────────────────────────
@@ -3049,12 +3057,13 @@ final class MCPServerViewModel: ObservableObject {
                     )
                     return result
                 } catch {
+                    let wasCancelled = error is CancellationError || MCPToolExecutionCancelledError.matches(error)
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,
                         correlation: lifecycleCorrelation,
                         EditFlowPerf.Dimensions(
                             toolName: name,
-                            outcome: error is CancellationError ? "cancelled" : "error"
+                            outcome: wasCancelled ? "cancelled" : "error"
                         )
                     )
                     throw error
@@ -3177,6 +3186,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // -----------------------------------------------------------------
+
     // MARK: Window tool catalog access
 
     /// -----------------------------------------------------------------
@@ -5694,7 +5704,11 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
 
-        try await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)
+        try await readableService.awaitFreshnessForExplicitRequest(
+            path,
+            rootRefs: roots,
+            timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+        )
         try Task.checkCancellation()
 
         let resolution = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
@@ -5808,6 +5822,12 @@ final class MCPServerViewModel: ObservableObject {
             policy: .allowLegacyImplicitRouting
         )
         let lookupContext = await resolveFileToolLookupContext(from: metadata)
+        if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
+            for: lookupContext,
+            store: promptVM.workspaceFileContextStore
+        ) {
+            throw failure
+        }
         try Task.checkCancellation()
         let effectivePath = lookupContext.translateInputPath(path)
         let effectiveNewPath = newPath.map { lookupContext.translateInputPath($0) }

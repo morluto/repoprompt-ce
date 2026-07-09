@@ -92,16 +92,27 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
             try Task.checkCancellation()
 
-            let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)
+            let reply: ToolResultDTOs.FileActionReply
+            do {
+                let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)
+                reply = ToolResultDTOs.FileActionReply(
+                    status: "ok",
+                    action: action,
+                    path: path,
+                    newPath: newPath,
+                    warning: warning
+                )
+            } catch let failure as MCPMutationRetryableFailure {
+                reply = ToolResultDTOs.FileActionReply.retryableFailure(
+                    action: action,
+                    path: path,
+                    newPath: newPath,
+                    failure: failure
+                )
+            }
             try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction)
-            let value = try Value(ToolResultDTOs.FileActionReply(
-                status: "ok",
-                action: action,
-                path: path,
-                newPath: newPath,
-                warning: warning
-            ))
+            let value = try Value(reply)
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction, transition: .completed)
             try Task.checkCancellation()
             return value
@@ -463,6 +474,10 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     }
 
     private func executeReadFile(args: [String: Value]) async throws -> Value {
+        try await executeReadFileBody(args: args)
+    }
+
+    private func executeReadFileBody(args: [String: Value]) async throws -> Value {
         try Task.checkCancellation()
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
         let providerTotalState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.providerTotal)
@@ -492,23 +507,31 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             return (worktreeScope, resolvedPath)
         }
         try Task.checkCancellation()
-        var readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
-            if let artifact = try await dependencies.readSelectedAuthorizedGitArtifact(
-                path,
-                resolvedPath,
-                startLine1Based,
-                limit,
-                metadata,
-                lookupContext
-            ) {
-                return artifact
+        var readResult: (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
+        do {
+            readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
+                if let artifact = try await dependencies.readSelectedAuthorizedGitArtifact(
+                    path,
+                    resolvedPath,
+                    startLine1Based,
+                    limit,
+                    metadata,
+                    lookupContext
+                ) {
+                    return artifact
+                }
+                return try await dependencies.readFile(
+                    resolvedPath,
+                    startLine1Based,
+                    limit,
+                    lookupContext.rootScope
+                )
             }
-            return try await dependencies.readFile(
-                resolvedPath,
-                startLine1Based,
-                limit,
-                lookupContext.rootScope
-            )
+        } catch WorkspaceAppliedIngressWaitError.timedOut {
+            return try Value(Self.readFileFreshnessTimeoutDTO(
+                path: path,
+                worktreeScope: worktreeScope
+            ))
         }
         try Task.checkCancellation()
         let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
@@ -540,6 +563,25 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerResultReady)
         return value
+    }
+
+    private static func readFileFreshnessTimeoutDTO(
+        path: String,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO? = nil
+    ) -> ToolResultDTOs.ReadFileReply {
+        ToolResultDTOs.ReadFileReply(
+            content: "",
+            totalLines: 0,
+            firstLine: 0,
+            lastLine: 0,
+            message: "Workspace freshness timed out before read_file could read '\(path)'. Retry after pending file-system ingress settles.",
+            displayPath: path,
+            worktreeScope: worktreeScope,
+            errorMessage: "Workspace freshness timed out before pending file-system ingress was applied.",
+            errorCode: "workspace_freshness_timeout",
+            retryable: true,
+            retryAfterMilliseconds: 1000
+        )
     }
 
     private func fileSearchTool() -> Tool {
@@ -604,17 +646,22 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: ["pattern"]
             )
         ) { [self] _, args in
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
-            let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
-            defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
-            let reply = try await executeFileSearch(args: args)
-            try Task.checkCancellation()
-            let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
-                try Value(reply)
-            }
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerResultReady)
-            return value
+            try await executeFileSearchToolValue(args: args)
         }
+    }
+
+    private func executeFileSearchToolValue(args: [String: Value]) async throws -> Value {
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
+        let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
+        let reply = try await executeFileSearch(args: args)
+
+        try Task.checkCancellation()
+        let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
+            try Value(reply)
+        }
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerResultReady)
+        return value
     }
 
     private func executeFileSearch(args: [String: Value]) async throws -> ToolResultDTOs.SearchResultDTO {
