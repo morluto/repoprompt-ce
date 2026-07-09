@@ -26,13 +26,13 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         )
 
         XCTAssertEqual(resolutions[0].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[0].recommended.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+        XCTAssertEqual(resolutions[0].recommended.modelRaw, AgentModel.gpt56SolLow.rawValue)
         XCTAssertEqual(resolutions[1].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[1].recommended.modelRaw, AgentModel.gpt55CodexMedium.rawValue)
+        XCTAssertEqual(resolutions[1].recommended.modelRaw, AgentModel.gpt56SolMedium.rawValue)
         XCTAssertEqual(resolutions[2].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[2].recommended.modelRaw, AgentModel.gpt55CodexHigh.rawValue)
+        XCTAssertEqual(resolutions[2].recommended.modelRaw, AgentModel.gpt56SolHigh.rawValue)
         XCTAssertEqual(resolutions[3].recommended.agent, .codexExec)
-        XCTAssertEqual(resolutions[3].recommended.modelRaw, AgentModel.gpt55CodexMedium.rawValue)
+        XCTAssertEqual(resolutions[3].recommended.modelRaw, AgentModel.gpt56SolMedium.rawValue)
     }
 
     func testResolutionsPreferRecommendationAvailabilityWhenItCanResolveRole() throws {
@@ -91,7 +91,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         // This selection equals the fallback recommendation for `.explore` under this availability.
         let selection = AgentModelCatalog.NormalizedAgentSelection(
             agent: .codexExec,
-            modelRaw: AgentModel.gpt55CodexLow.rawValue
+            modelRaw: AgentModel.gpt56SolLow.rawValue
         )
 
         MCPAgentRoleDefaultsService.setSelection(
@@ -122,7 +122,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         MCPAgentRoleDefaultsService.setSelection(
             AgentModelCatalog.NormalizedAgentSelection(
                 agent: .codexExec,
-                modelRaw: AgentModel.gpt55CodexHigh.rawValue
+                modelRaw: AgentModel.gpt56SolHigh.rawValue
             ),
             for: .engineer,
             settingsStore: store

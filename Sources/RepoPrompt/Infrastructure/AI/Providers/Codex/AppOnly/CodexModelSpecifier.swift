@@ -35,6 +35,8 @@ struct CodexModelSpecifier: Equatable {
         // First strip any reasoning effort suffix
         let suffixes: [(suffix: String, effort: ReasoningEffort)] = [
             ("-xhigh", .xhigh),
+            ("-maximum", .max),
+            ("-max", .max),
             ("-medium", .medium),
             ("-minimal", .minimal),
             ("-high", .high),

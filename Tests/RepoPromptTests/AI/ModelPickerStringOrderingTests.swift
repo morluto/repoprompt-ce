@@ -12,26 +12,26 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             ["ı", "i", "I"].sorted { ModelPickerStringOrdering.precedes($0, $1) },
             ["I", "i", "ı"]
         )
-        XCTAssertTrue(ModelPickerStringOrdering.precedes("gpt-5.5-Low", "gpt-5.5-low"))
+        XCTAssertTrue(ModelPickerStringOrdering.precedes("gpt-5.6-sol-Low", "gpt-5.6-sol-low"))
     }
 
     func testAIModelSemanticPickerOrderingCoversGptVersionsServiceTierReasoningAndRawTieBreaks() {
         let models: [AIModel] = [
             .codexCustom(name: "gpt-5.2-high"),
             .codexCustom(name: "gpt-5.4-fast-high"),
-            .codexCustom(name: "gpt-5.5-high"),
+            .codexCustom(name: "gpt-5.6-sol-high"),
             .codexCustom(name: "gpt-5.4-low"),
-            .codexCustom(name: "gpt-5.5-low"),
+            .codexCustom(name: "gpt-5.6-sol-low"),
             .codexCustom(name: "gpt-5.4-fast-low"),
-            .codexCustom(name: "gpt-5.5-Low")
+            .codexCustom(name: "gpt-5.6-sol-Low")
         ]
 
         let sorted = AIModel.sortedForPicker(models).map(\.modelName)
 
         XCTAssertEqual(sorted, [
-            "gpt-5.5-Low",
-            "gpt-5.5-low",
-            "gpt-5.5-high",
+            "gpt-5.6-sol-Low",
+            "gpt-5.6-sol-low",
+            "gpt-5.6-sol-high",
             "gpt-5.4-low",
             "gpt-5.4-fast-low",
             "gpt-5.4-fast-high",
@@ -107,22 +107,22 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         let groups = AIModel.codexMenuGroups(for: [
             .codexCustom(name: "gpt-5.2-high"),
             .codexCustom(name: "gpt-5.4-fast-high"),
-            .codexCustom(name: "gpt-5.5-high"),
+            .codexCustom(name: "gpt-5.6-sol-high"),
             .codexCustom(name: "gpt-5.4-low"),
-            .codexCustom(name: "gpt-5.5-low"),
+            .codexCustom(name: "gpt-5.6-sol-low"),
             .codexCustom(name: "gpt-5.4-fast-low"),
-            .codexCustom(name: "gpt-5.5-Low")
+            .codexCustom(name: "gpt-5.6-sol-Low")
         ])
 
         XCTAssertEqual(groups.map(\.baseModelID), [
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "gpt-5.4",
             "gpt-5.4-fast",
             "gpt-5.2"
         ])
         XCTAssertEqual(
-            groups.first { $0.baseModelID == "gpt-5.5" }?.models.map(\.modelName),
-            ["gpt-5.5-Low", "gpt-5.5-low", "gpt-5.5-high"]
+            groups.first { $0.baseModelID == "gpt-5.6-sol" }?.models.map(\.modelName),
+            ["gpt-5.6-sol-Low", "gpt-5.6-sol-low", "gpt-5.6-sol-high"]
         )
     }
 
@@ -131,23 +131,23 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             option(raw: AgentModel.defaultModel.rawValue, displayName: AgentModel.defaultModel.displayName, placeholderDefault: true),
             option(raw: "gpt-5.2-high", displayName: "GPT-5.2 High"),
             option(raw: "gpt-5.4-fast-high", displayName: "GPT-5.4 Fast High"),
-            option(raw: "gpt-5.5-high", displayName: "GPT-5.5 High"),
+            option(raw: "gpt-5.6-sol-high", displayName: "GPT-5.6 Sol High"),
             option(raw: "gpt-5.4-low", displayName: "GPT-5.4 Low"),
-            option(raw: "gpt-5.5-low", displayName: "GPT-5.5 Low"),
+            option(raw: "gpt-5.6-sol-low", displayName: "GPT-5.6 Sol Low"),
             option(raw: "gpt-5.4-fast-low", displayName: "GPT-5.4 Fast Low"),
-            option(raw: "gpt-5.5-Low", displayName: "GPT-5.5 Low")
+            option(raw: "gpt-5.6-sol-Low", displayName: "GPT-5.6 Sol Low")
         ])
 
         XCTAssertEqual(menu.defaultOption?.rawValue, AgentModel.defaultModel.rawValue)
         XCTAssertEqual(menu.groups.map(\.baseModelID), [
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "gpt-5.4",
             "gpt-5.4-fast",
             "gpt-5.2"
         ])
         XCTAssertEqual(
-            menu.groups.first { $0.baseModelID == "gpt-5.5" }?.options.map(\.rawValue),
-            ["gpt-5.5-Low", "gpt-5.5-low", "gpt-5.5-high"]
+            menu.groups.first { $0.baseModelID == "gpt-5.6-sol" }?.options.map(\.rawValue),
+            ["gpt-5.6-sol-Low", "gpt-5.6-sol-low", "gpt-5.6-sol-high"]
         )
     }
 
@@ -157,24 +157,24 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             option(raw: AgentModel.defaultModel.rawValue, displayName: AgentModel.defaultModel.displayName, placeholderDefault: true),
             option(raw: "gpt-5.2-high", displayName: "GPT-5.2 High"),
             option(raw: "gpt-5.4-fast-high", displayName: "GPT-5.4 Fast High"),
-            option(raw: "gpt-5.5-high", displayName: "GPT-5.5 High", providerDefault: true),
+            option(raw: "gpt-5.6-sol-high", displayName: "GPT-5.6 Sol High", providerDefault: true),
             option(raw: "gpt-5.4-low", displayName: "GPT-5.4 Low"),
-            option(raw: "gpt-5.5-low", displayName: "GPT-5.5 Low"),
+            option(raw: "gpt-5.6-sol-low", displayName: "GPT-5.6 Sol Low"),
             option(raw: "gpt-5.4-fast-low", displayName: "GPT-5.4 Fast Low")
         ])
 
         XCTAssertEqual(collapsed.map(\.rawValue), [
             AgentModel.defaultModel.rawValue,
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "gpt-5.4",
             "gpt-5.4-fast",
             "gpt-5.2"
         ])
 
-        let gpt55 = try XCTUnwrap(collapsed.first { $0.rawValue == "gpt-5.5" })
-        XCTAssertEqual(gpt55.supportedReasoningEfforts, [CodexReasoningEffort.low, .high])
-        XCTAssertEqual(gpt55.defaultReasoningEffort, .high)
-        XCTAssertEqual(gpt55.isProviderDefault, true)
+        let gpt56Sol = try XCTUnwrap(collapsed.first { $0.rawValue == "gpt-5.6-sol" })
+        XCTAssertEqual(gpt56Sol.supportedReasoningEfforts, [CodexReasoningEffort.low, .high])
+        XCTAssertEqual(gpt56Sol.defaultReasoningEffort, .high)
+        XCTAssertEqual(gpt56Sol.isProviderDefault, true)
     }
 
     private func option(
