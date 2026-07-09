@@ -1046,7 +1046,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let specifier = CodexModelSpecifier(raw: option.rawValue)
             let normalizedRaw = option.isPlaceholderDefault
                 ? AgentModel.defaultModel.rawValue
-                : CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: option.rawValue)
+                : option.codexBaseModelID
+                ?? CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: option.rawValue)
             let key = normalizedRaw.lowercased()
             if byRaw[key] == nil {
                 let isDefaultPlaceholder =
@@ -1076,7 +1077,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if let explicitDefault = option.defaultReasoningEffort {
                 byRaw[key]?.defaultEffort = explicitDefault
             }
-            if let parsedEffort = specifier.reasoningEffort {
+            let parsedEffort = option.supportedReasoningEfforts.count == 1
+                ? option.supportedReasoningEfforts.first
+                : specifier.reasoningEffort
+            if let parsedEffort {
                 byRaw[key]?.supported.insert(parsedEffort)
                 if option.isProviderDefault {
                     byRaw[key]?.defaultEffort = parsedEffort
@@ -1090,7 +1094,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         var collapsed: [AgentModelOption] = []
         for key in order {
             guard let record = byRaw[key] else { continue }
-            let orderedEfforts = CodexReasoningEffort.displayOrder.filter { record.supported.contains($0) }
+            let orderedEfforts = CodexReasoningEffort.ordered(record.supported)
             collapsed.append(
                 AgentModelOption(
                     rawValue: record.rawValue,
