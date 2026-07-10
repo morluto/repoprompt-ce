@@ -412,6 +412,10 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         let accounting = try await store.accounting()
         XCTAssertEqual(accounting.manifestCount, 0)
         XCTAssertEqual(accounting.quarantineCount, 4)
+        let decodeFailures = await store.decodeFailureAccounting()
+        XCTAssertEqual(decodeFailures.totalCount, 3)
+        XCTAssertEqual(decodeFailures.counts[.checksumMismatch], 2)
+        XCTAssertEqual(decodeFailures.counts[.invalidEnvelope], 1)
     }
 
     func testSymlinkHardlinkWrongModeAndRootReplacementFailClosed() async throws {
@@ -2033,6 +2037,90 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
                 ),
                 label
             )
+        }
+    }
+
+    func testStoredManifestDecodeFailureAttributesValidatedFrameStage() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let artifactStore = try CodeMapArtifactStore(rootURL: root)
+        let fixture = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: #function,
+            worktreeByte: 0xA7,
+            prefix: "",
+            path: "Sources/App.swift",
+            text: SwiftFixtureSource.emptyStruct("DecodeAttribution", trailingNewline: false)
+        )
+        let encoded = try CodeMapRootManifestCodec.encode(
+            snapshot: CodeMapRootManifestSnapshot(
+                namespace: fixture.namespace,
+                authority: fixture.authority,
+                manifestGeneration: 1,
+                lastAccessEpochSeconds: 1,
+                records: [fixture.record]
+            )
+        )
+        let offsets = try manifestCodecOffsets(in: encoded)
+
+        var checksumMismatch = encoded
+        checksumMismatch[checksumMismatch.index(before: checksumMismatch.endIndex)] ^= 0xFF
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksumMismatch,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .checksumMismatch)
+        }
+
+        var unsupportedCodec = encoded
+        writeUInt32(99, at: CodeMapRootManifestCodec.magic.count, in: &unsupportedCodec)
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksummedManifest(unsupportedCodec),
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .unsupportedCodecVersion(99))
+        }
+
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            encoded,
+            filenameDigest: String(repeating: "0", count: 64)
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .namespaceDigestMismatch)
+        }
+
+        var invalidRecord = encoded
+        invalidRecord.replaceSubrange(
+            offsets.records[0].pathDataRange,
+            with: Data("Sources/../x.swif".utf8)
+        )
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            checksummedManifest(invalidRecord),
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .recordValidation)
+        }
+
+        var trailingPayload = Data(encoded.dropLast(32))
+        trailingPayload.append(0)
+        trailingPayload.append(Data(SHA256.hash(data: trailingPayload)))
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
+            trailingPayload,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .trailingPayload)
+        }
+
+        let differentNamespace = try namespaceLike(
+            fixture.namespace,
+            worktreeIdentity: worktreeIdentity(0xA8)
+        )
+        XCTAssertThrowsError(try CodeMapRootManifestCodec.decode(
+            encoded,
+            expectedNamespace: differentNamespace,
+            filenameDigest: fixture.namespace.storageDigestHex
+        )) { error in
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .expectedNamespaceMismatch)
         }
     }
 

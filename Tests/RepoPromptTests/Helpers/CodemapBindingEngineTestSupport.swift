@@ -696,6 +696,32 @@ final class EngineManifestFaultOnce: @unchecked Sendable {
     }
 }
 
+final class EngineManifestFaultOnPublication: @unchecked Sendable {
+    private let lock = NSLock()
+    private let target: Int
+    private var publicationCount = 0
+    private var didFail = false
+
+    init(_ target: Int) {
+        precondition(target > 0)
+        self.target = target
+    }
+
+    var triggeredCount: Int {
+        lock.withLock { didFail ? 1 : 0 }
+    }
+
+    func action(_ point: CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction {
+        lock.withLock {
+            guard point == .afterTemporaryWrite else { return .proceed }
+            publicationCount += 1
+            guard publicationCount == target, !didFail else { return .proceed }
+            didFail = true
+            return .simulateProcessTermination
+        }
+    }
+}
+
 final class EngineLockedCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var storage = 0
