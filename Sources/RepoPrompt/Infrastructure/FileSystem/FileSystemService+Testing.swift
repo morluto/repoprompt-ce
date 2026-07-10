@@ -160,13 +160,28 @@ import Foundation
                 }
             )
             let filterResult = watcherEarlyFilter.filter(payload)
+            let evidence = FileSystemWatcherIngressEvidence.callback(
+                sourcePayload: payload,
+                retainedEntryCount: filterResult.payload?.count ?? 0,
+                earlyFilteredEntryCount: filterResult.filteredEntryCount,
+                callbackDurationMicroseconds: 0
+            )
+            watcherRecoveryDiagnostics.recordCallback(evidence)
             guard let retainedPayload = filterResult.payload else { return nil }
+            let acceptedPayload = FSEventCallbackPayload(
+                entries: retainedPayload.entries,
+                ingressEvidence: evidence
+            )
             let drain: (@Sendable () async -> Void)? = if scheduleDrain {
                 { [weak self] in await self?.drainAcceptedWatcherIngressMailbox() }
             } else {
                 nil
             }
-            return watcherIngressMailbox.accept(retainedPayload, lifecycleCorrelation: nil, scheduleDrain: drain)
+            return watcherIngressMailbox.accept(acceptedPayload, lifecycleCorrelation: nil, scheduleDrain: drain)
+        }
+
+        nonisolated func watcherRecoveryDiagnosticsSnapshotForTesting() -> FileSystemWatcherRecoveryDiagnosticsSnapshot {
+            watcherRecoveryDiagnostics.snapshot()
         }
 
         func watcherIngressMailboxSnapshotForTesting() -> FileSystemWatcherIngressMailbox.Snapshot {
@@ -200,6 +215,20 @@ import Foundation
             } else {
                 folderScanFailuresRemainingForTesting.removeValue(forKey: folder)
             }
+        }
+
+        func setFullResyncFailureCountForTesting(_ count: Int) {
+            fullResyncFailuresRemainingForTesting = max(0, count)
+        }
+
+        func setFullResyncWillStartHandlerForTesting(
+            _ handler: (@Sendable () async -> Void)?
+        ) {
+            fullResyncWillStartHandlerForTesting = handler
+        }
+
+        func waitForWatcherBatchProcessingForTesting() async {
+            await watcherBatchProcessingTask?.value
         }
 
         func setContentReadChunkHandlerForTesting(
@@ -241,6 +270,7 @@ import Foundation
             pendingScanTargets: [String: FSEventStreamEventId],
             pendingQuietFolderScanTargets: Set<String>,
             dirtyRecoveryScanTargets: Set<String>,
+            requiresRecoveryFullResync: Bool,
             recoveryScanFailureCountByFolder: [String: Int],
             lastScannedEventIdByFolder: [String: FSEventStreamEventId],
             lastVerifiedAtByFolder: [String: TimeInterval],
@@ -253,6 +283,7 @@ import Foundation
                 pendingScanTargets,
                 pendingQuietFolderScanTargets,
                 dirtyRecoveryScanTargets,
+                requiresRecoveryFullResync,
                 recoveryScanFailureCountByFolder,
                 lastScannedEventIdByFolder,
                 lastVerifiedAtByFolder,
