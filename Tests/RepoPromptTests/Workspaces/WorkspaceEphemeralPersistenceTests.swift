@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
 import XCTest
 
 final class WorkspaceEphemeralPersistenceTests: XCTestCase {
@@ -57,9 +57,9 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         )
         workspace.isEphemeral = true
 
-        await XCTAssertThrowsErrorAsync(
-            try manager.saveWorkspaceToFileAsync(workspace, baseRoot: storageRoot)
-        ) { error in
+        await XCTAssertThrowsErrorAsync {
+            try await manager.saveWorkspaceToFileAsync(workspace, baseRoot: storageRoot)
+        } errorHandler: { error in
             XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
         XCTAssertThrowsError(try manager.saveWorkspaceToFile(workspace)) { error in
@@ -69,7 +69,7 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testEphemeralChatSaveFailsBeforeCreatingSidecars() async throws {
+    func testEphemeralChatSaveFailsBeforeCreatingSidecars() async {
         let storageRoot = temporaryStorageRoot()
         defer { try? FileManager.default.removeItem(at: storageRoot) }
 
@@ -81,16 +81,16 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         workspace.isEphemeral = true
         let session = ChatSession(name: "Unsaved", messages: [])
 
-        await XCTAssertThrowsErrorAsync(
-            try ChatDataService().saveChatSession(session, for: workspace)
-        ) { error in
+        await XCTAssertThrowsErrorAsync {
+            try await ChatDataService().saveChatSession(session, for: workspace)
+        } errorHandler: { error in
             XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 
     @MainActor
-    func testEphemeralAgentSessionLookupFailsBeforeCreatingSidecars() async throws {
+    func testEphemeralAgentSessionLookupFailsBeforeCreatingSidecars() async {
         let storageRoot = temporaryStorageRoot()
         defer { try? FileManager.default.removeItem(at: storageRoot) }
 
@@ -101,16 +101,16 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         )
         workspace.isEphemeral = true
 
-        await XCTAssertThrowsErrorAsync(
-            try AgentSessionDataService.shared.listAgentSessions(for: workspace)
-        ) { error in
+        await XCTAssertThrowsErrorAsync {
+            try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
+        } errorHandler: { error in
             XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 
     @MainActor
-    func testEphemeralGitDataLoadFailsBeforeCreatingSidecars() async throws {
+    func testEphemeralGitDataLoadFailsBeforeCreatingSidecars() async {
         let storageRoot = temporaryStorageRoot()
         defer { try? FileManager.default.removeItem(at: storageRoot) }
 
@@ -124,28 +124,198 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         fixture.manager.workspaces = [workspace]
         fixture.manager.activeWorkspace = workspace
 
-        await XCTAssertThrowsErrorAsync(
-            try fixture.files.ensureGitDataRootLoaded(
+        await XCTAssertThrowsErrorAsync {
+            try await fixture.files.ensureGitDataRootLoaded(
                 workspace: workspace,
                 workspaceManager: fixture.manager
             )
+        } errorHandler: { error in
+            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
+    }
+
+    @MainActor
+    func testEphemeralWorkspaceCannotAuthorizeAttachmentStorage() throws {
+        let storageRoot = temporaryStorageRoot()
+        let manager = makeFixture().manager
+        var workspace = WorkspaceModel(name: "Temporary Attachment", repoPaths: [])
+        workspace.isEphemeral = true
+
+        XCTAssertThrowsError(
+            try manager.persistentStorage(for: workspace, baseRoot: storageRoot)
         ) { error in
             XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 
-    func testEphemeralWorkspaceCannotAuthorizeAttachmentStorage() throws {
+    @MainActor
+    func testExistingPersistentWorkspaceKeepsEphemeralDispositionAcrossDiskHydration() async throws {
         let storageRoot = temporaryStorageRoot()
-        var workspace = WorkspaceModel(name: "Temporary Attachment", repoPaths: [])
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        let manager = makeFixture().manager
+        let source = WorkspaceModel(
+            name: "Source",
+            repoPaths: [],
+            isSystemWorkspace: true
+        )
+        let target = WorkspaceModel(
+            name: "Persisted Target",
+            repoPaths: [],
+            customStoragePath: storageRoot
+        )
+        _ = try manager.saveWorkspaceToFile(target)
+        manager.workspaces = [source, target]
+        manager.activeWorkspace = source
+
+        await manager.setWorkspaceEphemeral(target.id, true)
+        let result = await manager.requestWorkspaceSwitch(
+            to: target,
+            saveState: false,
+            reason: "ephemeralPersistenceTest"
+        )
+
+        XCTAssertTrue(result.didSwitch)
+        XCTAssertEqual(manager.activeWorkspace?.id, target.id)
+        XCTAssertTrue(manager.activeWorkspace?.isEphemeral == true)
+        XCTAssertTrue(manager.workspaces.first(where: { $0.id == target.id })?.isEphemeral == true)
+    }
+
+    @MainActor
+    func testConvertingWorkspaceToEphemeralBlocksInFlightWriter() async throws {
+        let storageRoot = temporaryStorageRoot()
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        let fixture = makeFixture()
+        let manager = fixture.manager
+        let workspace = WorkspaceModel(
+            name: "In Flight",
+            repoPaths: [],
+            customStoragePath: storageRoot
+        )
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+
+        let gate = WorkspaceEphemeralPersistenceGate()
+        let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
+        await writer.setAtomicWriteGateForTesting {
+            await gate.arriveAndWait()
+        }
+
+        let finalURL = try await manager.saveWorkspaceToFileAsync(
+            workspace,
+            baseRoot: storageRoot
+        )
+        await gate.waitUntilArrived()
+        await manager.setWorkspaceEphemeral(workspace.id, true)
+        await gate.release()
+        await writer.flush(url: finalURL)
+        await writer.setAtomicWriteGateForTesting(nil)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: finalURL.path),
+            "A writer already admitted before conversion must be cancelled at the final write boundary"
+        )
+        XCTAssertThrowsError(try manager.saveWorkspaceToFile(workspace)) { error in
+            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
+        }
+    }
+
+    @MainActor
+    func testPersistentAttachmentStorageUsesAuthorizedWorkspaceDirectory() throws {
+        let storageRoot = temporaryStorageRoot()
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+
+        let workspaceDirectory = storageRoot.appendingPathComponent("workspace", isDirectory: true)
+        let sourceURL = storageRoot.appendingPathComponent("source.png")
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).write(to: sourceURL)
+
+        let manager = makeFixture().manager
+        let workspace = WorkspaceModel(
+            name: "Attachment Workspace",
+            repoPaths: [],
+            customStoragePath: workspaceDirectory
+        )
+        let storage = try manager.persistentStorage(for: workspace)
+        let result = try AgentAttachmentStore().importImageFile(
+            sourceURL: sourceURL,
+            storage: storage
+        )
+
+        XCTAssertEqual(
+            result.fileURL.deletingLastPathComponent(),
+            workspaceDirectory.appendingPathComponent("agent_attachments", isDirectory: true)
+                .standardizedFileURL
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: result.fileURL.path))
+    }
+
+    @MainActor
+    func testEphemeralPromptGitPublicationFailsAtStorageAuthorization() async {
+        let fixture = makeFixture()
+        var workspace = WorkspaceModel(name: "Prompt Temporary", repoPaths: [])
+        workspace.isEphemeral = true
+        fixture.manager.workspaces = [workspace]
+        fixture.manager.activeWorkspace = workspace
+
+        await XCTAssertThrowsErrorAsync {
+            try await fixture.prompt.publishGitDiffArtifacts(inclusionMode: .all)
+        } errorHandler: { error in
+            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
+        }
+    }
+
+    @MainActor
+    func testEphemeralMCPGitPublicationCannotResolveArtifactDirectory() throws {
+        let fixture = makeFixture()
+        var workspace = WorkspaceModel(name: "MCP Temporary", repoPaths: [])
         workspace.isEphemeral = true
 
         XCTAssertThrowsError(
-            try WorkspacePersistentStorage(workspace: workspace, workspaceDirectory: storageRoot)
+            try MCPGitToolProvider.test_persistentArtifactDirectory(
+                workspaceManager: fixture.manager,
+                workspace: workspace
+            )
         ) { error in
             XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
+    }
+
+    @MainActor
+    func testWorktreeArtifactPublicationUsesAuthorizedWorkspaceDirectory() throws {
+        let storageRoot = temporaryStorageRoot()
+        let fixture = makeFixture()
+        let workspace = WorkspaceModel(
+            name: "Worktree Persistent",
+            repoPaths: [],
+            customStoragePath: storageRoot
+        )
+        fixture.manager.workspaces = [workspace]
+        fixture.manager.activeWorkspace = workspace
+
+        XCTAssertEqual(
+            try AgentModeViewModel.test_worktreePreviewDirectory(
+                publishArtifacts: true,
+                workspaceManager: fixture.manager
+            ),
+            storageRoot.standardizedFileURL
+        )
+
+        var ephemeral = workspace
+        ephemeral.isEphemeral = true
+        fixture.manager.workspaces = [ephemeral]
+        fixture.manager.activeWorkspace = ephemeral
+        XCTAssertThrowsError(
+            try AgentModeViewModel.test_worktreePreviewDirectory(
+                publishArtifacts: true,
+                workspaceManager: fixture.manager
+            )
+        ) { error in
+            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
+        }
     }
 
     @MainActor
@@ -171,7 +341,8 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
     @MainActor
     private func makeFixture() -> (
         manager: WorkspaceManagerViewModel,
-        files: WorkspaceFilesViewModel
+        files: WorkspaceFilesViewModel,
+        prompt: PromptViewModel
     ) {
         let store = WorkspaceFileContextStore()
         let files = WorkspaceFilesViewModel(workspaceFileContextStore: store)
@@ -194,7 +365,7 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
             promptViewModel: prompt,
             performInitialWorkspaceActivation: false
         )
-        return (manager, files)
+        return (manager, files, prompt)
     }
 
     private func temporaryStorageRoot() -> URL {
@@ -205,8 +376,8 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
 
 @MainActor
 private func XCTAssertThrowsErrorAsync(
-    _ expression: @autoclosure () async throws -> some Any,
-    _ errorHandler: (Error) -> Void = { _ in },
+    _ expression: () async throws -> some Any,
+    errorHandler: (Error) -> Void = { _ in },
     file: StaticString = #filePath,
     line: UInt = #line
 ) async {
@@ -215,5 +386,41 @@ private func XCTAssertThrowsErrorAsync(
         XCTFail("Expected expression to throw", file: file, line: line)
     } catch {
         errorHandler(error)
+    }
+}
+
+private actor WorkspaceEphemeralPersistenceGate {
+    private var arrived = false
+    private var released = false
+    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func arriveAndWait() async {
+        arrived = true
+        let waiters = arrivalWaiters
+        arrivalWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilArrived() async {
+        guard !arrived else { return }
+        await withCheckedContinuation { continuation in
+            arrivalWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 }
