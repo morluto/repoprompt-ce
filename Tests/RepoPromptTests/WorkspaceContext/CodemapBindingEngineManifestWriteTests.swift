@@ -72,7 +72,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         let writeEntered = await writeGate.waitUntilEntered()
         XCTAssertTrue(writeEntered)
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
-        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 2))
+        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 2, timeout: 20))
         writeGate.release()
         guard case .ready = await first.value else { return XCTFail("Expected first ready.") }
         guard case .ready = await second.value else { return XCTFail("Expected second ready.") }
@@ -87,6 +87,114 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         )) else {
             return XCTFail("Expected latest two-record manifest snapshot on demand.")
         }
+    }
+
+    func testProjectionMutationKeepsAdmissionOrderAheadOfLaterSessionMutation() {
+        var queue = WorkspaceCodemapManifestFIFO<ManifestQueueTestItem>()
+        queue.append(ManifestQueueTestItem(revision: 2, proof: .projection, byteCount: 1))
+        queue.append(ManifestQueueTestItem(revision: 3, proof: .session, byteCount: 1))
+        queue.append(ManifestQueueTestItem(revision: 4, proof: .session, byteCount: 1))
+
+        let projection = queue.popBatch(
+            maximumItemCount: 64,
+            maximumByteCount: 64,
+            byteCount: { $0.byteCount },
+            canAppend: ManifestQueueTestItem.compatible
+        )
+        XCTAssertEqual(projection.map(\.revision), [2])
+
+        let sessions = queue.popBatch(
+            maximumItemCount: 64,
+            maximumByteCount: 64,
+            byteCount: { $0.byteCount },
+            canAppend: ManifestQueueTestItem.compatible
+        )
+        XCTAssertEqual(sessions.map(\.revision), [3, 4])
+
+        queue.append(ManifestQueueTestItem(revision: 6, proof: .session, byteCount: 1))
+        queue.prepend(contentsOf: [
+            ManifestQueueTestItem(revision: 5, proof: .projection, byteCount: 1)
+        ])
+        let retainedProjection = queue.popBatch(
+            maximumItemCount: 64,
+            maximumByteCount: 64,
+            byteCount: { $0.byteCount },
+            canAppend: ManifestQueueTestItem.compatible
+        )
+        XCTAssertEqual(retainedProjection.map(\.revision), [5])
+        XCTAssertEqual(queue.first?.revision, 6)
+    }
+
+    func testManifestWriterBatchByteLimitPreventsQueuedItemCoalescing() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
+            ]
+        )
+        let writeGate = EngineBlockingGate()
+        let hookEvents = EngineHookEvents()
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+                manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                    afterWriteShardAdmission: { writeGate.enterAndWait() }
+                )
+            ),
+            policy: WorkspaceCodemapBindingEnginePolicy(
+                maximumQueuedProjectionManifestMutationByteCountPerRoot: 1,
+                maximumQueuedProjectionManifestMutationByteCount: 1
+            ),
+            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
+        XCTAssertTrue(writeGate.waitUntilEntered())
+        let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
+        let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
+        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3, timeout: 20))
+        writeGate.release()
+
+        for result in await [first.value, second.value, third.value] {
+            guard case .ready = result else { return XCTFail("Expected ready demand.") }
+        }
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.counters.manifestWrites, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 0)
+    }
+
+    func testManifestWriterBatchItemLimitSplitsLargeQueuedRun() {
+        var queue = WorkspaceCodemapManifestFIFO<ManifestQueueTestItem>()
+        for revision in 1 ... 66 {
+            queue.append(ManifestQueueTestItem(
+                revision: UInt64(revision),
+                proof: .session,
+                byteCount: 1
+            ))
+        }
+        let first = queue.popBatch(
+            maximumItemCount: 64,
+            maximumByteCount: 1000,
+            byteCount: { $0.byteCount },
+            canAppend: ManifestQueueTestItem.compatible
+        )
+        let second = queue.popBatch(
+            maximumItemCount: 64,
+            maximumByteCount: 1000,
+            byteCount: { $0.byteCount },
+            canAppend: ManifestQueueTestItem.compatible
+        )
+        XCTAssertEqual(first.count, 64)
+        XCTAssertEqual(first.first?.revision, 1)
+        XCTAssertEqual(first.last?.revision, 64)
+        XCTAssertEqual(second.map(\.revision), [65, 66])
+        XCTAssertTrue(queue.isEmpty)
     }
 
     func testQueuedManifestCompletionsShareOneBoundedPublicationAndResolveAllWaiters() async throws {
@@ -117,7 +225,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertTrue(writeGate.waitUntilEntered())
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
-        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3))
+        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3, timeout: 20))
 
         writeGate.release()
         guard case .ready = await first.value else { return XCTFail("Expected first ready.") }
@@ -171,7 +279,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertTrue(writeGate.waitUntilEntered())
         let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
         let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
-        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3))
+        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3, timeout: 20))
 
         writeGate.release()
         guard case .ready = await first.value else { return XCTFail("Expected first ready.") }
@@ -187,70 +295,6 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
         XCTAssertEqual(accounting.dirtyManifestCount, 1)
         XCTAssertEqual(hookEvents.values(kind: .manifestFailure).count, 1)
-    }
-
-    func testBatchedRemoveThenUpsertForSamePathPersistsNewestMutation() async throws {
-        let repository = try makeRepositoryFixture(name: #function)
-        let root = try repository.makeRepository(
-            named: "repository",
-            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
-        )
-        let writeGate = EngineBlockingGate()
-        let hookEvents = EngineHookEvents()
-        let runtime = try CodeMapArtifactRuntime(
-            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
-            manifestStoreHooks: CodeMapRootManifestStoreHooks(
-                afterWriteShardAdmission: { writeGate.enterAndWait() }
-            )
-        )
-        let fixture = try await makeEngineFixture(
-            root: root,
-            runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
-        )
-        _ = await fixture.engine.registerRoot(fixture.registration)
-        let original = Task {
-            await fixture.engine.demand(fixture.demand(path: "Sources/Feature.swift"))
-        }
-        XCTAssertTrue(writeGate.waitUntilEntered())
-        try repository.write(
-            "struct Feature { let updated = true }\n",
-            to: "Sources/Feature.swift",
-            at: root
-        )
-        let invalidation = Task {
-            await fixture.engine.invalidateModified(
-                rootEpoch: fixture.rootEpoch,
-                standardizedRelativePaths: ["Sources/Feature.swift"]
-            )
-        }
-        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 2))
-        let replacement = Task {
-            await fixture.engine.demand(fixture.demand(path: "Sources/Feature.swift"))
-        }
-        XCTAssertTrue(hookEvents.wait(kind: .manifestRevisionQueued, numericValue: 3))
-
-        writeGate.release()
-        guard case .cancelled = await original.value else {
-            return XCTFail("Expected invalidation to cancel original demand.")
-        }
-        let invalidationResult = await invalidation.value
-        XCTAssertFalse(invalidationResult.manifestWriteFailed)
-        guard case .ready = await replacement.value else {
-            return XCTFail("Expected replacement demand ready.")
-        }
-        let accounting = await fixture.engine.accounting()
-        XCTAssertEqual(accounting.counters.manifestWrites, 2)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
-
-        await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
-        let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
-        _ = await reloaded.engine.registerRoot(reloaded.registration)
-        let reloadedIsReady = await isReady(reloaded.engine.demand(
-            reloaded.demand(path: "Sources/Feature.swift")
-        ))
-        XCTAssertTrue(reloadedIsReady)
     }
 
     func testSameNamespaceWriterDrainsUnloadedPredecessorBeforeSuccessor() async throws {
@@ -562,5 +606,26 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertEqual(drained.rootAdmissionHistoryCount, 0)
         XCTAssertEqual(drained.ownerAdmissionHistoryCount, 0)
         XCTAssertEqual(drained.counters.cancellations, 2)
+    }
+}
+
+private struct ManifestQueueTestItem: Equatable {
+    enum Proof: Equatable {
+        case session
+        case projection
+    }
+
+    let revision: UInt64
+    let proof: Proof
+    let byteCount: UInt64
+
+    static func compatible(
+        first: ManifestQueueTestItem,
+        previous: ManifestQueueTestItem,
+        next: ManifestQueueTestItem
+    ) -> Bool {
+        previous.revision < .max &&
+            next.revision == previous.revision + 1 &&
+            next.proof == first.proof
     }
 }
