@@ -1251,6 +1251,25 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn('SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/release"', release_script)
         self.assertIn('ditto "$SENTRY_SYMBOLS_DIR" "$stage_root/.build/sentry-symbols/release"', release_script)
         self.assertIn('upload_required_sentry_symbols', release_script)
+        self.assertIn('SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"', release_script)
+        self.assertIn('require_sentry_publish_configuration() {', release_script)
+        self.assertIn('require_command sentry-cli', release_script)
+        self.assertIn('prepare_sentry_release', release_script)
+        self.assertIn('releases new', release_script)
+        self.assertIn('releases set-commits', release_script)
+        self.assertIn('--commit "$source_repository@$RELEASE_COMMIT"', release_script)
+        self.assertIn('finalize_sentry_release', release_script)
+        self.assertIn('releases finalize "$SENTRY_RELEASE_NAME"', release_script)
+        self.assertIn('record_sentry_production_deploy', release_script)
+        self.assertIn('releases deploys "$SENTRY_RELEASE_NAME" new', release_script)
+        self.assertIn('--env "$SENTRY_DEPLOY_ENVIRONMENT"', release_script)
+        self.assertIn('--name "$RELEASE_TAG"', release_script)
+        self.assertIn('SENTRY_AUTH_TOKEN="$(tr -d', release_script)
+
+        publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}\n\ncase", 1)[0]
+        self.assertLess(publish_staged.index("prepare_sentry_release"), publish_staged.index("upload_required_sentry_symbols"))
+        self.assertLess(publish_staged.index("upload_required_sentry_symbols"), publish_staged.index("finalize_sentry_release"))
+        self.assertLess(publish_staged.index("record_sentry_production_deploy"), publish_staged.index("gh release create"))
 
         stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
         publish_job = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
@@ -1263,8 +1282,10 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
             publish_job.index("Install Sentry CLI when symbol upload is configured"),
             publish_job.index("Sign, notarize, and create draft release"),
         )
+        self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', publish_job)
         self.assertIn("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}", publish_job)
         self.assertIn("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}", publish_job)
+        self.assertIn("REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT: production", publish_job)
 
         self.assertIn('"REPOPROMPT_ENABLE_SENTRY"', conductor)
         self.assertIn('"REPOPROMPT_UPLOAD_SENTRY_SYMBOLS"', conductor)
@@ -1631,9 +1652,21 @@ printf '%s' "${SENTRY_AUTH_TOKEN:-}" > "$TOKEN_CAPTURE"
         self.assertIn('REPOPROMPT_TELEMETRY_DISABLED', bootstrap_source)
         self.assertIn('GlobalSettingsStore.shared.telemetryEnabled()', bootstrap_source)
         self.assertIn('options.beforeSend', bootstrap_source)
+        self.assertIn('options.enableCaptureFailedRequests = false', bootstrap_source)
+        self.assertIn('options.enableAutoSessionTracking = false', bootstrap_source)
+        self.assertIn('event.request = nil', bootstrap_source)
+        self.assertIn('event.user = nil', bootstrap_source)
+        self.assertIn('event.serverName = nil', bootstrap_source)
+        self.assertIn('deviceIdentifierKeys', bootstrap_source)
+        self.assertIn('geoPayloadKeys', bootstrap_source)
+        self.assertNotIn('options.dist =', bootstrap_source)
         self.assertIn('options.tracesSampleRate = performanceTracingEnabled ? 0.05 : 0', bootstrap_source)
         self.assertIn('#if DEBUG\n                if let value = ProcessInfo.processInfo.environment["REPOPROMPT_SENTRY_DSN"]', bootstrap_source)
         self.assertIn('Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN', release_script)
+        self.assertIn('SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"', release_script)
+        self.assertIn('prepare_sentry_release', release_script)
+        self.assertIn('finalize_sentry_release', release_script)
+        self.assertIn('record_sentry_production_deploy', release_script)
 
         pins = {pin["identity"]: pin for pin in package_resolved["pins"]}
         self.assertEqual(pins["sentry-cocoa"]["state"]["version"], "9.17.1")

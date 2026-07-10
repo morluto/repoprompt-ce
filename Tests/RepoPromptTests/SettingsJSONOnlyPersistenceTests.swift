@@ -272,6 +272,79 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(scrubbed.contains("the basic idea is simple"))
     }
 
+    func testSentryScrubPayloadDropsRequestGeoUserAndStableDeviceIdentifiers() throws {
+        let scrubbed = SentryTelemetryBootstrap.scrubPayloadForTesting([
+            "request": [
+                "url": "https://example.invalid/private?token=secret",
+                "headers": ["Authorization": "Bearer abcdef"]
+            ],
+            "contexts": [
+                "device": [
+                    "id": "stable-device-id",
+                    "identifier_for_vendor": "stable-vendor-id",
+                    "name": "Alice’s MacBook",
+                    "model": "Mac14,7"
+                ],
+                "os": ["name": "macOS", "version": "15.0"],
+                "app": [
+                    "device_app_hash": "stable-app-device-hash",
+                    "app_identifier": "com.pvncher.repoprompt.ce"
+                ]
+            ],
+            "user": [
+                "id": "stable-user-id",
+                "geo": ["city": "Tokyo", "country_code": "JP"]
+            ],
+            "extra": [
+                "installation_id": "stable-installation-id",
+                "safe_note": "token=abcdef 10.0.0.1"
+            ]
+        ])
+
+        XCTAssertNil(scrubbed["request"])
+        XCTAssertNil(scrubbed["user"])
+        let contexts = try XCTUnwrap(scrubbed["contexts"] as? [String: Any])
+        let device = try XCTUnwrap(contexts["device"] as? [String: Any])
+        XCTAssertNil(device["id"])
+        XCTAssertNil(device["identifier_for_vendor"])
+        XCTAssertNil(device["name"])
+        XCTAssertEqual(device["model"] as? String, "Mac14,7")
+        XCTAssertNotNil(contexts["os"])
+        let app = try XCTUnwrap(contexts["app"] as? [String: Any])
+        XCTAssertNil(app["device_app_hash"])
+        XCTAssertEqual(app["app_identifier"] as? String, "com.pvncher.repoprompt.ce")
+        let extra = try XCTUnwrap(scrubbed["extra"] as? [String: Any])
+        XCTAssertNil(extra["installation_id"])
+        XCTAssertEqual(extra["safe_note"] as? String, "token=[redacted] [ip]")
+    }
+
+    func testSentryScrubPayloadDropsNestedRequestAndGeoFieldsWithoutDroppingSafeSiblings() throws {
+        let scrubbed = SentryTelemetryBootstrap.scrubPayloadForTesting([
+            "breadcrumb": [
+                "category": "app.lifecycle",
+                "url": "https://example.invalid/private",
+                "data": [
+                    "query_string": "api_key=secret",
+                    "result": "ok"
+                ]
+            ],
+            "profile": [
+                "user_geo": ["region": "CA"],
+                "display": "safe value"
+            ]
+        ])
+
+        let breadcrumb = try XCTUnwrap(scrubbed["breadcrumb"] as? [String: Any])
+        XCTAssertEqual(breadcrumb["category"] as? String, "app.lifecycle")
+        XCTAssertNil(breadcrumb["url"])
+        let data = try XCTUnwrap(breadcrumb["data"] as? [String: Any])
+        XCTAssertNil(data["query_string"])
+        XCTAssertEqual(data["result"] as? String, "ok")
+        let profile = try XCTUnwrap(scrubbed["profile"] as? [String: Any])
+        XCTAssertNil(profile["user_geo"])
+        XCTAssertEqual(profile["display"] as? String, "safe value")
+    }
+
     func testObsoleteGitignoreJSONKeyIsIgnoredAndNeverEmitted() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
