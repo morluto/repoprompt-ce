@@ -94,7 +94,7 @@ import XCTest
             XCTAssertEqual(GitDiffEngine.DiffTextCache.saturatingAdd(.max - 1, 1), .max)
         }
 
-        func testCacheDisabledRequestReturnsCompleteDiffWithoutReadOrAdmission() async throws {
+        func testCacheDisabledRequestBypassesLookupButStillAdmitsRecomputedResult() async throws {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
             let repo = try makeModifiedRepository(using: fixture)
             let engine = GitDiffEngine(
@@ -124,11 +124,75 @@ import XCTest
             XCTAssertFalse(bypassed.perFile?.isEmpty ?? true)
             let snapshot = await engine.cacheHealthSnapshot()
             XCTAssertEqual(snapshot.entryCount, 1)
-            XCTAssertEqual(snapshot.retainedUTF8Bytes, beforeBypass.retainedUTF8Bytes)
             XCTAssertEqual(snapshot.hitCount, 0)
             XCTAssertEqual(snapshot.missCount, 1)
             XCTAssertEqual(snapshot.bypassCount, 1)
-            XCTAssertEqual(snapshot.admissionCount, 1)
+            // Force refresh must replace the resident entry, not leave it stale.
+            XCTAssertEqual(snapshot.admissionCount, beforeBypass.admissionCount + 1)
+            XCTAssertEqual(snapshot.replacementCount, 1)
+        }
+
+        func testForcedRefreshReplacesStaleSameKeyEntryForLaterCachedReads() {
+            // Simulates force-refresh (useCache:false) when fingerprint/statusHash is
+            // unchanged across content edits: recompute must admit/replace so the next
+            // ordinary lookup returns the refreshed diff.
+            let key = makeKey("same-status-hash")
+            var cache = GitDiffEngine.DiffTextCache(
+                limits: .init(maximumEntryCount: 4, maximumRetainedUTF8Bytes: 1024 * 1024)
+            )
+
+            XCTAssertTrue(cache.admit(makeResult("stale-diff"), for: key))
+            XCTAssertEqual(cache.value(for: key)?.text, "stale-diff")
+
+            // Forced recompute path: skip lookup, still admit.
+            cache.recordBypass()
+            XCTAssertTrue(cache.admit(makeResult("fresh-diff"), for: key))
+
+            XCTAssertEqual(cache.value(for: key)?.text, "fresh-diff")
+            XCTAssertEqual(cache.count, 1)
+            XCTAssertEqual(cache.healthSnapshot.bypassCount, 1)
+            XCTAssertEqual(cache.healthSnapshot.replacementCount, 1)
+            XCTAssertEqual(cache.healthSnapshot.admissionCount, 2)
+        }
+
+        func testForcedRefreshThenOrdinaryRequestReturnsRefreshedDiffText() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let repo = try makeModifiedRepository(using: fixture)
+            let engine = GitDiffEngine(
+                vcsService: VCSService(),
+                gitService: GitService(),
+                cacheLimits: .init(maximumEntryCount: 2, maximumRetainedUTF8Bytes: 1024 * 1024)
+            )
+
+            let initial = try await engine.diffText(
+                target: .uncommitted(base: "HEAD"),
+                scope: .all,
+                selectedAbsolutePaths: [],
+                repoURL: repo
+            )
+            XCTAssertTrue(initial.text.contains("let value = 2"))
+
+            try fixture.write("let value = 3\nlet added = true\nlet more = true\n", to: "Feature.swift", at: repo)
+
+            let forced = try await engine.diffText(
+                target: .uncommitted(base: "HEAD"),
+                scope: .all,
+                selectedAbsolutePaths: [],
+                repoURL: repo,
+                useCache: false
+            )
+            XCTAssertTrue(forced.text.contains("let value = 3"))
+            XCTAssertFalse(forced.text.contains("+let value = 2"))
+
+            let ordinary = try await engine.diffText(
+                target: .uncommitted(base: "HEAD"),
+                scope: .all,
+                selectedAbsolutePaths: [],
+                repoURL: repo,
+                useCache: true
+            )
+            XCTAssertEqual(ordinary.text, forced.text)
+            XCTAssertTrue(ordinary.text.contains("let value = 3"))
         }
 
         func testOversizedResultIsReturnedButNotCached() async throws {
@@ -157,7 +221,34 @@ import XCTest
 
         func testConcurrentActorRequestsReturnFullResultsWithinBounds() async throws {
             let fixture = try ReviewGitRepositoryFixture(name: #function)
-            let repo = try makeModifiedRepository(using: fixture)
+            // Distinct paths produce distinct cache keys so concurrent work is not
+            // all hits on one identical request under actor isolation.
+            let repo = try fixture.makeRepository(
+                named: "repo",
+                files: [
+                    "A.swift": "let a = 1\n",
+                    "B.swift": "let b = 1\n",
+                    "C.swift": "let c = 1\n",
+                ]
+            )
+            try fixture.write("let a = 2\n", to: "A.swift", at: repo)
+            try fixture.write("let b = 2\n", to: "B.swift", at: repo)
+            try fixture.write("let c = 2\n", to: "C.swift", at: repo)
+
+            let pathA = repo.appendingPathComponent("A.swift").path
+            let pathB = repo.appendingPathComponent("B.swift").path
+            let pathC = repo.appendingPathComponent("C.swift").path
+            let requests: [(GitDiffScope, [String])] = [
+                (.all, []),
+                (.selected, [pathA]),
+                (.selected, [pathB]),
+                (.selected, [pathC]),
+                (.all, []),
+                (.selected, [pathA]),
+                (.selected, [pathB]),
+                (.selected, [pathC]),
+            ]
+
             let maximumBytes = 1024 * 1024
             let engine = GitDiffEngine(
                 vcsService: VCSService(),
@@ -165,23 +256,34 @@ import XCTest
                 cacheLimits: .init(maximumEntryCount: 2, maximumRetainedUTF8Bytes: maximumBytes)
             )
 
-            let results = try await withThrowingTaskGroup(of: GitDiffEngine.DiffTextResult.self) { group in
-                for _ in 0 ..< 8 {
+            let results = try await withThrowingTaskGroup(
+                of: (Int, GitDiffEngine.DiffTextResult).self
+            ) { group in
+                for (index, request) in requests.enumerated() {
                     group.addTask {
-                        try await engine.diffText(
+                        let result = try await engine.diffText(
                             target: .uncommitted(base: "HEAD"),
-                            scope: .all,
-                            selectedAbsolutePaths: [],
+                            scope: request.0,
+                            selectedAbsolutePaths: request.1,
                             repoURL: repo
                         )
+                        return (index, result)
                     }
                 }
                 return try await group.reduce(into: []) { $0.append($1) }
             }
 
-            let expected = try XCTUnwrap(results.first?.text)
-            XCTAssertFalse(expected.isEmpty)
-            XCTAssertTrue(results.allSatisfy { $0.text == expected && !($0.perFile?.isEmpty ?? true) })
+            XCTAssertEqual(results.count, requests.count)
+            for (index, result) in results {
+                XCTAssertFalse(result.text.isEmpty, "request \(index) returned empty diff")
+                XCTAssertFalse(result.perFile?.isEmpty ?? true, "request \(index) missing per-file map")
+            }
+            // Distinct selected-path requests must not all collapse to the same body.
+            let selectedBodies = results
+                .filter { requests[$0.0].0 == .selected }
+                .map(\.1.text)
+            XCTAssertGreaterThan(Set(selectedBodies).count, 1)
+
             let snapshot = await engine.cacheHealthSnapshot()
             XCTAssertLessThanOrEqual(snapshot.entryCount, 2)
             XCTAssertLessThanOrEqual(snapshot.retainedUTF8Bytes, maximumBytes)

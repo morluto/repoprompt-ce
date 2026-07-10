@@ -520,9 +520,9 @@ actor GitDiffEngine {
             )
             guard !filtered.isEmpty else {
                 let result = DiffTextResult(fingerprint: fingerprint, text: "", perFile: nil)
-                if useCache {
-                    cache.admit(result, for: cacheKey)
-                }
+                // Always admit recomputed results so useCache:false only bypasses
+                // lookup (force refresh), never leaves a stale resident entry.
+                cache.admit(result, for: cacheKey)
                 return result
             }
 
@@ -553,9 +553,7 @@ actor GitDiffEngine {
                 .joined(separator: "\n")
             let perFile = combined.isEmpty ? nil : GitService.splitUnifiedDiffByFile(combined)
             let result = DiffTextResult(fingerprint: fingerprint, text: combined, perFile: perFile)
-            if useCache {
-                cache.admit(result, for: cacheKey)
-            }
+            cache.admit(result, for: cacheKey)
             return result
 
         case let .uncommittedMergeBase(base):
@@ -592,9 +590,7 @@ actor GitDiffEngine {
             )
             guard !filtered.isEmpty else {
                 let result = DiffTextResult(fingerprint: fingerprint, text: "", perFile: nil)
-                if useCache {
-                    cache.admit(result, for: cacheKey)
-                }
+                cache.admit(result, for: cacheKey)
                 return result
             }
 
@@ -624,9 +620,7 @@ actor GitDiffEngine {
                 .joined(separator: "\n")
             let perFile = combined.isEmpty ? nil : GitService.splitUnifiedDiffByFile(combined)
             let result = DiffTextResult(fingerprint: fingerprint, text: combined, perFile: perFile)
-            if useCache {
-                cache.admit(result, for: cacheKey)
-            }
+            cache.admit(result, for: cacheKey)
             return result
 
         case let .commit(sha):
@@ -704,9 +698,7 @@ actor GitDiffEngine {
             let gitPaths = gitRelativePaths(from: selectedAbsolutePaths, repoRootPath: repoURL.path)
             guard !gitPaths.isEmpty else {
                 let result = DiffTextResult(fingerprint: fingerprint, text: "", perFile: nil)
-                if useCache {
-                    cache.admit(result, for: cacheKey)
-                }
+                cache.admit(result, for: cacheKey)
                 return result
             }
             diffText = try await backend.getDiffText(
@@ -720,9 +712,7 @@ actor GitDiffEngine {
 
         let perFile = diffText.isEmpty ? nil : GitService.splitUnifiedDiffByFile(diffText)
         let result = DiffTextResult(fingerprint: fingerprint, text: diffText, perFile: perFile)
-        if useCache {
-            cache.admit(result, for: cacheKey)
-        }
+        cache.admit(result, for: cacheKey)
         return result
     }
 
