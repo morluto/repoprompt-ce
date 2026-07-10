@@ -451,6 +451,116 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(luna.supportedReasoningEfforts, [.custom("quantum")])
     }
 
+    func testCodexCLIAndAppServerSerializeMaxUltraAndCustomEfforts() {
+        let maxSpec = CodexModelSpecifier(baseModel: "gpt-5.6-sol", reasoningEffort: .max)
+        XCTAssertEqual(maxSpec.cliModelArgs, ["--model", "gpt-5.6-sol"])
+        XCTAssertEqual(maxSpec.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=max"])
+        XCTAssertEqual(maxSpec.appServerModelParam, "gpt-5.6-sol")
+        XCTAssertEqual(maxSpec.appServerEffortParam, "max")
+
+        let ultraSpec = CodexModelSpecifier(baseModel: "gpt-5.6-sol", reasoningEffort: .ultra)
+        XCTAssertEqual(ultraSpec.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=ultra"])
+        XCTAssertEqual(ultraSpec.appServerEffortParam, "ultra")
+
+        let customSpec = CodexModelSpecifier(baseModel: "gpt-5.6-sol", reasoningEffort: .custom("quantum"))
+        XCTAssertEqual(customSpec.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=quantum"])
+        XCTAssertEqual(customSpec.appServerEffortParam, "quantum")
+        XCTAssertEqual(customSpec.appServerServiceTierParam, nil)
+    }
+
+    func testSynthesizedFastVariantIDsPreserveEffortAndServiceTier() throws {
+        let fastUltra = try XCTUnwrap(
+            CodexServiceTierVariantCatalog.fastVariantID(
+                baseModelID: "gpt-5.6-sol",
+                reasoningEffort: .ultra
+            )
+        )
+        XCTAssertEqual(fastUltra, "gpt-5.6-sol-fast-ultra")
+
+        let specifier = CodexModelSpecifier(raw: fastUltra)
+        XCTAssertEqual(specifier.baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(specifier.reasoningEffort, .ultra)
+        XCTAssertEqual(specifier.serviceTier, "fast")
+        XCTAssertEqual(specifier.appServerServiceTierParam, "fast")
+        XCTAssertEqual(specifier.appServerEffortParam, "ultra")
+        XCTAssertEqual(specifier.cliServiceTierConfigArgs, ["-c", "service_tier=fast"])
+        XCTAssertEqual(specifier.cliReasoningConfigArgs, ["-c", "model_reasoning_effort=ultra"])
+    }
+
+    @MainActor
+    func testEffectiveCodexSelectionUsesExplicitEffortAndFastServiceTier() {
+        let coordinator = makeSelectionCoordinator(
+            initialLastUsed: nil,
+            byModelSlug: [:]
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        // Compound Fast + effort selection used at launch time.
+        session.selectedModelRaw = "gpt-5.6-sol-fast-high"
+        session.selectedReasoningEffortRaw = "high"
+
+        let selection = coordinator.test_effectiveCodexSelection(for: session)
+        XCTAssertEqual(selection.model, "gpt-5.6-sol")
+        XCTAssertEqual(selection.reasoningEffort, "high")
+        XCTAssertEqual(selection.serviceTier, "fast")
+    }
+
+    @MainActor
+    func testEffectiveCodexSelectionRestoresPersistedLastUsedEffortWhenExplicitMissing() {
+        let coordinator = makeSelectionCoordinator(
+            initialLastUsed: .medium,
+            byModelSlug: ["gpt-5.6-sol": .ultra]
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-5.6-sol"
+        session.selectedReasoningEffortRaw = nil
+
+        let selection = coordinator.test_effectiveCodexSelection(for: session)
+        XCTAssertEqual(selection.model, "gpt-5.6-sol")
+        // Slug-scoped last-used ultra wins over global medium when still valid for the model.
+        XCTAssertEqual(selection.reasoningEffort, "ultra")
+        XCTAssertNil(selection.serviceTier)
+    }
+
+    @MainActor
+    func testEffectiveCodexSelectionPrefersExplicitEffortOverPersistedLastUsed() {
+        let coordinator = makeSelectionCoordinator(
+            initialLastUsed: .ultra,
+            byModelSlug: ["gpt-5.6-sol": .ultra]
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-5.6-sol"
+        session.selectedReasoningEffortRaw = "low"
+
+        let selection = coordinator.test_effectiveCodexSelection(for: session)
+        XCTAssertEqual(selection.model, "gpt-5.6-sol")
+        XCTAssertEqual(selection.reasoningEffort, "low")
+    }
+
+    @MainActor
+    private func makeSelectionCoordinator(
+        initialLastUsed: CodexReasoningEffort?,
+        byModelSlug: [String: CodexReasoningEffort]
+    ) -> CodexAgentModeCoordinator {
+        let suiteName = "codex.selection.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        return CodexAgentModeCoordinator(
+            windowID: 9_451,
+            workspacePathProvider: { _ in nil },
+            codexControllerFactory: { _, _, _, _, _, _, _ in
+                fatalError("selection tests do not start Codex sessions")
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            shouldManageCodexTooling: false,
+            preferenceDefaults: defaults,
+            initialLastUsedReasoningEffort: initialLastUsed,
+            initialLastUsedReasoningEffortsByModelSlug: byModelSlug
+        )
+    }
+
     private func option(
         raw: String,
         displayName: String,

@@ -6960,6 +6960,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
 
         @_spi(TestSupport)
+        public func test_effectiveCodexSelection(
+            for session: AgentModeViewModel.TabSession
+        ) -> (model: String?, reasoningEffort: String?, serviceTier: String?) {
+            effectiveCodexSelection(for: session)
+        }
+
+        @_spi(TestSupport)
         public static func test_shouldTreatRunningProcessAsAlive(
             observedAliveProcessIDs: Set<String>,
             processID: String,
