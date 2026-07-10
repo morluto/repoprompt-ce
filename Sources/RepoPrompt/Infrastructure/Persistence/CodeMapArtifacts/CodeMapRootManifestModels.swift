@@ -19,7 +19,7 @@ enum CodeMapRootManifestDecodeFailure: Error, Hashable {
     case invalidEnvelope
     case checksumMismatch
     case invalidMagic
-    case unsupportedCodecVersion(UInt32)
+    case unsupportedCodecVersion
     case namespaceValidation
     case namespaceDigestMismatch
     case expectedNamespaceMismatch
@@ -825,7 +825,7 @@ enum CodeMapRootManifestCodec {
             throw CodeMapRootManifestDecodeFailure.invalidEnvelope
         }
         guard codecVersion == version || codecVersion == legacyVersion else {
-            throw CodeMapRootManifestDecodeFailure.unsupportedCodecVersion(codecVersion)
+            throw CodeMapRootManifestDecodeFailure.unsupportedCodecVersion
         }
         let namespaceBytes: Data
         let authorityBytes: Data

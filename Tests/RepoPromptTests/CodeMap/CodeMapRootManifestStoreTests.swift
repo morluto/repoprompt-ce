@@ -2054,7 +2054,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         }
     }
 
-    func testRepeatedSemanticQuarantineBackpressuresOnlyTheFailingAuthority() async throws {
+    func testRepeatedSemanticQuarantineDelaysAndEventuallyRepairsTheFailingAuthority() async throws {
         let root = try makeSecureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let artifactStore = try CodeMapArtifactStore(rootURL: root)
@@ -2067,7 +2067,14 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             path: "Sources/App.swift",
             text: SwiftFixtureSource.emptyStruct("RepeatedSemanticFailure", trailingNewline: false)
         )
-        let store = try CodeMapRootManifestStore(rootURL: root, accessEpochSeconds: { 100 })
+        let clock = ManifestAccessClock(100)
+        let store = try CodeMapRootManifestStore(
+            rootURL: root,
+            hooks: CodeMapRootManifestStoreHooks(
+                waitForRegenerationBackpressure: { seconds in clock.advance(by: seconds) }
+            ),
+            accessEpochSeconds: { clock.value }
+        )
         _ = try await store.replaceCurrentManifest(
             namespace: fixture.namespace,
             authority: fixture.authority,
@@ -2104,62 +2111,23 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             currentAuthority: fixture.authority
         )
         XCTAssertEqual(secondFailure, .miss)
-        do {
-            _ = try await store.replaceCurrentManifest(
-                namespace: fixture.namespace,
-                authority: fixture.authority,
-                records: [fixture.record],
-                lastAccessEpochSeconds: 3
-            )
-            XCTFail("the repeatedly failing authority should be backpressured")
-        } catch {
-            XCTAssertEqual(error as? CodeMapRootManifestStoreError, .regenerationBackpressured)
-        }
-
-        let changedAuthority = try authorityLike(fixture.authority, generation: 2, index: "index-2")
-        let changedRecord = try await makeRecord(
-            root: root,
-            artifactStore: artifactStore,
-            namespaceScope: #function,
-            namespace: fixture.namespace,
-            authority: changedAuthority,
-            path: "Sources/App.swift",
-            text: SwiftFixtureSource.emptyStruct("ChangedAuthority", trailingNewline: false),
-            bindingGeneration: 2
-        )
         _ = try await store.replaceCurrentManifest(
             namespace: fixture.namespace,
-            authority: changedAuthority,
-            records: [changedRecord],
+            authority: fixture.authority,
+            records: [fixture.record],
             lastAccessEpochSeconds: 3
         )
 
-        let stale = try await store.loadCurrentManifest(
-            namespace: fixture.namespace,
-            currentAuthority: fixture.authority
-        )
-        XCTAssertEqual(stale, .stale(existingAuthority: changedAuthority))
-        do {
-            _ = try await store.replaceCurrentManifest(
-                namespace: fixture.namespace,
-                authority: fixture.authority,
-                records: [fixture.record],
-                lastAccessEpochSeconds: 4
-            )
-            XCTFail("a stale-authority read must not clear current-authority backpressure")
-        } catch {
-            XCTAssertEqual(error as? CodeMapRootManifestStoreError, .regenerationBackpressured)
-        }
         guard case .hit = try await store.loadCurrentManifest(
             namespace: fixture.namespace,
-            currentAuthority: changedAuthority
+            currentAuthority: fixture.authority
         ) else {
-            return XCTFail("a changed authority should bypass the previous authority's cooldown")
+            return XCTFail("the blocked durability write should repair after its delay")
         }
-
         let accounting = await store.decodeFailureAccounting()
         XCTAssertEqual(accounting.counts[.contributionValidation], 2)
-        XCTAssertEqual(accounting.regenerationBackpressureCount, 2)
+        XCTAssertEqual(accounting.regenerationBackpressureCount, 1)
+        XCTAssertEqual(clock.value, 130)
     }
 
     func testStoredManifestDecodeFailureAttributesValidatedFrameStage() async throws {
@@ -2201,7 +2169,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             checksummedManifest(unsupportedCodec),
             filenameDigest: fixture.namespace.storageDigestHex
         )) { error in
-            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .unsupportedCodecVersion(99))
+            XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, .unsupportedCodecVersion)
         }
 
         XCTAssertThrowsError(try CodeMapRootManifestCodec.decodeStored(
@@ -2908,10 +2876,22 @@ private final class ManifestEntryInsertionHook: @unchecked Sendable {
 }
 
 private final class ManifestAccessClock: @unchecked Sendable {
-    let value: UInt64
+    private let lock = NSLock()
+    private var storedValue: UInt64
 
     init(_ value: UInt64) {
-        self.value = value
+        storedValue = value
+    }
+
+    var value: UInt64 {
+        lock.withLock { storedValue }
+    }
+
+    func advance(by amount: UInt64) {
+        lock.withLock {
+            let (sum, overflow) = storedValue.addingReportingOverflow(amount)
+            storedValue = overflow ? .max : sum
+        }
     }
 }
 

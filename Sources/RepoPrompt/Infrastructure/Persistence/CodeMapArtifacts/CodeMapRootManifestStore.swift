@@ -7,7 +7,6 @@ enum CodeMapRootManifestStoreError: Error, Equatable {
     case insecureLeaf
     case quotaExceeded
     case staleWriterAuthority
-    case regenerationBackpressured
     case simulatedProcessTermination(CodeMapRootManifestStoreFaultPoint)
     case ioFailure(operation: String, code: Int32)
 }
@@ -53,6 +52,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
     let maximumQuarantineCount: Int
     let maintenanceEntryLimit: Int
     let minimumAccessRefreshIntervalSeconds: UInt64
+    let regenerationBaseBackoffSeconds: UInt64
 
     static let `default` = CodeMapRootManifestStorePolicy(
         maximumRecordCountPerManifest: 100_000,
@@ -61,7 +61,8 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         maximumStoreByteCount: 256 * 1024 * 1024,
         maximumQuarantineCount: 64,
         maintenanceEntryLimit: 4096,
-        minimumAccessRefreshIntervalSeconds: 60
+        minimumAccessRefreshIntervalSeconds: 60,
+        regenerationBaseBackoffSeconds: 30
     )
 
     init(
@@ -71,7 +72,8 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         maximumStoreByteCount: UInt64,
         maximumQuarantineCount: Int,
         maintenanceEntryLimit: Int,
-        minimumAccessRefreshIntervalSeconds: UInt64 = 60
+        minimumAccessRefreshIntervalSeconds: UInt64 = 60,
+        regenerationBaseBackoffSeconds: UInt64 = 30
     ) {
         precondition(maximumRecordCountPerManifest > 0)
         precondition(maximumManifestByteCount > 0)
@@ -79,6 +81,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         precondition(maximumStoreByteCount >= maximumManifestByteCount)
         precondition(maximumQuarantineCount > 0)
         precondition(maintenanceEntryLimit > maximumManifestCount)
+        precondition(regenerationBaseBackoffSeconds > 0)
         self.maximumRecordCountPerManifest = maximumRecordCountPerManifest
         self.maximumManifestByteCount = maximumManifestByteCount
         self.maximumManifestCount = maximumManifestCount
@@ -86,6 +89,7 @@ struct CodeMapRootManifestStorePolicy: Equatable {
         self.maximumQuarantineCount = maximumQuarantineCount
         self.maintenanceEntryLimit = maintenanceEntryLimit
         self.minimumAccessRefreshIntervalSeconds = minimumAccessRefreshIntervalSeconds
+        self.regenerationBaseBackoffSeconds = regenerationBaseBackoffSeconds
     }
 }
 
@@ -97,6 +101,7 @@ struct CodeMapRootManifestStoreHooks {
     var beforeMaintenanceLock: @Sendable () async -> Void
     var beforeTerminalAuthorityCheck: @Sendable (CodeMapRootManifestStoreTerminalOperation) -> Void
     var faultAction: @Sendable (CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction
+    var waitForRegenerationBackpressure: @Sendable (UInt64) async throws -> Void
 
     init(
         afterReadAdmission: @escaping @Sendable () async -> Void = {},
@@ -107,7 +112,11 @@ struct CodeMapRootManifestStoreHooks {
         beforeTerminalAuthorityCheck: @escaping @Sendable (CodeMapRootManifestStoreTerminalOperation) ->
             Void = { _ in },
         faultAction: @escaping @Sendable (CodeMapRootManifestStoreFaultPoint) ->
-            CodeMapRootManifestStoreFaultAction = { _ in .proceed }
+            CodeMapRootManifestStoreFaultAction = { _ in .proceed },
+        waitForRegenerationBackpressure: @escaping @Sendable (UInt64) async throws -> Void = { seconds in
+            let (nanoseconds, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+            try await Task.sleep(nanoseconds: overflow ? UInt64.max : nanoseconds)
+        }
     ) {
         self.afterReadAdmission = afterReadAdmission
         self.afterWriteShardAdmission = afterWriteShardAdmission
@@ -116,6 +125,7 @@ struct CodeMapRootManifestStoreHooks {
         self.beforeMaintenanceLock = beforeMaintenanceLock
         self.beforeTerminalAuthorityCheck = beforeTerminalAuthorityCheck
         self.faultAction = faultAction
+        self.waitForRegenerationBackpressure = waitForRegenerationBackpressure
     }
 
     static let none = CodeMapRootManifestStoreHooks()
@@ -184,7 +194,6 @@ actor CodeMapRootManifestStore {
     private static let directoryMode = mode_t(0o700)
     private static let fileMode = mode_t(0o600)
     private static let regenerationFailureThreshold: UInt64 = 2
-    private static let regenerationBaseBackoffSeconds: UInt64 = 30
     private static let regenerationMaximumBackoffExponent: UInt64 = 4
 
     nonisolated let rootURL: URL
@@ -594,6 +603,7 @@ actor CodeMapRootManifestStore {
         guard namespace.isCurrent else {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
+        try await waitForRegenerationBackpressure(namespace: namespace, authority: authority)
         let layout = try Self.openLayout(rootURL: rootURL, create: false)
         await hooks.beforeMaintenanceLock()
         try Self.lock(lockAnchor.rawValue, operation: "manifest-anchor-lock")
@@ -683,7 +693,6 @@ actor CodeMapRootManifestStore {
         } else {
             1
         }
-        try enforceRegenerationBackpressure(namespace: namespace, authority: authority)
         let snapshot = try CodeMapRootManifestSnapshot(
             namespace: namespace,
             authority: authority,
@@ -1396,8 +1405,7 @@ actor CodeMapRootManifestStore {
             return .valid(snapshot, identity)
         } catch CodeMapRootManifestStoreError.insecureLeaf {
             return .insecure
-        } catch let failure as CodeMapRootManifestDecodeFailure {
-            recordDecodeFailure(failure)
+        } catch is CodeMapRootManifestDecodeFailure {
             return .corrupt
         } catch {
             return .corrupt
@@ -1439,7 +1447,10 @@ actor CodeMapRootManifestStore {
                 state.failureCount - Self.regenerationFailureThreshold,
                 Self.regenerationMaximumBackoffExponent
             )
-            let delay = Self.regenerationBaseBackoffSeconds << exponent
+            let multiplier = UInt64(1) << exponent
+            let (candidateDelay, delayOverflow) = policy.regenerationBaseBackoffSeconds
+                .multipliedReportingOverflow(by: multiplier)
+            let delay = delayOverflow ? UInt64.max : candidateDelay
             let now = accessEpochSeconds()
             let (deadline, overflow) = now.addingReportingOverflow(delay)
             state.blockedUntilEpochSeconds = max(
@@ -1450,19 +1461,20 @@ actor CodeMapRootManifestStore {
         regenerationFailures[digest] = state
     }
 
-    private func enforceRegenerationBackpressure(
+    private func waitForRegenerationBackpressure(
         namespace: CodeMapRootManifestNamespace,
         authority: CodeMapRootManifestAuthority
-    ) throws {
+    ) async throws {
         let digest = namespace.storageDigestHex
-        guard let state = regenerationFailures[digest],
-              state.authority == authority,
-              accessEpochSeconds() < state.blockedUntilEpochSeconds
-        else { return }
-        regenerationBackpressureCount = regenerationBackpressureCount == .max
-            ? .max
-            : regenerationBackpressureCount + 1
-        throw CodeMapRootManifestStoreError.regenerationBackpressured
+        while let state = regenerationFailures[digest], state.authority == authority {
+            let now = accessEpochSeconds()
+            guard now < state.blockedUntilEpochSeconds else { return }
+            regenerationBackpressureCount = regenerationBackpressureCount == .max
+                ? .max
+                : regenerationBackpressureCount + 1
+            try await hooks.waitForRegenerationBackpressure(state.blockedUntilEpochSeconds - now)
+            try Task.checkCancellation()
+        }
     }
 
     private func clearRegenerationFailure(
