@@ -481,6 +481,25 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         }
     }
 
+    private static func persistentArtifactDirectory(
+        workspaceManager: WorkspaceManagerViewModel,
+        workspace: WorkspaceModel
+    ) throws -> URL {
+        try workspaceManager.persistentStorage(for: workspace).workspaceDirectory
+    }
+
+    #if DEBUG
+        static func test_persistentArtifactDirectory(
+            workspaceManager: WorkspaceManagerViewModel,
+            workspace: WorkspaceModel
+        ) throws -> URL {
+            try persistentArtifactDirectory(
+                workspaceManager: workspaceManager,
+                workspace: workspace
+            )
+        }
+    #endif
+
     private func executeGitToolBody(
         args: [String: Value],
         connectionID: UUID?,
@@ -1099,9 +1118,10 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             if artifacts {
                 let workspaceDirectory: URL
                 do {
-                    workspaceDirectory = try workspaceManager
-                        .persistentStorage(for: workspace)
-                        .workspaceDirectory
+                    workspaceDirectory = try Self.persistentArtifactDirectory(
+                        workspaceManager: workspaceManager,
+                        workspace: workspace
+                    )
                 } catch WorkspacePersistenceError.ephemeralWorkspace {
                     throw MCPError.invalidParams("Temporary workspaces cannot publish persistent Git artifacts.")
                 }

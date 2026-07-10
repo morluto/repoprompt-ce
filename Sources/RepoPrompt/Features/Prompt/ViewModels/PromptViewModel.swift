@@ -1002,9 +1002,12 @@ class PromptViewModel: ObservableObject {
         detectRenames: Bool = true
     ) async throws -> GitDiffSnapshotManifest {
         // Validate prerequisites
-        guard let workspace = workspaceManager?.activeWorkspace else {
+        guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
             throw GitArtifactPublishError.noActiveWorkspace
         }
+        let workspaceDirectory = try workspaceManager
+            .persistentStorage(for: workspace)
+            .workspaceDirectory
         guard let gitRootPath = gitViewModel.gitRootPath else {
             throw GitArtifactPublishError.noGitRepository
         }
@@ -1036,13 +1039,6 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Get workspace directory for storing artifacts
-        guard let workspaceManager else {
-            throw GitArtifactPublishError.noActiveWorkspace
-        }
-        let workspaceDirectory = try workspaceManager
-            .persistentStorage(for: workspace)
-            .workspaceDirectory
         let compareDisplay = compareSpec.displayString
 
         // Publish the artifacts

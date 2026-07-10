@@ -1,6 +1,14 @@
 import CryptoKit
 import Foundation
 
+enum AgentAttachmentStorageError: LocalizedError {
+    case noActiveWorkspace
+
+    var errorDescription: String? {
+        "Images require an active workspace."
+    }
+}
+
 @MainActor
 extension AgentModeViewModel {
     // MARK: - Draft Text Management
@@ -95,8 +103,23 @@ extension AgentModeViewModel {
     func attachImages(tabID: UUID, urls: [URL]) {
         guard !urls.isEmpty else { return }
         let session = session(for: tabID)
-        guard let storage = attachmentWorkspaceStorage() else {
-            let errorItem = AgentChatItem.error("Images require an active workspace.", sequenceIndex: session.nextSequenceIndex)
+        let storage: WorkspacePersistentStorage
+        do {
+            storage = try attachmentWorkspaceStorage()
+        } catch WorkspacePersistenceError.ephemeralWorkspace {
+            let errorItem = AgentChatItem.error(
+                "Images aren't available in temporary workspaces.",
+                sequenceIndex: session.nextSequenceIndex
+            )
+            session.appendItem(errorItem)
+            updateBindingsFromSession(session)
+            scheduleSave(for: tabID)
+            return
+        } catch {
+            let errorItem = AgentChatItem.error(
+                error.localizedDescription,
+                sequenceIndex: session.nextSequenceIndex
+            )
             session.appendItem(errorItem)
             updateBindingsFromSession(session)
             scheduleSave(for: tabID)
@@ -263,14 +286,14 @@ extension AgentModeViewModel {
         return ImageAttachmentFingerprint(byteCount: byteCount, digestHex: digestHex)
     }
 
-    private func attachmentWorkspaceStorage() -> WorkspacePersistentStorage? {
-        attachmentWorkspaceStorageProvider()
+    private func attachmentWorkspaceStorage() throws -> WorkspacePersistentStorage {
+        try attachmentWorkspaceStorageProvider()
     }
 
     private func clearConsumedAttachmentFilesIfNeeded(_ attachments: [AgentImageAttachment]) {
         guard clearConsumedAttachmentsAfterProviderConsumption else { return }
         guard !attachments.isEmpty else { return }
-        guard let storage = attachmentWorkspaceStorage() else { return }
+        guard let storage = try? attachmentWorkspaceStorage() else { return }
         attachmentStore.clearConsumedLocalFiles(attachments, storage: storage)
     }
 

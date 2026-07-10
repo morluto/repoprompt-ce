@@ -120,10 +120,6 @@ actor ChatDataService {
         _ session: ChatSession,
         for workspace: WorkspaceModel
     ) async throws -> URL {
-        guard workspace.persistenceDisposition == .persistent else {
-            throw WorkspacePersistenceError.ephemeralWorkspace
-        }
-
         // 1) Get "Chats" folder
         let chatsFolder = try ensureChatsFolder(for: workspace)
 

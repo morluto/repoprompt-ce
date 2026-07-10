@@ -560,7 +560,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
-    let attachmentWorkspaceStorageProvider: () -> WorkspacePersistentStorage?
+    let attachmentWorkspaceStorageProvider: () throws -> WorkspacePersistentStorage
     private let workspacePathProvider: () -> String?
     private let skillCatalog: AgentSkillCatalog
     private let headlessProviderFactory: HeadlessProviderFactory
@@ -1422,12 +1422,9 @@ final class AgentModeViewModel: ObservableObject {
         workspacePathProvider = codexWorkspacePathProvider
         attachmentWorkspaceStorageProvider = { [weak workspaceManager] in
             guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
-                return nil
+                throw AgentAttachmentStorageError.noActiveWorkspace
             }
-            return try? WorkspacePersistentStorage(
-                workspace: workspace,
-                workspaceDirectory: FileManager.default.temporaryDirectory
-            )
+            return try workspaceManager.persistentStorage(for: workspace)
         }
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
@@ -1573,7 +1570,6 @@ final class AgentModeViewModel: ObservableObject {
         init(
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
-            testWorkspaceDirectory: URL? = nil,
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
             shouldManageCodexTooling: Bool = false,
@@ -1638,11 +1634,7 @@ final class AgentModeViewModel: ObservableObject {
             self.applyEditsApprovalStore = applyEditsApprovalStore
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
             attachmentWorkspaceStorageProvider = {
-                let workspace = WorkspaceModel(name: "Agent attachment test", repoPaths: [])
-                return try? WorkspacePersistentStorage(
-                    workspace: workspace,
-                    workspaceDirectory: testWorkspaceDirectory ?? FileManager.default.temporaryDirectory
-                )
+                throw AgentAttachmentStorageError.noActiveWorkspace
             }
             let codexWorkspacePathProvider = { testWorkspacePath }
             let sessionWorkspacePathProvider: (TabSession) throws -> String? = { session in
