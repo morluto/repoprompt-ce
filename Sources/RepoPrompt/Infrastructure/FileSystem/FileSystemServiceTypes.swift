@@ -115,6 +115,7 @@ struct PendingFSEventBatch {
     var watcherAcceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark?
     var publicationSource: FileSystemDeltaPublicationSource = .watcher
     var watcherIngressGeneration: UInt64?
+    var ingressEvidence: FileSystemWatcherIngressEvidence = .empty
 
     var isEmpty: Bool {
         events.isEmpty
