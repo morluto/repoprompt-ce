@@ -1401,6 +1401,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
+    /// Storage directory for workspace sidecars (attachments, git artifacts, git_data).
+    /// Persistent workspaces keep their existing authorized directory; ephemeral workspaces
+    /// use a transient directory under the system temporary folder.
+    func workspaceStorage(for workspace: WorkspaceModel) -> WorkspacePersistentStorage {
+        let authoritativeWorkspace = workspaces.first(where: { $0.id == workspace.id }) ?? workspace
+        return workspaceStorage(for: authoritativeWorkspace, baseRoot: currentBaseRoot)
+    }
+
+    nonisolated func workspaceStorage(for workspace: WorkspaceModel, baseRoot: URL) -> WorkspacePersistentStorage {
+        if workspace.persistenceDisposition == .persistent {
+            return WorkspacePersistentStorage(
+                authorizedWorkspaceDirectory: workspaceDirectory(for: workspace, baseRoot: baseRoot)
+            )
+        }
+        let transientDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPrompt-Ephemeral-\(workspace.id.uuidString)", isDirectory: true)
+        return WorkspacePersistentStorage(authorizedWorkspaceDirectory: transientDirectory)
+    }
+
     func workspaceFileURL(for workspace: WorkspaceModel) -> URL {
         workspaceFileURL(for: workspace, baseRoot: currentBaseRoot)
     }

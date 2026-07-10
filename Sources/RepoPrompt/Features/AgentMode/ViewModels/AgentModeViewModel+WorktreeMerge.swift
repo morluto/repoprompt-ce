@@ -363,8 +363,8 @@ extension AgentModeViewModel {
                     "Worktree artifact publication requires an active workspace."
                 )
             }
-            return try workspaceManager
-                .persistentStorage(for: workspace)
+            return workspaceManager
+                .workspaceStorage(for: workspace)
                 .workspaceDirectory
         }
         if let workspaceManager, let workspace = workspaceManager.activeWorkspace {

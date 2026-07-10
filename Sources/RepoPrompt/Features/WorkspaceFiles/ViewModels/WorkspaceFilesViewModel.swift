@@ -3222,11 +3222,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         guard workspace.isSystemWorkspace == false else {
             throw GitDataRootLoadError.systemWorkspace(workspaceID: workspace.id)
         }
-        guard workspace.persistenceDisposition == .persistent else {
-            throw WorkspacePersistenceError.ephemeralWorkspace
-        }
 
-        let gitDataURL = workspaceManager.gitDataDirectory(for: workspace)
+        let gitDataURL = workspaceManager.workspaceStorage(for: workspace)
+            .workspaceDirectory
+            .appendingPathComponent("_git_data", isDirectory: true)
         if !isFolderAlreadyLoaded(gitDataURL) {
             try await loadSupplementalRoot(
                 at: gitDataURL,

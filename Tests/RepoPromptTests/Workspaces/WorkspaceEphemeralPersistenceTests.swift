@@ -90,7 +90,7 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testEphemeralAgentSessionLookupFailsBeforeCreatingSidecars() async {
+    func testEphemeralAgentSessionLookupReturnsEmptyBeforeCreatingSidecars() async {
         let storageRoot = temporaryStorageRoot()
         defer { try? FileManager.default.removeItem(at: storageRoot) }
 
@@ -101,16 +101,13 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         )
         workspace.isEphemeral = true
 
-        await XCTAssertThrowsErrorAsync {
-            try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
-        } errorHandler: { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        let sessions = try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
+        XCTAssertTrue(sessions.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 
     @MainActor
-    func testEphemeralGitDataLoadFailsBeforeCreatingSidecars() async {
+    func testEphemeralGitDataLoadUsesTransientStorageWithoutCreatingSidecars() async {
         let storageRoot = temporaryStorageRoot()
         defer { try? FileManager.default.removeItem(at: storageRoot) }
 
@@ -124,14 +121,11 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         fixture.manager.workspaces = [workspace]
         fixture.manager.activeWorkspace = workspace
 
-        await XCTAssertThrowsErrorAsync {
-            try await fixture.files.ensureGitDataRootLoaded(
-                workspace: workspace,
-                workspaceManager: fixture.manager
-            )
-        } errorHandler: { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        let root = try await fixture.files.ensureGitDataRootLoaded(
+            workspace: workspace,
+            workspaceManager: fixture.manager
+        )
+        XCTAssertTrue(root.standardizedFullPath.hasSuffix("/_git_data"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 
@@ -254,7 +248,7 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testEphemeralPromptGitPublicationFailsAtStorageAuthorization() async {
+    func testEphemeralPromptGitPublicationFailsAtNoGitRepository() async {
         let fixture = makeFixture()
         var workspace = WorkspaceModel(name: "Prompt Temporary", repoPaths: [])
         workspace.isEphemeral = true
@@ -264,24 +258,24 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         await XCTAssertThrowsErrorAsync {
             try await fixture.prompt.publishGitDiffArtifacts(inclusionMode: .all)
         } errorHandler: { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
+            guard case .noGitRepository = error as? GitArtifactPublishError else {
+                return XCTFail("Expected noGitRepository, got \(error)")
+            }
         }
     }
 
     @MainActor
-    func testEphemeralMCPGitPublicationCannotResolveArtifactDirectory() throws {
+    func testEphemeralMCPGitPublicationUsesTransientArtifactDirectory() throws {
         let fixture = makeFixture()
         var workspace = WorkspaceModel(name: "MCP Temporary", repoPaths: [])
         workspace.isEphemeral = true
 
-        XCTAssertThrowsError(
-            try MCPGitToolProvider.test_persistentArtifactDirectory(
-                workspaceManager: fixture.manager,
-                workspace: workspace
-            )
-        ) { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        let url = MCPGitToolProvider.test_persistentArtifactDirectory(
+            workspaceManager: fixture.manager,
+            workspace: workspace
+        )
+        XCTAssertTrue(url.path.contains("RepoPrompt-Ephemeral-"))
+        XCTAssertFalse(url.path.contains("/Workspace/"))
     }
 
     @MainActor
@@ -308,14 +302,11 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         ephemeral.isEphemeral = true
         fixture.manager.workspaces = [ephemeral]
         fixture.manager.activeWorkspace = ephemeral
-        XCTAssertThrowsError(
-            try AgentModeViewModel.test_worktreePreviewDirectory(
-                publishArtifacts: true,
-                workspaceManager: fixture.manager
-            )
-        ) { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        let ephemeralDir = try AgentModeViewModel.test_worktreePreviewDirectory(
+            publishArtifacts: true,
+            workspaceManager: fixture.manager
+        )
+        XCTAssertTrue(ephemeralDir.path.contains("RepoPrompt-Ephemeral-"))
     }
 
     @MainActor

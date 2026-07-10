@@ -1005,8 +1005,8 @@ class PromptViewModel: ObservableObject {
         guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
             throw GitArtifactPublishError.noActiveWorkspace
         }
-        let workspaceDirectory = try workspaceManager
-            .persistentStorage(for: workspace)
+        let workspaceDirectory = workspaceManager
+            .workspaceStorage(for: workspace)
             .workspaceDirectory
         guard let gitRootPath = gitViewModel.gitRootPath else {
             throw GitArtifactPublishError.noGitRepository

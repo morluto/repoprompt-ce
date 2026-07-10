@@ -1424,7 +1424,7 @@ final class AgentModeViewModel: ObservableObject {
             guard let workspaceManager, let workspace = workspaceManager.activeWorkspace else {
                 throw AgentAttachmentStorageError.noActiveWorkspace
             }
-            return try workspaceManager.persistentStorage(for: workspace)
+            return workspaceManager.workspaceStorage(for: workspace)
         }
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()

@@ -106,15 +106,6 @@ extension AgentModeViewModel {
         let storage: WorkspacePersistentStorage
         do {
             storage = try attachmentWorkspaceStorage()
-        } catch WorkspacePersistenceError.ephemeralWorkspace {
-            let errorItem = AgentChatItem.error(
-                "Images aren't available in temporary workspaces.",
-                sequenceIndex: session.nextSequenceIndex
-            )
-            session.appendItem(errorItem)
-            updateBindingsFromSession(session)
-            scheduleSave(for: tabID)
-            return
         } catch {
             let errorItem = AgentChatItem.error(
                 error.localizedDescription,
