@@ -201,6 +201,11 @@ actor WorkspaceFileContextStore {
         }
     #endif
 
+    enum CodemapProjectionPreloadTrigger: String, Equatable {
+        case rootReady
+        case watcherGap
+    }
+
     enum CodemapProjectionPreloadStoreEventKind: String, Equatable {
         case rootInventoryAndSearchReady
         case scheduled
@@ -223,6 +228,7 @@ actor WorkspaceFileContextStore {
         let rootEpoch: WorkspaceCodemapRootEpoch
         let kind: CodemapProjectionPreloadStoreEventKind
         let launchPhase: WorkspaceCodemapProjectionPreloadLaunchPhase
+        let trigger: CodemapProjectionPreloadTrigger
     }
 
     struct CodemapProjectionPreloadRetryPolicy: @unchecked Sendable {
@@ -341,6 +347,7 @@ actor WorkspaceFileContextStore {
         let id: UUID
         let authority: CodemapRootAuthority
         let retryAttempt: Int
+        let trigger: CodemapProjectionPreloadTrigger
         var phase: WorkspaceCodemapProjectionPreloadLaunchPhase
         var task: Task<Void, Never>?
     }
@@ -350,6 +357,7 @@ actor WorkspaceFileContextStore {
         let authority: CodemapRootAuthority
         let attempt: Int
         let deadlineNanoseconds: UInt64
+        let trigger: CodemapProjectionPreloadTrigger
         let task: Task<Void, Never>
     }
 
@@ -981,6 +989,7 @@ actor WorkspaceFileContextStore {
             let distinctContentKeyCount: Int
             let decodedCacheInvalidationRequestCount: Int
             let codemapInvalidationRequestCount: Int
+            let watcherGapInvalidationCount: Int
             let appliedIndexEventYieldCount: Int
         }
 
@@ -1116,6 +1125,7 @@ actor WorkspaceFileContextStore {
             var contentInvalidationCount = 0
             var decodedCacheInvalidationRequestCount = 0
             var codemapInvalidationRequestCount = 0
+            var watcherGapInvalidationCount = 0
             var appliedIndexEventYieldCount = 0
             var distinctContentKeys = Set<WorkspaceSearchContentCacheKey>()
 
@@ -1893,6 +1903,7 @@ actor WorkspaceFileContextStore {
                 distinctContentKeyCount: recorder.distinctContentKeys.count,
                 decodedCacheInvalidationRequestCount: recorder.decodedCacheInvalidationRequestCount,
                 codemapInvalidationRequestCount: recorder.codemapInvalidationRequestCount,
+                watcherGapInvalidationCount: recorder.watcherGapInvalidationCount,
                 appliedIndexEventYieldCount: recorder.appliedIndexEventYieldCount
             )
         }
@@ -2288,6 +2299,9 @@ actor WorkspaceFileContextStore {
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
     private var codemapProjectionPreloadReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var codemapProjectionPreloadPendingTriggerByRootEpoch: [
+        WorkspaceCodemapRootEpoch: CodemapProjectionPreloadTrigger
+    ] = [:]
     private var codemapPathLocalCatalogMutationDepthByRootID: [UUID: Int] = [:]
     private var codemapAuthorityGenerationsByRootEpoch: [WorkspaceCodemapRootEpoch: UInt64] = [:]
     private var codemapProjectionInvalidationGenerationsByRootEpoch: [
@@ -9818,6 +9832,7 @@ actor WorkspaceFileContextStore {
                 continuation.resume()
             }
             codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
+            codemapProjectionPreloadPendingTriggerByRootEpoch.removeValue(forKey: rootEpoch)
             if let cleanup = detachCodemapSession(
                 rootEpoch: rootEpoch,
                 invalidationCommands: [.unload],
@@ -12807,15 +12822,21 @@ actor WorkspaceFileContextStore {
     private func recordCodemapProjectionPreloadStoreEvent(
         _ kind: CodemapProjectionPreloadStoreEventKind,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        phase: WorkspaceCodemapProjectionPreloadLaunchPhase
+        phase: WorkspaceCodemapProjectionPreloadLaunchPhase,
+        trigger: CodemapProjectionPreloadTrigger? = nil
     ) {
         #if DEBUG
+            let effectiveTrigger = trigger
+                ?? codemapProjectionPreloadLaunchesByRootEpoch[rootEpoch]?.trigger
+                ?? codemapProjectionPreloadRetriesByRootEpoch[rootEpoch]?.trigger
+                ?? .rootReady
             nextCodemapProjectionPreloadStoreEventOrdinal &+= 1
             codemapProjectionPreloadStoreEvents.append(CodemapProjectionPreloadStoreEvent(
                 ordinal: nextCodemapProjectionPreloadStoreEventOrdinal,
                 rootEpoch: rootEpoch,
                 kind: kind,
-                launchPhase: phase
+                launchPhase: phase,
+                trigger: effectiveTrigger
             ))
             if codemapProjectionPreloadStoreEvents.count > 2048 {
                 codemapProjectionPreloadStoreEvents.removeFirst(
@@ -12839,7 +12860,8 @@ actor WorkspaceFileContextStore {
     /// integration-route, manifest, CAS, source, and graph work all begin in the task body.
     private func scheduleCodemapProjectionPreloadAfterRootReady(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        retryAttempt: Int = 0
+        retryAttempt: Int = 0,
+        trigger: CodemapProjectionPreloadTrigger = .rootReady
     ) {
         #if DEBUG
             guard codemapProjectionPreloadLaunchPolicyForTesting == .enabled else { return }
@@ -12864,13 +12886,15 @@ actor WorkspaceFileContextStore {
             id: launchID,
             authority: authority,
             retryAttempt: retryAttempt,
+            trigger: trigger,
             phase: .eligibilityQueued,
             task: nil
         )
         recordCodemapProjectionPreloadStoreEvent(
             .scheduled,
             rootEpoch: rootEpoch,
-            phase: .eligibilityQueued
+            phase: .eligibilityQueued,
+            trigger: trigger
         )
         let task = Task<Void, Never>(priority: .background) { [weak self] in
             guard let self else { return }
@@ -13336,6 +13360,7 @@ actor WorkspaceFileContextStore {
             authority: authority,
             attempt: attempt,
             deadlineNanoseconds: deadline,
+            trigger: launch.trigger,
             task: task
         )
         recordCodemapProjectionPreloadStoreEvent(
@@ -13357,6 +13382,7 @@ actor WorkspaceFileContextStore {
               retry.attempt == attempt,
               retry.deadlineNanoseconds == deadlineNanoseconds
         else { return }
+        let trigger = retry.trigger
         codemapProjectionPreloadRetriesByRootEpoch.removeValue(forKey: authority.rootEpoch)
         guard !Task.isCancelled,
               codemapProjectionPreloadRetryPolicy.nowNanoseconds() >= deadlineNanoseconds,
@@ -13380,7 +13406,8 @@ actor WorkspaceFileContextStore {
         }
         scheduleCodemapProjectionPreloadAfterRootReady(
             rootEpoch: authority.rootEpoch,
-            retryAttempt: attempt
+            retryAttempt: attempt,
+            trigger: trigger
         )
     }
 
@@ -18410,7 +18437,8 @@ actor WorkspaceFileContextStore {
               rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
         else { return }
         codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
-        scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch)
+        let trigger = codemapProjectionPreloadPendingTriggerByRootEpoch.removeValue(forKey: rootEpoch) ?? .rootReady
+        scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch, trigger: trigger)
     }
 
     private func fenceCodemapRootAuthority(
@@ -19561,6 +19589,14 @@ actor WorkspaceFileContextStore {
             requiresFullResync: requiresFullResync
         )
         if let rootCommand = invalidation.rootCommand {
+            #if DEBUG
+                if case .watcherGap = rootCommand {
+                    Self.activePublicationInvalidationRecorder?.watcherGapInvalidationCount += 1
+                }
+            #endif
+            if case .watcherGap = rootCommand, let repositoryMutationFence {
+                codemapProjectionPreloadPendingTriggerByRootEpoch[repositoryMutationFence.rootEpoch] = .watcherGap
+            }
             if repositoryMutationFence == nil {
                 await fenceCodemapRootAuthority(rootIDs: [rootID], command: rootCommand)
             }
@@ -19573,10 +19609,13 @@ actor WorkspaceFileContextStore {
             didCommitRepositoryMutation = repositoryMutationFence != nil
             await awaitCodemapCleanupFlights(rootIDs: [rootID])
             if repositoryMutationFence == nil, let current = rootStatesByID[rootID] {
-                scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: WorkspaceCodemapRootEpoch(
-                    rootID: rootID,
-                    rootLifetimeID: current.lifetimeID
-                ))
+                scheduleCodemapProjectionPreloadAfterRootReady(
+                    rootEpoch: WorkspaceCodemapRootEpoch(
+                        rootID: rootID,
+                        rootLifetimeID: current.lifetimeID
+                    ),
+                    trigger: .watcherGap
+                )
             }
             return
         }
