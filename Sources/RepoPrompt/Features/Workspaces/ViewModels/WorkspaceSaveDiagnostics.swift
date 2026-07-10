@@ -1,6 +1,6 @@
 import Foundation
 
-struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, CustomStringConvertible, Sendable {
+struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, CustomStringConvertible {
     let rawValue: String
 
     init(_ rawValue: String) {
@@ -52,12 +52,12 @@ struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, Cus
     static let directUnknown = WorkspaceSaveSource("directUnknown")
 }
 
-enum WorkspaceSaveUrgency: Equatable, Sendable {
+enum WorkspaceSaveUrgency: Equatable {
     case deferred
     case flushBeforeBoundary
 }
 
-enum WorkspaceSaveCompletion: Equatable, Sendable {
+enum WorkspaceSaveCompletion: Equatable {
     case committed(version: Int)
     case superseded(version: Int)
     case skippedIneligible
@@ -65,37 +65,39 @@ enum WorkspaceSaveCompletion: Equatable, Sendable {
     case cancelled
 }
 
-struct WorkspaceSavePerformanceSummary: Equatable, Sendable {
-    let source: WorkspaceSaveSource
-    let payloadByteCount: Int
-    let composeTabCount: Int
-    let selectedPathCount: Int
-    let sliceFileCount: Int
-    let sliceRangeCount: Int
-    let preparationDurationMS: Double
-    let diskDecodeDurationMS: Double
-    let encodeDurationMS: Double
-    let staleVersionRetryCount: Int
-    let coalescedRequestCount: Int
-    let atomicWriteCount: Int
+#if DEBUG
+    struct WorkspaceSavePerformanceSummary: Equatable {
+        let source: WorkspaceSaveSource
+        let payloadByteCount: Int
+        let composeTabCount: Int
+        let selectedPathCount: Int
+        let sliceFileCount: Int
+        let sliceRangeCount: Int
+        let preparationDurationMS: Double
+        let diskDecodeDurationMS: Double
+        let encodeDurationMS: Double
+        let staleVersionRetryCount: Int
+        let coalescedRequestCount: Int
+        let atomicWriteCount: Int
 
-    var traceFields: [String: String] {
-        [
-            "source": source.rawValue,
-            "payloadByteCount": "\(payloadByteCount)",
-            "composeTabCount": "\(composeTabCount)",
-            "selectedPathCount": "\(selectedPathCount)",
-            "sliceFileCount": "\(sliceFileCount)",
-            "sliceRangeCount": "\(sliceRangeCount)",
-            "preparationDurationMS": String(format: "%.3f", preparationDurationMS),
-            "diskDecodeDurationMS": String(format: "%.3f", diskDecodeDurationMS),
-            "encodeDurationMS": String(format: "%.3f", encodeDurationMS),
-            "staleVersionRetryCount": "\(staleVersionRetryCount)",
-            "coalescedRequestCount": "\(coalescedRequestCount)",
-            "atomicWriteCount": "\(atomicWriteCount)"
-        ]
+        var traceFields: [String: String] {
+            [
+                "source": source.rawValue,
+                "payloadByteCount": "\(payloadByteCount)",
+                "composeTabCount": "\(composeTabCount)",
+                "selectedPathCount": "\(selectedPathCount)",
+                "sliceFileCount": "\(sliceFileCount)",
+                "sliceRangeCount": "\(sliceRangeCount)",
+                "preparationDurationMS": String(format: "%.3f", preparationDurationMS),
+                "diskDecodeDurationMS": String(format: "%.3f", diskDecodeDurationMS),
+                "encodeDurationMS": String(format: "%.3f", encodeDurationMS),
+                "staleVersionRetryCount": "\(staleVersionRetryCount)",
+                "coalescedRequestCount": "\(coalescedRequestCount)",
+                "atomicWriteCount": "\(atomicWriteCount)"
+            ]
+        }
     }
-}
+#endif
 
 struct WorkspaceSaveOwner: Equatable, Hashable {
     let windowID: Int?
