@@ -1043,6 +1043,92 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testClaudeIdleShutdownWaitsForActiveChildAgentRunWait() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        var hasActiveChildWait = true
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            activeAgentRunWaitQuery: { _ in hasActiveChildWait },
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.claudeController = controller
+        session.providerSessionID = "resume-child-wait"
+
+        harness.service.scheduleClaudeIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: controller,
+            agent: .claudeCode,
+            reason: "test"
+        )
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNotNil(session.claudeController)
+        XCTAssertFalse(recorder.contains("claude:shutdown"))
+        XCTAssertEqual(session.providerSessionID, "resume-child-wait")
+
+        hasActiveChildWait = false
+        harness.service.scheduleClaudeIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: controller,
+            agent: .claudeCode,
+            reason: "test"
+        )
+        try await waitUntil("Claude idle cleanup should resume after the child wait drains") {
+            session.claudeController == nil
+        }
+        XCTAssertEqual(session.providerSessionID, "lifecycle-claude-session")
+    }
+
+    func testCancellingIdleOwnershipDoesNotCancelShutdownAfterTeardownBegins() async throws {
+        let recorder = LifecycleRecorder()
+        let shutdownGate = LifecycleAsyncGate()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            shutdownGate: shutdownGate
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            claudeIdleShutdownDelayNanos: 1_000_000
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.claudeController = controller
+        session.providerSessionID = "resume-cancel-safe"
+
+        harness.service.scheduleClaudeIdleShutdownIfNeeded(
+            for: session,
+            completedRunID: session.runID,
+            retainedController: controller,
+            agent: .claudeCode,
+            reason: "test"
+        )
+        await shutdownGate.waitUntilArrived()
+
+        harness.service.cancelClaudeIdleShutdown(for: session.tabID)
+        await shutdownGate.release()
+        try await withLifecycleTimeout("Claude shutdown should finish after idle ownership is cancelled") {
+            while await !controller.didFinishShutdown() {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+            }
+        }
+
+        let shutdownWasCancelled = await controller.didShutdownObserveCancellation()
+        XCTAssertEqual(shutdownWasCancelled, false)
+        XCTAssertNil(session.claudeController)
+        XCTAssertEqual(session.providerSessionID, "lifecycle-claude-session")
+    }
+
     func testClaudeIdleShutdownCancelsOnNewRun() async throws {
         let recorder = LifecycleRecorder()
         let controller = LifecycleFakeNativeController(recorder: recorder)
@@ -2087,6 +2173,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult)? = nil,
         autoSignalACPRouting: Bool = false,
+        activeAgentRunWaitQuery: @escaping (UUID) -> Bool = { _ in false },
         acpIdleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos,
         claudeIdleShutdownDelayNanos: UInt64 = AgentModeIdleShutdownPolicy.defaultDelayNanos
     ) -> LifecycleHarness {
@@ -2149,7 +2236,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: cancelMCPTools,
             awaitNoActiveMCPTools: idleWaiter,
-            activeAgentRunWaitQuery: { _ in false },
+            activeAgentRunWaitQuery: activeAgentRunWaitQuery,
             childAgentRunWaitDrainTimeoutSeconds: 0.01,
             acpIdleShutdownDelayNanos: acpIdleShutdownDelayNanos,
             claudeIdleShutdownDelayNanos: claudeIdleShutdownDelayNanos

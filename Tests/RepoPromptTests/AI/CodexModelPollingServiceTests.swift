@@ -60,6 +60,42 @@ final class CodexModelPollingServiceTests: XCTestCase {
         await service.shutdown()
     }
 
+    func testSubscriberAndRefreshArrivingDuringIdleStopWaitForTheSameLifecycleOperation() async throws {
+        let stopGate = PollingAsyncGate()
+        let client = PollingClientSpy(stopGate: stopGate)
+        let service = CodexModelPollingService(
+            client: client,
+            intervalNanos: 60_000_000_000,
+            stopClientOnShutdown: false,
+            stopClientWhenIdle: true,
+            stopClientAfterRefresh: true
+        )
+
+        let firstConsumer = await makeConsumer(service: service)
+        try await waitUntil { await client.listCallCount == 1 }
+        await stopGate.waitUntilArrived()
+
+        firstConsumer.cancel()
+        await firstConsumer.value
+        let refresh = Task { await service.refreshNow() }
+        let secondConsumer = await makeConsumer(service: service)
+
+        try await Task.sleep(for: .milliseconds(50))
+        let listCallsWhileStopping = await client.listCallCount
+        let stopCallsWhileStopping = await client.stopCallCount
+        XCTAssertEqual(listCallsWhileStopping, 1)
+        XCTAssertEqual(stopCallsWhileStopping, 1)
+
+        await stopGate.release()
+        await refresh.value
+        await service.refreshNow()
+        try await waitUntil { await client.listCallCount == 2 }
+
+        secondConsumer.cancel()
+        await secondConsumer.value
+        await service.shutdown()
+    }
+
     private func makeConsumer(
         service: CodexModelPollingService
     ) async -> Task<Void, Never> {
@@ -89,6 +125,11 @@ private actor PollingClientSpy: CodexModelListingClient {
     private(set) var listCallCount = 0
     private(set) var stopCallCount = 0
     private var processSnapshot: CodexAppServerClient.ProcessSnapshot?
+    private let stopGate: PollingAsyncGate?
+
+    init(stopGate: PollingAsyncGate? = nil) {
+        self.stopGate = stopGate
+    }
 
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel] {
         listCallCount += 1
@@ -108,6 +149,9 @@ private actor PollingClientSpy: CodexModelListingClient {
 
     func stop() async {
         stopCallCount += 1
+        if let stopGate {
+            await stopGate.arriveAndWait()
+        }
         if let snapshot = processSnapshot {
             processSnapshot = .init(pid: snapshot.pid, appearsAlive: false)
         }
@@ -119,5 +163,37 @@ private actor PollingClientSpy: CodexModelListingClient {
 
     func setProcessSnapshot(_ snapshot: CodexAppServerClient.ProcessSnapshot?) {
         processSnapshot = snapshot
+    }
+}
+
+private actor PollingAsyncGate {
+    private var arrived = false
+    private var released = false
+    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func arriveAndWait() async {
+        arrived = true
+        let waiters = arrivalWaiters
+        arrivalWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilArrived() async {
+        guard !arrived else { return }
+        await withCheckedContinuation { arrivalWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 }

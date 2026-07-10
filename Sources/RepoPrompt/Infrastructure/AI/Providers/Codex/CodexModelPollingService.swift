@@ -62,6 +62,7 @@ actor CodexModelPollingService {
     private var latest: Snapshot?
     private var isShutdown = false
     private var isStoppingClientForIdle = false
+    private var inFlightRefreshNeedsInterrupt = false
 
     init(
         client: any CodexModelListingClient,
@@ -157,8 +158,17 @@ actor CodexModelPollingService {
         isShutdown = true
         pollingTask?.cancel()
         pollingTask = nil
-        inFlightRefresh?.cancel()
+        let shouldInterruptRefresh = inFlightRefresh != nil
+            && inFlightRefreshNeedsInterrupt
+            && stopClientOnShutdown
+        if shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
+        }
+        if let inFlightRefresh {
+            await inFlightRefresh.value
+        }
         inFlightRefresh = nil
+        inFlightRefreshNeedsInterrupt = false
         if finishSubscribers {
             let activeContinuations = continuations
             continuations.removeAll()
@@ -169,8 +179,8 @@ actor CodexModelPollingService {
                 continuation.finish()
             }
         }
-        if stopClientOnShutdown {
-            await client.stop()
+        if stopClientOnShutdown, !shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
         }
     }
 
@@ -201,11 +211,16 @@ actor CodexModelPollingService {
         guard !isStoppingClientForIdle else { return }
 
         isStoppingClientForIdle = true
+        let shouldInterruptRefresh = inFlightRefresh != nil && inFlightRefreshNeedsInterrupt
+        if shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
+        }
         if let inFlightRefresh {
-            inFlightRefresh.cancel()
             await inFlightRefresh.value
         }
-        await client.stop()
+        if !stopClientAfterRefresh, !shouldInterruptRefresh {
+            await stopClientWithoutInheritingCancellation()
+        }
         isStoppingClientForIdle = false
 
         if !isShutdown, !continuations.isEmpty {
@@ -244,19 +259,38 @@ actor CodexModelPollingService {
             guard let self else { return }
             do {
                 let models = try await client.listModels(limit: 100)
-                guard !Task.isCancelled else { return }
                 let snapshot = Snapshot(models: models, fetchedAt: Date())
                 await applyRefreshResult(snapshot)
             } catch {
                 // Keep existing cache when refresh fails; callers fall back to static list when empty.
             }
+            let shouldStopClient = await finishRefreshRequest()
+            // Refresh and transport shutdown are one lifecycle operation. Keeping the stop in
+            // this task prevents refreshNow(), subscriber removal, and the next polling tick from
+            // observing a completed refresh while the app-server is still being stopped.
+            if shouldStopClient {
+                await client.stop()
+            }
         }
+        inFlightRefreshNeedsInterrupt = true
         inFlightRefresh = task
-        defer { inFlightRefresh = nil }
+        defer {
+            inFlightRefresh = nil
+            inFlightRefreshNeedsInterrupt = false
+        }
         await task.value
-        if stopClientAfterRefresh, !isShutdown {
+    }
+
+    private func stopClientWithoutInheritingCancellation() async {
+        let stopTask = Task { [client] in
             await client.stop()
         }
+        await stopTask.value
+    }
+
+    private func finishRefreshRequest() -> Bool {
+        inFlightRefreshNeedsInterrupt = false
+        return stopClientAfterRefresh && !isStoppingClientForIdle && !isShutdown
     }
 
     private func applyRefreshResult(_ snapshot: Snapshot) {

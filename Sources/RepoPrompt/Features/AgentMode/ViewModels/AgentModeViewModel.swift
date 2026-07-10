@@ -1709,7 +1709,7 @@ final class AgentModeViewModel: ObservableObject {
                         )
                     },
                 leaseRoutingTimeoutMs: testCodexLeaseRoutingTimeoutMs ?? 2000,
-                idleShutdownDelayNanos: testCodexIdleShutdownDelayNanos ?? 300_000_000_000,
+                idleShutdownDelayNanos: testCodexIdleShutdownDelayNanos ?? AgentModeIdleShutdownPolicy.defaultDelayNanos,
                 stallWatchdogPollIntervalNanos: testCodexStallWatchdogPollIntervalNanos ?? 5_000_000_000,
                 stallWatchdogProbeThreshold: testWatchdogProbeThreshold,
                 stallWatchdogRecoveryThreshold: testWatchdogRecoveryThreshold,

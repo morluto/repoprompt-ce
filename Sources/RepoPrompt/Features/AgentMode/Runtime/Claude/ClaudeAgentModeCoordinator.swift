@@ -510,11 +510,14 @@ final class ClaudeAgentModeCoordinator {
         ) else {
             return false
         }
-        guard await retireClaudeController(
-            detached,
-            for: session,
-            captureProviderSessionID: true
-        ) else {
+        let retirementTask = Task { @MainActor in
+            await retireClaudeController(
+                detached,
+                for: session,
+                captureProviderSessionID: true
+            )
+        }
+        guard await retirementTask.value else {
             return false
         }
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)

@@ -500,9 +500,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let currentSessionRefGate: LifecycleAsyncGate?
     private let eventsStreamReadyGate: LifecycleAsyncGate?
     private let sendUserMessageGate: LifecycleAsyncGate?
+    private let shutdownGate: LifecycleAsyncGate?
     private let sessionRef = NativeAgentRuntimeSessionRef(sessionID: "lifecycle-claude-session")
     private let sendTurnID: UUID
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
+    private var shutdownObservedCancellation: Bool?
+    private var shutdownFinished = false
 
     init(
         recorder: LifecycleRecorder,
@@ -512,6 +515,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         currentSessionRefGate: LifecycleAsyncGate? = nil,
         eventsStreamReadyGate: LifecycleAsyncGate? = nil,
         sendUserMessageGate: LifecycleAsyncGate? = nil,
+        shutdownGate: LifecycleAsyncGate? = nil,
         sendTurnID: UUID = UUID(),
         events: [NativeAgentRuntimeEvent] = []
     ) {
@@ -522,6 +526,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.currentSessionRefGate = currentSessionRefGate
         self.eventsStreamReadyGate = eventsStreamReadyGate
         self.sendUserMessageGate = sendUserMessageGate
+        self.shutdownGate = shutdownGate
         self.sendTurnID = sendTurnID
         stream = AsyncStream { continuation in
             for event in events {
@@ -592,6 +597,20 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
 
     func shutdown() async {
         recorder.record("\(label):shutdown")
+        shutdownObservedCancellation = Task.isCancelled
+        if let shutdownGate {
+            await shutdownGate.arriveAndWait()
+            shutdownObservedCancellation = shutdownObservedCancellation == true || Task.isCancelled
+        }
+        shutdownFinished = true
+    }
+
+    func didShutdownObserveCancellation() -> Bool? {
+        shutdownObservedCancellation
+    }
+
+    func didFinishShutdown() -> Bool {
+        shutdownFinished
     }
 
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {}

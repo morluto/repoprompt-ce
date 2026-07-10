@@ -237,8 +237,11 @@ extension AgentModeViewModel.TabSession {
 
     func teardownACPControllerIfPresent() async {
         guard let controller = detachACPControllerForShutdown() else { return }
-        await controller.cancelPrompt()
-        await controller.shutdown()
+        let shutdownTask = Task { @MainActor in
+            await controller.cancelPrompt()
+            await controller.shutdown()
+        }
+        await shutdownTask.value
     }
 }
 
