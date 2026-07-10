@@ -275,6 +275,38 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var stateVersionByWorkspaceID: [UUID: Int] = [:]
     private var lastSavedVersionByWorkspaceID: [UUID: Int] = [:]
 
+    private struct WorkspaceSaveRequest {
+        let workspaceID: UUID
+        let requestedVersion: Int
+        let source: WorkspaceSaveSource
+        let urgency: WorkspaceSaveUrgency
+        let requestedAt: Date
+        let sequence: UInt64
+    }
+
+    private struct WorkspaceSaveCoordinatorState {
+        var pendingLatest: WorkspaceSaveRequest?
+        var firstDeferredRequestAt: Date?
+        var worker: Task<Void, Never>?
+        var waiters: [CheckedContinuation<WorkspaceSaveCompletion, Never>] = []
+        var coalescedRequestCount = 0
+        var staleVersionRetryCount = 0
+        var requiresBoundaryFlush = false
+        var debounceGeneration: UInt64 = 0
+        var debounceWaiter: CheckedContinuation<Void, Never>?
+    }
+
+    private var workspaceSaveStateByWorkspaceID: [UUID: WorkspaceSaveCoordinatorState] = [:]
+    private var nextWorkspaceSaveRequestSequence: UInt64 = 1
+    private static let workspaceSaveQuietDelay: TimeInterval = 0.2
+    private static let workspaceSaveMaximumDelay: TimeInterval = 1
+
+    #if DEBUG
+        private var workspaceSavePreparationCountByWorkspaceID: [UUID: Int] = [:]
+        private var workspaceSavePreparationGate: (@Sendable (UUID, Int) async -> Void)?
+        private var latestWorkspaceSavePerformanceSummaryByWorkspaceID: [UUID: WorkspaceSavePerformanceSummary] = [:]
+    #endif
+
     @MainActor
     private static var nextWorkspaceSelectionRevision: UInt64 = 1
     @MainActor
@@ -1625,6 +1657,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             tasks.forEach { $0.cancel() }
         }
         postCatalogRootWorkTasks.removeAll()
+        for state in workspaceSaveStateByWorkspaceID.values {
+            state.worker?.cancel()
+        }
     }
 
     func prepareForWindowClose() {
@@ -1641,8 +1676,43 @@ class WorkspaceManagerViewModel: ObservableObject {
             tasks.forEach { $0.cancel() }
         }
         postCatalogRootWorkTasks.removeAll()
+        for state in workspaceSaveStateByWorkspaceID.values {
+            state.worker?.cancel()
+        }
         cancellables.removeAll()
     }
+
+    #if DEBUG
+        func test_scheduleWorkspaceSave(source: WorkspaceSaveSource = "test.deferred") {
+            scheduleSave(source: source)
+        }
+
+        func test_flushWorkspaceSave(source: WorkspaceSaveSource = "test.flush") async -> WorkspaceSaveCompletion {
+            guard let activeWorkspaceID else { return .skippedIneligible }
+            return await requestWorkspaceSave(
+                workspaceID: activeWorkspaceID,
+                requestedVersion: stateVersionByWorkspaceID[activeWorkspaceID, default: 0],
+                source: source,
+                urgency: .flushBeforeBoundary
+            )
+        }
+
+        func test_workspaceSavePreparationCount(workspaceID: UUID) -> Int {
+            workspaceSavePreparationCountByWorkspaceID[workspaceID, default: 0]
+        }
+
+        func test_lastSavedVersion(workspaceID: UUID) -> Int? {
+            lastSavedVersionByWorkspaceID[workspaceID]
+        }
+
+        func test_workspaceSavePerformanceSummary(workspaceID: UUID) -> WorkspaceSavePerformanceSummary? {
+            latestWorkspaceSavePerformanceSummaryByWorkspaceID[workspaceID]
+        }
+
+        func test_setWorkspaceSavePreparationGate(_ gate: (@Sendable (UUID, Int) async -> Void)?) {
+            workspaceSavePreparationGate = gate
+        }
+    #endif
 
     #if DEBUG
         var test_isPollTimerActive: Bool {
@@ -4772,12 +4842,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let snapshot {
             composeTabSnapshotSubject.send(snapshot)
         }
-        await saveWorkspaceAsync(source: source) // see change below to avoid big reassign
-        if let savedWorkspace = workspace(withID: wsID) {
-            await WorkspaceDiskWriter.shared.flush(url: workspaceFileURL(for: savedWorkspace))
-        }
-
-        lastSavedVersionByWorkspaceID[wsID] = cur
+        _ = await requestWorkspaceSave(
+            workspaceID: wsID,
+            requestedVersion: stateVersionByWorkspaceID[wsID, default: cur],
+            source: source,
+            urgency: .flushBeforeBoundary
+        )
     }
 
     func restoreWorkspaceState(
@@ -6699,6 +6769,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Shared actor for serialized workspace disk writes across all windows
     actor WorkspaceDiskWriter {
+        enum WriteOutcome: Equatable, Sendable {
+            case committed
+            case superseded
+            case failed
+            case idle
+        }
+
         // MARK: internal model
 
         private struct Pending {
@@ -6723,11 +6800,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         private var pendingByURL: [URL: Pending] = [:]
-        private var waitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
+        private var waitersByURL: [URL: [CheckedContinuation<WriteOutcome, Never>]] = [:]
         private var latestSelectionByWorkspaceTab: [WorkspaceTabSelectionKey: LatestSelectionRecord] = [:]
         private var lastWrittenSelectionRevisionByWorkspaceTab: [WorkspaceTabSelectionKey: UInt64] = [:]
         #if DEBUG
             private var atomicWriteGateForTesting: (@Sendable () async -> Void)?
+            private var failAtomicWriteForTesting = false
+            private var atomicWriteAttemptCountByURLForTesting: [URL: Int] = [:]
+            private var failAtomicWriteAttemptForTesting: (url: URL, attempt: Int)?
         #endif
 
         // MARK: public API
@@ -6781,9 +6861,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             runNext(for: url)
         }
 
-        func enqueueAndWait(data: Data, url: URL) async {
+        func enqueueAndWait(data: Data, url: URL) async -> WriteOutcome {
             enqueue(data: data, url: url)
-            await flush(url: url)
+            return await flush(url: url)
+        }
+
+        func enqueueWorkspaceAndWait(
+            data: Data,
+            url: URL,
+            metadata: WorkspaceSavePayloadMetadata
+        ) async -> WriteOutcome {
+            enqueue(data: data, url: url, metadata: metadata)
+            return await flush(url: url)
         }
 
         func writeNormalizationIfUnchanged(
@@ -6819,15 +6908,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
-        func flush(url: URL) async {
-            if pendingByURL[url] == nil { return }
+        func flush(url: URL) async -> WriteOutcome {
+            if pendingByURL[url] == nil {
+                return .idle
+            }
             let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
             let flushState = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.flushWait)
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.WorkspaceDurability.flushBegan,
                 correlation: lifecycleCorrelation
             )
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let outcome = await withCheckedContinuation { (cont: CheckedContinuation<WriteOutcome, Never>) in
                 waitersByURL[url, default: []].append(cont)
             }
             EditFlowPerf.lifecycleEvent(
@@ -6835,11 +6926,25 @@ class WorkspaceManagerViewModel: ObservableObject {
                 correlation: lifecycleCorrelation
             )
             EditFlowPerf.end(EditFlowPerf.Stage.WorkspaceDurability.flushWait, flushState)
+            return outcome
         }
 
         #if DEBUG
             func setAtomicWriteGateForTesting(_ gate: (@Sendable () async -> Void)?) {
                 atomicWriteGateForTesting = gate
+            }
+
+            func setFailAtomicWriteForTesting(_ fail: Bool) {
+                failAtomicWriteForTesting = fail
+            }
+
+            func setFailAtomicWriteForTesting(
+                url: URL,
+                afterAdditionalAttempts additionalAttempts: Int?
+            ) {
+                failAtomicWriteAttemptForTesting = additionalAttempts.map {
+                    (url, atomicWriteAttemptCountByURLForTesting[url, default: 0] + $0)
+                }
             }
 
             func removeAllForTesting() {
@@ -6850,10 +6955,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                 latestSelectionByWorkspaceTab.removeAll()
                 lastWrittenSelectionRevisionByWorkspaceTab.removeAll()
                 atomicWriteGateForTesting = nil
+                failAtomicWriteForTesting = false
+                atomicWriteAttemptCountByURLForTesting.removeAll()
+                failAtomicWriteAttemptForTesting = nil
                 let allWaiters = waitersByURL.values.flatMap(\.self)
                 waitersByURL.removeAll()
                 for waiter in allWaiters {
-                    waiter.resume()
+                    waiter.resume(returning: .failed)
                 }
             }
         #endif
@@ -6894,7 +7002,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                     "workspaceDiskWriter.skipStaleCoalescedPayload",
                     fields: [
                         "workspaceID": WorkspaceRestorePerfLog.shortID(incomingWorkspace.id),
-                        "workspaceName": incomingWorkspace.name,
                         "url": url.lastPathComponent
                     ]
                 )
@@ -6949,7 +7056,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                                 extra: [
                                     "latestSelectionRevision": "\(latestRevision)",
                                     "lastWrittenSelectionRevision": "\(lastWrittenRevision)",
-                                    "latestPayloadID": latestMetadata.payloadID.uuidString
+                                    "latestPayloadID": WorkspaceRestorePerfLog.shortID(latestMetadata.payloadID)
                                 ]
                             )
                             return EffectiveWritePayload(data: encoded, metadata: latestMetadata, selectionKey: key, effectiveSelectionRevision: latestRevision, shouldWrite: true)
@@ -6975,7 +7082,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                         extra: [
                             "incomingSelectionRevision": "\(incomingRevision)",
                             "latestSelectionRevision": "\(latestRevision)",
-                            "latestPayloadID": latestMetadata.payloadID.uuidString
+                            "latestPayloadID": WorkspaceRestorePerfLog.shortID(latestMetadata.payloadID)
                         ]
                     )
                     return EffectiveWritePayload(data: encoded, metadata: latestMetadata, selectionKey: key, effectiveSelectionRevision: latestRevision, shouldWrite: true)
@@ -7012,6 +7119,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             let lastWrittenRevision = metadata?.selectionKey.map { lastWrittenSelectionRevisionByWorkspaceTab[$0, default: 0] } ?? 0
             #if DEBUG
                 let atomicWriteGateForTesting = atomicWriteGateForTesting
+                atomicWriteAttemptCountByURLForTesting[url, default: 0] += 1
+                let atomicWriteAttempt = atomicWriteAttemptCountByURLForTesting[url, default: 0]
+                let failAtomicWriteForTesting = failAtomicWriteForTesting ||
+                    (failAtomicWriteAttemptForTesting?.url == url &&
+                        failAtomicWriteAttemptForTesting?.attempt == atomicWriteAttempt)
             #endif
 
             let task = Task.detached(priority: .utility) { [weak self] in
@@ -7028,6 +7140,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                     if effective.shouldWrite {
                         #if DEBUG
                             await atomicWriteGateForTesting?()
+                            if failAtomicWriteForTesting {
+                                throw CocoaError(.fileWriteUnknown)
+                            }
                         #endif
                         let writeState = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.atomicWrite)
                         EditFlowPerf.lifecycleEvent(
@@ -7055,7 +7170,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                     print("💾 Write failed \(url.lastPathComponent): \(error)")
                 }
                 WorkspaceSaveTracer.event("workspaceSave.write.finish", metadata: effective.metadata, url: url, extra: ["writeSucceeded": "\(writeSucceeded)"])
-                await self?.writerFinished(for: url, effective: effective, writeSucceeded: writeSucceeded)
+                let outcome: WriteOutcome = if effective.shouldWrite {
+                    writeSucceeded ? .committed : .failed
+                } else {
+                    .superseded
+                }
+                await self?.writerFinished(for: url, effective: effective, writeSucceeded: writeSucceeded, outcome: outcome)
             }
             if var current = pendingByURL[url] {
                 current.task = task
@@ -7063,7 +7183,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
-        private func writerFinished(for url: URL, effective: EffectiveWritePayload, writeSucceeded: Bool) {
+        private func writerFinished(
+            for url: URL,
+            effective: EffectiveWritePayload,
+            writeSucceeded: Bool,
+            outcome: WriteOutcome
+        ) {
             if writeSucceeded,
                let key = effective.selectionKey,
                effective.effectiveSelectionRevision > 0
@@ -7078,7 +7203,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 pendingByURL.removeValue(forKey: url)
                 if let waiters = waitersByURL.removeValue(forKey: url) {
                     for w in waiters {
-                        w.resume()
+                        w.resume(returning: outcome)
                     }
                 }
             } else {
@@ -7091,24 +7216,210 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - Save/Load Single Workspace
 
+    private func requestWorkspaceSave(
+        workspaceID: UUID,
+        requestedVersion: Int,
+        source: WorkspaceSaveSource,
+        urgency: WorkspaceSaveUrgency
+    ) async -> WorkspaceSaveCompletion {
+        await withCheckedContinuation { continuation in
+            let now = Date()
+            let sequence = nextWorkspaceSaveRequestSequence
+            nextWorkspaceSaveRequestSequence &+= 1
+            var state = workspaceSaveStateByWorkspaceID[workspaceID] ?? WorkspaceSaveCoordinatorState()
+            var debounceWaiterToResume: CheckedContinuation<Void, Never>?
+            if state.pendingLatest != nil || state.worker != nil {
+                state.coalescedRequestCount += 1
+            }
+            let existing = state.pendingLatest
+            if urgency == .flushBeforeBoundary {
+                state.requiresBoundaryFlush = true
+                debounceWaiterToResume = state.debounceWaiter
+                state.debounceWaiter = nil
+                state.debounceGeneration &+= 1
+            }
+            let effectiveUrgency: WorkspaceSaveUrgency = if state.requiresBoundaryFlush || existing?.urgency == .flushBeforeBoundary {
+                .flushBeforeBoundary
+            } else {
+                .deferred
+            }
+            if existing == nil || requestedVersion >= existing?.requestedVersion ?? Int.min {
+                state.pendingLatest = WorkspaceSaveRequest(
+                    workspaceID: workspaceID,
+                    requestedVersion: requestedVersion,
+                    source: source,
+                    urgency: effectiveUrgency,
+                    requestedAt: now,
+                    sequence: sequence
+                )
+            } else if effectiveUrgency == .flushBeforeBoundary, let existing {
+                state.pendingLatest = WorkspaceSaveRequest(
+                    workspaceID: existing.workspaceID,
+                    requestedVersion: existing.requestedVersion,
+                    source: existing.source,
+                    urgency: .flushBeforeBoundary,
+                    requestedAt: now,
+                    sequence: sequence
+                )
+            }
+            if state.firstDeferredRequestAt == nil, effectiveUrgency == .deferred {
+                state.firstDeferredRequestAt = now
+            }
+            state.waiters.append(continuation)
+            if state.worker == nil {
+                state.worker = Task { @MainActor [weak self] in
+                    await self?.runWorkspaceSaveLoop(workspaceID: workspaceID)
+                }
+            }
+            workspaceSaveStateByWorkspaceID[workspaceID] = state
+            debounceWaiterToResume?.resume()
+        }
+    }
+
+    private func resumeWorkspaceSaveDebounce(workspaceID: UUID, generation: UInt64) {
+        guard var state = workspaceSaveStateByWorkspaceID[workspaceID],
+              state.debounceGeneration == generation,
+              let waiter = state.debounceWaiter
+        else { return }
+        state.debounceWaiter = nil
+        workspaceSaveStateByWorkspaceID[workspaceID] = state
+        waiter.resume()
+    }
+
+    private func runWorkspaceSaveLoop(workspaceID: UUID) async {
+        var finalOutcome: WorkspaceSaveCompletion = .cancelled
+        while !Task.isCancelled {
+            guard var state = workspaceSaveStateByWorkspaceID[workspaceID],
+                  let request = state.pendingLatest
+            else { break }
+
+            if request.urgency == .deferred, let firstRequestAt = state.firstDeferredRequestAt {
+                let now = Date()
+                let quietRemaining = Self.workspaceSaveQuietDelay - now.timeIntervalSince(request.requestedAt)
+                let maximumRemaining = Self.workspaceSaveMaximumDelay - now.timeIntervalSince(firstRequestAt)
+                let delay = min(quietRemaining, maximumRemaining)
+                if delay > 0 {
+                    let generation = state.debounceGeneration &+ 1
+                    await withCheckedContinuation { continuation in
+                        state.debounceGeneration = generation
+                        state.debounceWaiter = continuation
+                        workspaceSaveStateByWorkspaceID[workspaceID] = state
+                        Task { @MainActor [weak self] in
+                            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                            self?.resumeWorkspaceSaveDebounce(
+                                workspaceID: workspaceID,
+                                generation: generation
+                            )
+                        }
+                    }
+                    continue
+                }
+            }
+
+            state.pendingLatest = nil
+            state.firstDeferredRequestAt = nil
+            workspaceSaveStateByWorkspaceID[workspaceID] = state
+            finalOutcome = await performWorkspaceSavePreparation(request)
+
+            guard var latestState = workspaceSaveStateByWorkspaceID[workspaceID] else { break }
+            switch finalOutcome {
+            case let .committed(version):
+                if let pending = latestState.pendingLatest,
+                   pending.requestedVersion < version ||
+                   (pending.requestedVersion == version && pending.sequence <= request.sequence)
+                {
+                    latestState.pendingLatest = nil
+                    latestState.firstDeferredRequestAt = nil
+                }
+                if latestState.pendingLatest == nil {
+                    lastSavedVersionByWorkspaceID[workspaceID] = max(
+                        lastSavedVersionByWorkspaceID[workspaceID, default: -1],
+                        version
+                    )
+                }
+            case let .superseded(version):
+                let latestVersion = stateVersionByWorkspaceID[workspaceID, default: request.requestedVersion]
+                if latestVersion > request.requestedVersion {
+                    latestState.staleVersionRetryCount += 1
+                }
+                if latestVersion > request.requestedVersion,
+                   latestState.pendingLatest?.requestedVersion ?? Int.min < latestVersion
+                {
+                    latestState.pendingLatest = WorkspaceSaveRequest(
+                        workspaceID: workspaceID,
+                        requestedVersion: latestVersion,
+                        source: request.source,
+                        urgency: latestState.requiresBoundaryFlush ? .flushBeforeBoundary : request.urgency,
+                        requestedAt: Date(),
+                        sequence: nextWorkspaceSaveRequestSequence
+                    )
+                    nextWorkspaceSaveRequestSequence &+= 1
+                } else if latestVersion == request.requestedVersion,
+                          latestState.pendingLatest == nil
+                {
+                    lastSavedVersionByWorkspaceID[workspaceID] = max(
+                        lastSavedVersionByWorkspaceID[workspaceID, default: -1],
+                        version
+                    )
+                }
+            case .skippedIneligible, .failed, .cancelled:
+                break
+            }
+            workspaceSaveStateByWorkspaceID[workspaceID] = latestState
+            if latestState.pendingLatest != nil {
+                continue
+            }
+            break
+        }
+
+        guard var state = workspaceSaveStateByWorkspaceID[workspaceID] else { return }
+        state.worker = nil
+        let waiters = state.waiters
+        state.waiters.removeAll()
+        state.coalescedRequestCount = 0
+        state.staleVersionRetryCount = 0
+        state.requiresBoundaryFlush = false
+        state.debounceWaiter = nil
+        workspaceSaveStateByWorkspaceID[workspaceID] = state
+        for waiter in waiters {
+            waiter.resume(returning: finalOutcome)
+        }
+    }
+
     private func saveWorkspaceAsync(source: WorkspaceSaveSource = .saveWorkspaceAsync) async {
-        guard let active = activeWorkspace,
-              let idx = workspaces.firstIndex(where: { $0.id == active.id })
-        else {
+        guard let active = activeWorkspace else {
             print("No active workspace to save.")
             return
         }
+        _ = await requestWorkspaceSave(
+            workspaceID: active.id,
+            requestedVersion: stateVersionByWorkspaceID[active.id, default: 0],
+            source: source,
+            urgency: .flushBeforeBoundary
+        )
+    }
+
+    private func performWorkspaceSavePreparation(_ request: WorkspaceSaveRequest) async -> WorkspaceSaveCompletion {
+        guard let idx = workspaces.firstIndex(where: { $0.id == request.workspaceID })
+        else {
+            return .skippedIneligible
+        }
 
         let current = workspaces[idx]
-        let capturedStateVersion = stateVersionByWorkspaceID[current.id, default: 0]
+        let capturedStateVersion = request.requestedVersion
         let baseRoot = currentBaseRoot
         let customStoragePath = current.customStoragePath
         let workspaceDirName = directoryName(for: current)
         let lastSyncedRepoPaths = lastSyncedRepoPathsByWorkspaceID[current.id]
-        await WorkspaceDiskWriter.shared.flush(url: workspaceFileURL(for: current))
+        _ = await WorkspaceDiskWriter.shared.flush(url: workspaceFileURL(for: current))
+        let preparationStartedAt = Date()
+        #if DEBUG
+            workspaceSavePreparationCountByWorkspaceID[current.id, default: 0] += 1
+            await workspaceSavePreparationGate?(current.id, capturedStateVersion)
+        #endif
 
         do {
-            let (merged, data, indexFieldsChanged, preservedDiskRepoPaths, url) = try await Task.detached(priority: .utility) {
+            let (merged, data, indexFieldsChanged, preservedDiskRepoPaths, url, diskDecodeDurationMS, encodeDurationMS) = try await Task.detached(priority: .utility) {
                 let workspaceDir: URL = if let customStoragePath {
                     customStoragePath
                 } else {
@@ -7134,11 +7445,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
 
                 let url = workspaceDir.appendingPathComponent("workspace.json")
+                let diskDecodeStartedAt = Date()
                 let diskWorkspace: WorkspaceModel? = if fm.fileExists(atPath: url.path) {
                     try? Self.loadWorkspaceFromFile(at: url)
                 } else {
                     nil
                 }
+                let diskDecodeDurationMS = Date().timeIntervalSince(diskDecodeStartedAt) * 1000
 
                 let mergeResult = Self.workspaceForSavePreservingDiskRepoPaths(
                     current: current,
@@ -7146,14 +7459,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                     lastSyncedRepoPaths: lastSyncedRepoPaths
                 )
                 let merged = mergeResult.workspace
+                let encodeStartedAt = Date()
                 let data = try JSONEncoder().encode(merged)
+                let encodeDurationMS = Date().timeIntervalSince(encodeStartedAt) * 1000
                 let indexFieldsChanged =
                     (merged.name != current.name) ||
                     (merged.customStoragePath != current.customStoragePath) ||
                     (merged.isSystemWorkspace != current.isSystemWorkspace) ||
                     (merged.isHiddenInMenus != current.isHiddenInMenus)
 
-                return (merged, data, indexFieldsChanged, mergeResult.preservedDiskRepoPaths, url)
+                return (merged, data, indexFieldsChanged, mergeResult.preservedDiskRepoPaths, url, diskDecodeDurationMS, encodeDurationMS)
             }.value
 
             let latestStateVersion = stateVersionByWorkspaceID[current.id, default: 0]
@@ -7168,8 +7483,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                         ]
                     )
                 #endif
-                await saveWorkspaceAsync(source: source)
-                return
+                return .superseded(version: latestStateVersion)
             }
 
             // IMPORTANT: Do NOT assign `workspaces[idx] = merged` here.
@@ -7186,24 +7500,67 @@ class WorkspaceManagerViewModel: ObservableObject {
             if preservedDiskRepoPaths {
                 workspaces[idx].repoPaths = merged.repoPaths
             }
-            recordRepoPathBaseline(for: merged)
-
-            let metadata = workspaceSaveMetadata(for: merged, source: source)
+            let metadata = workspaceSaveMetadata(for: merged, source: request.source)
             WorkspaceFileDecodeCache.shared.invalidate(url: url)
-            await WorkspaceDiskWriter.shared.enqueueWorkspace(data: data, url: url, metadata: metadata)
+            let writeOutcome = await WorkspaceDiskWriter.shared.enqueueWorkspaceAndWait(
+                data: data,
+                url: url,
+                metadata: metadata
+            )
 
-            if indexFieldsChanged {
-                await rebuildAndSaveIndexAsync()
+            if writeOutcome == .committed {
+                recordRepoPathBaseline(for: merged)
+                if indexFieldsChanged {
+                    await rebuildAndSaveIndexAsync()
+                }
+            }
+            let selection = metadata.selectionSummary
+            let coordinatorState = workspaceSaveStateByWorkspaceID[current.id]
+            let summary = WorkspaceSavePerformanceSummary(
+                source: request.source,
+                payloadByteCount: data.count,
+                composeTabCount: merged.composeTabs.count,
+                selectedPathCount: selection.selectedPaths,
+                sliceFileCount: selection.sliceFiles,
+                sliceRangeCount: selection.sliceRanges,
+                preparationDurationMS: Date().timeIntervalSince(preparationStartedAt) * 1000,
+                diskDecodeDurationMS: diskDecodeDurationMS,
+                encodeDurationMS: encodeDurationMS,
+                staleVersionRetryCount: coordinatorState?.staleVersionRetryCount ?? 0,
+                coalescedRequestCount: coordinatorState?.coalescedRequestCount ?? 0,
+                atomicWriteCount: writeOutcome == .committed ? 1 : 0
+            )
+            #if DEBUG
+                latestWorkspaceSavePerformanceSummaryByWorkspaceID[current.id] = summary
+                WorkspaceRestorePerfLog.event("workspaceSave.performance", fields: summary.traceFields)
+            #endif
+            switch writeOutcome {
+            case .committed:
+                return .committed(version: capturedStateVersion)
+            case .superseded:
+                return .superseded(version: capturedStateVersion)
+            case .failed:
+                return .failed
+            case .idle:
+                return .failed
             }
         } catch {
             print("💾 Failed to serialize workspace: \(error)")
+            return error is CancellationError ? .cancelled : .failed
         }
     }
 
     private func scheduleSave(source: WorkspaceSaveSource) {
-        // Use async version
-        Task {
-            await saveWorkspaceAsync(source: source)
+        guard let active = activeWorkspace else { return }
+        let workspaceID = active.id
+        let requestedVersion = stateVersionByWorkspaceID[workspaceID, default: 0]
+        Task { @MainActor [weak self] in
+            _ = await self?.requestWorkspaceSave(
+                workspaceID: workspaceID,
+                requestedVersion: requestedVersion,
+                source: source,
+                urgency: .deferred
+            )
         }
     }
 
