@@ -1729,6 +1729,11 @@ final actor ClaudeNativeProcessSessionController {
             isRawEventFileLoggingEnabled()
         }
 
+        /// Test seam for `system/api_retry` → `task_progress` mapping.
+        static func test_parseAPIRetryProgressResult(from payload: [String: Any]) -> AIStreamResult? {
+            parseAPIRetryProgressResult(from: payload)
+        }
+
         func test_determineTurnStatus(payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
             determineTurnStatus(from: payload, stopReasonHint: stopReasonHint)
         }

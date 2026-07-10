@@ -247,4 +247,55 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             requestPayload: ["input": ["command": "rm -rf /tmp/example"]]
         ))
     }
+
+    func testSystemAPIRetryPayloadMapsToTaskProgressWithAttemptAndDelay() {
+        let progress = ClaudeNativeProcessSessionController.test_parseAPIRetryProgressResult(from: [
+            "type": "system",
+            "subtype": "api_retry",
+            "attempt": 2,
+            "max_retries": 5,
+            "error_status": "429",
+            "error": "rate_limit",
+            "retry_delay_ms": 1500
+        ])
+
+        XCTAssertEqual(progress?.type, "task_progress")
+        let text = try XCTUnwrap(progress?.text)
+        XCTAssertTrue(text.contains("Provider API retry 2/5"), text)
+        XCTAssertTrue(text.contains("429"), text)
+        XCTAssertTrue(text.contains("rate_limit"), text)
+        XCTAssertTrue(text.contains("Retrying in 2s"), text)
+    }
+
+    func testNonAPIRetrySystemPayloadDoesNotMapToTaskProgress() {
+        XCTAssertNil(
+            ClaudeNativeProcessSessionController.test_parseAPIRetryProgressResult(from: [
+                "type": "system",
+                "subtype": "init"
+            ])
+        )
+        XCTAssertNil(
+            ClaudeNativeProcessSessionController.test_parseAPIRetryProgressResult(from: [
+                "type": "assistant",
+                "subtype": "api_retry"
+            ])
+        )
+    }
+
+    func testAgentModeConfigClampsSDKConnectTimeoutSeconds() {
+        let short = ClaudeCodeAgentConfig.agentMode(
+            commandName: "/usr/bin/false",
+            sdkConnectTimeoutSeconds: 0.25
+        )
+        XCTAssertEqual(short.sdkConnectTimeoutSeconds, 1)
+
+        let custom = ClaudeCodeAgentConfig.agentMode(
+            commandName: "/usr/bin/false",
+            sdkConnectTimeoutSeconds: 42
+        )
+        XCTAssertEqual(custom.sdkConnectTimeoutSeconds, 42)
+
+        let discovery = ClaudeCodeAgentConfig.discovery(commandName: "/usr/bin/false")
+        XCTAssertEqual(discovery.sdkConnectTimeoutSeconds, 10)
+    }
 }

@@ -105,8 +105,12 @@ on run argv
     end tell
 
     -- If the app survived the popover open, async load, and option click path, the smoke passes.
+    -- Also require the front window still exists so a silent crash-to-dock does not pass.
     tell application "System Events"
         if not (exists process appProcessName) then error appProcessName & " process exited during execution-location UI smoke"
+        tell process appProcessName
+            if not (exists window 1) then error appProcessName & " lost its front window during execution-location UI smoke"
+        end tell
     end tell
 end run
 APPLESCRIPT
