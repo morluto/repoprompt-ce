@@ -628,6 +628,11 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var demandManifestAdoptionWaits: UInt64 = 0
     var manifestWrites: UInt64 = 0
     var manifestFailures: UInt64 = 0
+    var manifestWriteBatches: UInt64 = 0
+    var manifestWriteItems: UInt64 = 0
+    var manifestWriteBatchBytes: UInt64 = 0
+    var manifestWriteCoalescedItems: UInt64 = 0
+    var manifestWriterPeakQueuedItems: UInt64 = 0
     var materializations: UInt64 = 0
     var materializedBytes: UInt64 = 0
     var validatedWorktreeReads: UInt64 = 0
@@ -696,6 +701,11 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         demandManifestAdoptionWaits = initialValue
         manifestWrites = initialValue
         manifestFailures = initialValue
+        manifestWriteBatches = initialValue
+        manifestWriteItems = initialValue
+        manifestWriteBatchBytes = initialValue
+        manifestWriteCoalescedItems = initialValue
+        manifestWriterPeakQueuedItems = initialValue
         materializations = initialValue
         materializedBytes = initialValue
         validatedWorktreeReads = initialValue

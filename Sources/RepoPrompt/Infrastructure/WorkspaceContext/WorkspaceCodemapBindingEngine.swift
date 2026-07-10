@@ -5,6 +5,8 @@ import Foundation
 /// One injected instance can own bounded sessions for many roots. It deliberately owns no source
 /// catalog and no artifact cache: those remain with the caller and the process-wide artifact runtime.
 actor WorkspaceCodemapBindingEngine {
+    private static let maximumManifestWriterBatchItemCount = 64
+
     private final class DemandCancellationState: @unchecked Sendable {
         private let lock = NSLock()
         private var storage = false
@@ -169,7 +171,7 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private enum ManifestMutationProof {
+    private enum ManifestMutationProof: Equatable {
         case session(invalidationGeneration: UInt64)
         case projection(jobID: UUID, generation: WorkspaceCodemapProjectionGeneration)
     }
@@ -196,6 +198,18 @@ actor WorkspaceCodemapBindingEngine {
         let byteCount: UInt64
     }
 
+    private struct ManifestMutationBatch {
+        let id: UUID
+        let workKey: ManifestWriterWorkKey
+        let proof: ManifestMutationProof
+        let workItemIDs: Set<UUID>
+        let lowestRevision: UInt64
+        let highestRevision: UInt64
+        let changesByPath: [String: PendingManifestChange]
+        let byteCount: UInt64
+        let absorbedWorkItemCount: Int
+    }
+
     private struct ManifestWriteWaiter {
         let id: UUID
         let workKey: ManifestWriterWorkKey
@@ -203,13 +217,68 @@ actor WorkspaceCodemapBindingEngine {
         let continuation: CheckedContinuation<Bool, Never>
     }
 
+    private struct ManifestWorkQueue {
+        private(set) var storage: [ManifestMutationWorkItem] = []
+        private(set) var head = 0
+
+        var count: Int {
+            storage.count - head
+        }
+
+        var isEmpty: Bool {
+            head == storage.count
+        }
+
+        var first: ManifestMutationWorkItem? {
+            guard head < storage.count else { return nil }
+            return storage[head]
+        }
+
+        mutating func append(_ item: ManifestMutationWorkItem) {
+            storage.append(item)
+        }
+
+        mutating func popFirst() -> ManifestMutationWorkItem? {
+            guard head < storage.count else { return nil }
+            let item = storage[head]
+            head += 1
+            compactIfNeeded()
+            return item
+        }
+
+        func contains(where predicate: (ManifestMutationWorkItem) -> Bool) -> Bool {
+            storage[head...].contains(where: predicate)
+        }
+
+        mutating func removeAll(where shouldRemove: (ManifestMutationWorkItem) -> Bool) {
+            storage = storage[head...].filter { !shouldRemove($0) }
+            head = 0
+        }
+
+        private mutating func compactIfNeeded() {
+            guard head >= 64, head * 2 >= storage.count else { return }
+            storage.removeFirst(head)
+            head = 0
+        }
+    }
+
     private struct ManifestWriterState {
         var writerID: UUID?
         var task: Task<Void, Never>?
-        var queuedWork: [ManifestMutationWorkItem] = []
-        var inFlightWork: ManifestMutationWorkItem?
+        var sessionQueue = ManifestWorkQueue()
+        var projectionQueue = ManifestWorkQueue()
+        var inFlightBatch: ManifestMutationBatch?
         var inFlightRevision: UInt64?
-        var waiters: [ManifestWriteWaiter] = []
+        var waitersByWorkKey: [ManifestWriterWorkKey: [ManifestWriteWaiter]] = [:]
+        var waiterWorkKeyByID: [UUID: ManifestWriterWorkKey] = [:]
+
+        var queuedWorkCount: Int {
+            sessionQueue.count + projectionQueue.count
+        }
+
+        var isQueueEmpty: Bool {
+            sessionQueue.isEmpty && projectionQueue.isEmpty
+        }
     }
 
     private struct ProjectionAdmissionWaiter {
@@ -1825,6 +1894,11 @@ actor WorkspaceCodemapBindingEngine {
                     "builds": current.counters.builds,
                     "materializations": current.counters.materializations,
                     "manifest_writes": current.counters.manifestWrites,
+                    "manifest_write_batches": current.counters.manifestWriteBatches,
+                    "manifest_write_items": current.counters.manifestWriteItems,
+                    "manifest_write_batch_bytes": current.counters.manifestWriteBatchBytes,
+                    "manifest_write_coalesced_items": current.counters.manifestWriteCoalescedItems,
+                    "manifest_writer_peak_queued_items": current.counters.manifestWriterPeakQueuedItems,
                     "failures": current.counters.failures,
                     "manifest_failures": current.counters.manifestFailures,
                     "busy_rejections": current.counters.busyRejections,
@@ -6469,14 +6543,14 @@ actor WorkspaceCodemapBindingEngine {
         var state = manifestWriters[namespace] ?? ManifestWriterState()
         switch item.proof {
         case .session:
-            let insertionIndex = state.queuedWork.firstIndex {
-                if case .projection = $0.proof { return true }
-                return false
-            } ?? state.queuedWork.endIndex
-            state.queuedWork.insert(item, at: insertionIndex)
+            state.sessionQueue.append(item)
         case .projection:
-            state.queuedWork.append(item)
+            state.projectionQueue.append(item)
         }
+        counters.manifestWriterPeakQueuedItems = max(
+            counters.manifestWriterPeakQueuedItems,
+            UInt64(state.queuedWorkCount)
+        )
         guard state.writerID == nil else {
             manifestWriters[namespace] = state
             return
@@ -6493,20 +6567,91 @@ actor WorkspaceCodemapBindingEngine {
         manifestWriters[namespace] = current
     }
 
+    private func dequeueManifestBatch(from writer: inout ManifestWriterState) -> ManifestMutationBatch? {
+        enum QueueKind {
+            case session
+            case projection
+        }
+
+        let queueKind: QueueKind
+        let first: ManifestMutationWorkItem
+        if let session = writer.sessionQueue.popFirst() {
+            queueKind = .session
+            first = session
+        } else if let projection = writer.projectionQueue.popFirst() {
+            queueKind = .projection
+            first = projection
+        } else {
+            return nil
+        }
+
+        let maximumByteCount = policy.maximumQueuedProjectionManifestMutationByteCountPerRoot
+        var items = [first]
+        var byteCount = first.byteCount
+        while items.count < Self.maximumManifestWriterBatchItemCount {
+            let next = switch queueKind {
+            case .session:
+                writer.sessionQueue.first
+            case .projection:
+                writer.projectionQueue.first
+            }
+            guard let previousRevision = items.last?.revision,
+                  previousRevision < .max,
+                  let next,
+                  next.revision == previousRevision + 1,
+                  next.workKey == first.workKey,
+                  next.proof == first.proof,
+                  addingSaturating(byteCount, next.byteCount) <= maximumByteCount
+            else { break }
+            let absorbed = switch queueKind {
+            case .session:
+                writer.sessionQueue.popFirst()
+            case .projection:
+                writer.projectionQueue.popFirst()
+            }
+            guard let absorbed else { break }
+            items.append(absorbed)
+            byteCount = addingSaturating(byteCount, absorbed.byteCount)
+        }
+
+        var changesByPath: [String: PendingManifestChange] = [:]
+        for item in items {
+            for mutation in item.mutations {
+                changesByPath[mutation.repositoryRelativePath] = PendingManifestChange(
+                    revision: item.revision,
+                    workItemID: item.id,
+                    record: mutation.record
+                )
+            }
+        }
+        return ManifestMutationBatch(
+            id: UUID(),
+            workKey: first.workKey,
+            proof: first.proof,
+            workItemIDs: Set(items.map(\.id)),
+            lowestRevision: items.map(\.revision).min() ?? first.revision,
+            highestRevision: items.map(\.revision).max() ?? first.revision,
+            changesByPath: changesByPath,
+            byteCount: byteCount,
+            absorbedWorkItemCount: items.count
+        )
+    }
+
     private func runManifestWriter(
         namespace: CodeMapRootManifestNamespace,
         writerID: UUID
     ) async {
         while !Task.isCancelled {
-            let item: ManifestMutationWorkItem
+            let batch: ManifestMutationBatch
             do {
                 guard var writer = manifestWriters[namespace], writer.writerID == writerID else { return }
-                guard !writer.queuedWork.isEmpty else {
-                    let orphaned = writer.waiters
-                    writer.waiters.removeAll()
+                guard let nextBatch = dequeueManifestBatch(from: &writer) else {
+                    let orphaned = Array(writer.waitersByWorkKey.values.joined())
+                    writer.waitersByWorkKey.removeAll()
+                    writer.waiterWorkKeyByID.removeAll()
                     writer.writerID = nil
                     writer.task = nil
-                    writer.inFlightWork = nil
+                    writer.inFlightBatch = nil
                     writer.inFlightRevision = nil
                     storeManifestWriterState(writer, namespace: namespace)
                     for waiter in orphaned {
@@ -6514,12 +6659,18 @@ actor WorkspaceCodemapBindingEngine {
                     }
                     return
                 }
-                item = writer.queuedWork.removeFirst()
-                writer.inFlightWork = item
-                writer.inFlightRevision = item.revision
+                batch = nextBatch
+                writer.inFlightBatch = batch
+                writer.inFlightRevision = batch.highestRevision
                 manifestWriters[namespace] = writer
+                incrementCounter(\.manifestWriteBatches)
+                addToCounter(\.manifestWriteItems, UInt64(batch.absorbedWorkItemCount))
+                addToCounter(\.manifestWriteBatchBytes, batch.byteCount)
+                if batch.absorbedWorkItemCount > 1 {
+                    addToCounter(\.manifestWriteCoalescedItems, UInt64(batch.absorbedWorkItemCount - 1))
+                }
             }
-            let workKey = item.workKey
+            let workKey = batch.workKey
             let scope = workKey.scope
             guard case let .eligible(initialSession)? = roots[scope.rootEpoch],
                   initialSession.id == workKey.sessionID,
@@ -6527,29 +6678,29 @@ actor WorkspaceCodemapBindingEngine {
                   initialPipeline.id == workKey.pipelineSessionID,
                   initialPipeline.namespace == namespace,
                   manifestMutationProofIsCurrent(
-                      item.proof,
+                      batch.proof,
                       rootEpoch: scope.rootEpoch,
                       session: initialSession,
                       pipeline: initialPipeline
                   )
             else {
-                discardManifestWorkItem(item, namespace: namespace, writerID: writerID)
+                discardManifestBatch(batch, namespace: namespace, writerID: writerID)
                 continue
             }
             var session = initialSession
             var pipeline = initialPipeline
-            if item.revision <= pipeline.persistedManifestRevision {
+            if batch.highestRevision <= pipeline.persistedManifestRevision {
                 guard var currentWriter = currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
-                    itemID: item.id
+                    batchID: batch.id
                 ) else { return }
-                currentWriter.inFlightWork = nil
+                currentWriter.inFlightBatch = nil
                 currentWriter.inFlightRevision = nil
                 let completed = detachManifestWaiters(
                     from: &currentWriter,
                     workKey: workKey,
-                    revision: item.revision
+                    revision: batch.highestRevision
                 )
                 storeManifestWriterState(currentWriter, namespace: namespace)
                 for waiter in completed {
@@ -6557,7 +6708,7 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 continue
             }
-            if case let .projection(_, generation) = item.proof {
+            if case let .projection(_, generation) = batch.proof {
                 let tokenDisposition = await catalogClient.revalidateProjectionCatalogToken(
                     scope.rootEpoch,
                     generation.catalogToken
@@ -6565,7 +6716,7 @@ actor WorkspaceCodemapBindingEngine {
                 guard currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
-                    itemID: item.id
+                    batchID: batch.id
                 ) != nil else { return }
                 guard tokenDisposition == .current,
                       case let .eligible(revalidated)? = roots[scope.rootEpoch],
@@ -6573,13 +6724,13 @@ actor WorkspaceCodemapBindingEngine {
                       let revalidatedPipeline = revalidated.pipelines[scope.pipelineIdentity],
                       revalidatedPipeline.id == pipeline.id,
                       manifestMutationProofIsCurrent(
-                          item.proof,
+                          batch.proof,
                           rootEpoch: scope.rootEpoch,
                           session: revalidated,
                           pipeline: revalidatedPipeline
                       )
                 else {
-                    discardManifestWorkItem(item, namespace: namespace, writerID: writerID)
+                    discardManifestBatch(batch, namespace: namespace, writerID: writerID)
                     continue
                 }
                 session = revalidated
@@ -6587,19 +6738,8 @@ actor WorkspaceCodemapBindingEngine {
             }
             let sessionID = session.id
             let pipelineSessionID = pipeline.id
-            let revision = item.revision
-            var changes: [String: PendingManifestChange] = Dictionary(
-                uniqueKeysWithValues: item.mutations.map { mutation in
-                    (
-                        mutation.repositoryRelativePath,
-                        PendingManifestChange(
-                            revision: item.revision,
-                            workItemID: item.id,
-                            record: mutation.record
-                        )
-                    )
-                }
-            )
+            let revision = batch.highestRevision
+            var changes = batch.changesByPath
             for (path, change) in pipeline.pendingManifestChanges where change.revision <= revision {
                 if (changes[path]?.revision ?? 0) <= change.revision {
                     changes[path] = change
@@ -6618,7 +6758,7 @@ actor WorkspaceCodemapBindingEngine {
                 guard currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
-                    itemID: item.id
+                    batchID: batch.id
                 ) != nil else { return }
                 guard let writerAuthority = claimedWriterAuthority else {
                     throw CodeMapRootManifestStoreError.staleWriterAuthority
@@ -6628,13 +6768,13 @@ actor WorkspaceCodemapBindingEngine {
                       let afterAuthorityPipeline = afterAuthority.pipelines[scope.pipelineIdentity],
                       afterAuthorityPipeline.id == pipelineSessionID,
                       manifestMutationProofIsCurrent(
-                          item.proof,
+                          batch.proof,
                           rootEpoch: scope.rootEpoch,
                           session: afterAuthority,
                           pipeline: afterAuthorityPipeline
                       )
                 else {
-                    discardManifestWorkItem(item, namespace: namespace, writerID: writerID)
+                    discardManifestBatch(batch, namespace: namespace, writerID: writerID)
                     continue
                 }
                 let result = try await mergeManifestChanges(
@@ -6648,15 +6788,15 @@ actor WorkspaceCodemapBindingEngine {
                 guard currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
-                    itemID: item.id
+                    batchID: batch.id
                 ) != nil else { return }
                 await hooks.afterManifestStoreWriteBeforeCompletion(scope.rootEpoch)
                 guard var currentWriter = currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
-                    itemID: item.id
+                    batchID: batch.id
                 ) else { return }
-                currentWriter.inFlightWork = nil
+                currentWriter.inFlightBatch = nil
                 currentWriter.inFlightRevision = nil
                 let completed = detachManifestWaiters(
                     from: &currentWriter,
@@ -6698,9 +6838,9 @@ actor WorkspaceCodemapBindingEngine {
                 guard var currentWriter = currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
-                    itemID: item.id
+                    batchID: batch.id
                 ) else { return }
-                currentWriter.inFlightWork = nil
+                currentWriter.inFlightBatch = nil
                 currentWriter.inFlightRevision = nil
                 let failed = detachManifestWaiters(
                     from: &currentWriter,
@@ -6726,22 +6866,20 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func discardManifestWorkItem(
-        _ item: ManifestMutationWorkItem,
+    private func discardManifestBatch(
+        _ batch: ManifestMutationBatch,
         namespace: CodeMapRootManifestNamespace,
         writerID: UUID
     ) {
         guard var writer = manifestWriters[namespace], writer.writerID == writerID else { return }
-        let workKey = item.workKey
-        let detached = writer.waiters.filter {
-            $0.workKey == workKey && $0.revision <= item.revision
-        }
-        writer.waiters.removeAll {
-            $0.workKey == workKey && $0.revision <= item.revision
-        }
-        writer.queuedWork.removeAll { $0.id == item.id }
-        if writer.inFlightWork?.id == item.id {
-            writer.inFlightWork = nil
+        let workKey = batch.workKey
+        let detached = detachManifestWaiters(
+            from: &writer,
+            workKey: workKey,
+            revision: batch.highestRevision
+        )
+        if writer.inFlightBatch?.id == batch.id {
+            writer.inFlightBatch = nil
             writer.inFlightRevision = nil
         }
         if case var .eligible(session)? = roots[workKey.scope.rootEpoch],
@@ -6749,7 +6887,9 @@ actor WorkspaceCodemapBindingEngine {
            var pipeline = session.pipelines[workKey.scope.pipelineIdentity],
            pipeline.id == workKey.pipelineSessionID
         {
-            for (path, change) in pipeline.pendingManifestChanges where change.workItemID == item.id {
+            for (path, change) in pipeline.pendingManifestChanges
+                where batch.workItemIDs.contains(change.workItemID)
+            {
                 pipeline.pendingManifestChanges.removeValue(forKey: path)
             }
             pipeline.manifestState = pipeline.pendingManifestChanges.isEmpty
@@ -6767,11 +6907,11 @@ actor WorkspaceCodemapBindingEngine {
     private func currentManifestWriterState(
         namespace: CodeMapRootManifestNamespace,
         writerID: UUID,
-        itemID: UUID
+        batchID: UUID
     ) -> ManifestWriterState? {
         guard let state = manifestWriters[namespace],
               state.writerID == writerID,
-              state.inFlightWork?.id == itemID
+              state.inFlightBatch?.id == batchID
         else { return nil }
         return state
     }
@@ -6781,11 +6921,25 @@ actor WorkspaceCodemapBindingEngine {
         workKey: ManifestWriterWorkKey,
         revision: UInt64
     ) -> [ManifestWriteWaiter] {
-        let detached = writer.waiters.filter {
-            $0.workKey == workKey && $0.revision <= revision
+        guard let waiters = writer.waitersByWorkKey[workKey] else { return [] }
+        var detached: [ManifestWriteWaiter] = []
+        var retained: [ManifestWriteWaiter] = []
+        detached.reserveCapacity(waiters.count)
+        retained.reserveCapacity(waiters.count)
+        for waiter in waiters {
+            if waiter.revision <= revision {
+                detached.append(waiter)
+            } else {
+                retained.append(waiter)
+            }
         }
-        writer.waiters.removeAll {
-            $0.workKey == workKey && $0.revision <= revision
+        if retained.isEmpty {
+            writer.waitersByWorkKey.removeValue(forKey: workKey)
+        } else {
+            writer.waitersByWorkKey[workKey] = retained
+        }
+        for waiter in detached {
+            writer.waiterWorkKeyByID.removeValue(forKey: waiter.id)
         }
         return detached
     }
@@ -6796,10 +6950,11 @@ actor WorkspaceCodemapBindingEngine {
     ) {
         if state.writerID == nil,
            state.task == nil,
-           state.queuedWork.isEmpty,
-           state.inFlightWork == nil,
+           state.isQueueEmpty,
+           state.inFlightBatch == nil,
            state.inFlightRevision == nil,
-           state.waiters.isEmpty
+           state.waitersByWorkKey.isEmpty,
+           state.waiterWorkKeyByID.isEmpty
         {
             manifestWriters.removeValue(forKey: namespace)
         } else {
@@ -7047,19 +7202,22 @@ actor WorkspaceCodemapBindingEngine {
                     return
                 }
                 var state = manifestWriters[namespace] ?? ManifestWriterState()
-                let hasRelevantWork = state.queuedWork.contains {
+                let hasRelevantWork = state.sessionQueue.contains {
                     $0.workKey == workKey && $0.revision >= revision
-                } || (state.inFlightWork?.workKey == workKey && (state.inFlightRevision ?? 0) >= revision)
+                } || state.projectionQueue.contains {
+                    $0.workKey == workKey && $0.revision >= revision
+                } || (state.inFlightBatch?.workKey == workKey && (state.inFlightRevision ?? 0) >= revision)
                 guard hasRelevantWork else {
                     continuation.resume(returning: false)
                     return
                 }
-                state.waiters.append(ManifestWriteWaiter(
+                state.waitersByWorkKey[workKey, default: []].append(ManifestWriteWaiter(
                     id: waiterID,
                     workKey: workKey,
                     revision: revision,
                     continuation: continuation
                 ))
+                state.waiterWorkKeyByID[waiterID] = workKey
                 manifestWriters[namespace] = state
             }
         } onCancel: {
@@ -7072,14 +7230,22 @@ actor WorkspaceCodemapBindingEngine {
         waiterID: UUID
     ) {
         guard var state = manifestWriters[namespace],
-              let index = state.waiters.firstIndex(where: { $0.id == waiterID })
+              let workKey = state.waiterWorkKeyByID[waiterID],
+              var waiters = state.waitersByWorkKey[workKey],
+              let index = waiters.firstIndex(where: { $0.id == waiterID })
         else {
             if pendingManifestWaiterInstalls.contains(waiterID) {
                 cancelledManifestWaiterInstalls.insert(waiterID)
             }
             return
         }
-        let waiter = state.waiters.remove(at: index)
+        state.waiterWorkKeyByID.removeValue(forKey: waiterID)
+        let waiter = waiters.remove(at: index)
+        if waiters.isEmpty {
+            state.waitersByWorkKey.removeValue(forKey: workKey)
+        } else {
+            state.waitersByWorkKey[workKey] = waiters
+        }
         storeManifestWriterState(state, namespace: namespace)
         waiter.continuation.resume(returning: false)
     }
@@ -7087,9 +7253,13 @@ actor WorkspaceCodemapBindingEngine {
     private func detachManifestWriters(rootEpoch: WorkspaceCodemapRootEpoch) {
         for namespace in Array(manifestWriters.keys) {
             guard var state = manifestWriters[namespace] else { continue }
-            state.queuedWork.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
-            let detached = state.waiters.filter { $0.workKey.scope.rootEpoch == rootEpoch }
-            state.waiters.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
+            state.sessionQueue.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
+            state.projectionQueue.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
+            let detachedKeys = state.waitersByWorkKey.keys.filter { $0.scope.rootEpoch == rootEpoch }
+            let detached = detachedKeys.flatMap { state.waitersByWorkKey.removeValue(forKey: $0) ?? [] }
+            for waiter in detached {
+                state.waiterWorkKeyByID.removeValue(forKey: waiter.id)
+            }
             storeManifestWriterState(state, namespace: namespace)
             for waiter in detached {
                 waiter.continuation.resume(returning: false)
@@ -7104,7 +7274,7 @@ actor WorkspaceCodemapBindingEngine {
         cancelledManifestWaiterInstalls.removeAll()
         for state in states {
             state.task?.cancel()
-            for waiter in state.waiters {
+            for waiter in state.waitersByWorkKey.values.joined() {
                 waiter.continuation.resume(returning: false)
             }
         }
