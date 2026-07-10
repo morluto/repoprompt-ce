@@ -14,6 +14,19 @@ enum CodeMapRootManifestModelError: Error, Equatable {
     case staleAuthority
 }
 
+enum CodeMapRootManifestDecodeFailure: Error, Hashable {
+    case invalidEnvelope
+    case checksumMismatch
+    case invalidMagic
+    case unsupportedCodecVersion(UInt32)
+    case namespaceValidation
+    case namespaceDigestMismatch
+    case expectedNamespaceMismatch
+    case recordValidation
+    case trailingPayload
+    case nonCanonicalEncoding
+}
+
 /// A Git-only manifest namespace. The shared repository namespace permits CAS/locator reuse,
 /// while the exact worktree and loaded-root prefix deliberately prevent manifest reuse.
 struct CodeMapRootManifestNamespace: Hashable {
@@ -766,7 +779,7 @@ enum CodeMapRootManifestCodec {
     ) throws -> CodeMapRootManifestSnapshot {
         let snapshot = try decodeStored(data, filenameDigest: filenameDigest)
         guard snapshot.namespace == expectedNamespace else {
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestDecodeFailure.expectedNamespaceMismatch
         }
         return snapshot
     }
@@ -779,31 +792,51 @@ enum CodeMapRootManifestCodec {
               data.count >= magic.count + 4 + checksumByteCount,
               filenameDigest.utf8.count == 64
         else {
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestDecodeFailure.invalidEnvelope
         }
         let payloadEnd = data.count - checksumByteCount
         guard Data(SHA256.hash(data: data.prefix(payloadEnd))) == data.suffix(checksumByteCount) else {
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestDecodeFailure.checksumMismatch
         }
         var reader = CodeMapRootManifestReader(data: data.prefix(payloadEnd))
-        guard try reader.readData(count: magic.count) == magic else {
-            throw CodeMapRootManifestModelError.corruptRecord
+        let storedMagic: Data
+        do {
+            storedMagic = try reader.readData(count: magic.count)
+        } catch {
+            throw CodeMapRootManifestDecodeFailure.invalidEnvelope
         }
-        let codecVersion = try reader.readUInt32()
+        guard storedMagic == magic else {
+            throw CodeMapRootManifestDecodeFailure.invalidMagic
+        }
+        let codecVersion: UInt32
+        do {
+            codecVersion = try reader.readUInt32()
+        } catch {
+            throw CodeMapRootManifestDecodeFailure.invalidEnvelope
+        }
         guard codecVersion == version || codecVersion == legacyVersion else {
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestDecodeFailure.unsupportedCodecVersion(codecVersion)
         }
-        let namespaceBytes = try reader.readLengthPrefixedData(
-            maximumByteCount: CodeMapRootManifestNamespace.maximumCanonicalByteCount
-        )
-        let authorityBytes = try reader.readLengthPrefixedData(maximumByteCount: 16 * 1024)
-        let manifestGeneration = try reader.readUInt64()
-        let lastAccessEpochSeconds = try reader.readUInt64()
-        let recordCount = try reader.readUInt32()
+        let namespaceBytes: Data
+        let authorityBytes: Data
+        let manifestGeneration: UInt64
+        let lastAccessEpochSeconds: UInt64
+        let recordCount: UInt32
+        do {
+            namespaceBytes = try reader.readLengthPrefixedData(
+                maximumByteCount: CodeMapRootManifestNamespace.maximumCanonicalByteCount
+            )
+            authorityBytes = try reader.readLengthPrefixedData(maximumByteCount: 16 * 1024)
+            manifestGeneration = try reader.readUInt64()
+            lastAccessEpochSeconds = try reader.readUInt64()
+            recordCount = try reader.readUInt32()
+        } catch {
+            throw CodeMapRootManifestDecodeFailure.invalidEnvelope
+        }
         guard recordCount <= UInt32(maximumRecordCount),
               Int(recordCount) <= reader.remainingByteCount / minimumEncodedRecordByteCount
         else {
-            throw CodeMapRootManifestModelError.inputTooLarge
+            throw CodeMapRootManifestDecodeFailure.recordValidation
         }
         let namespace: CodeMapRootManifestNamespace
         let authority: CodeMapRootManifestAuthority
@@ -811,34 +844,43 @@ enum CodeMapRootManifestCodec {
             namespace = try CodeMapRootManifestNamespace(canonicalBytes: namespaceBytes)
             authority = try CodeMapRootManifestAuthority(canonicalBytes: authorityBytes)
         } catch {
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestDecodeFailure.namespaceValidation
         }
         guard namespace.storageDigestHex == filenameDigest else {
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestDecodeFailure.namespaceDigestMismatch
         }
         var records: [CodeMapRootManifestRecord] = []
         records.reserveCapacity(Int(recordCount))
-        for _ in 0 ..< recordCount {
-            try records.append(
-                CodeMapRootManifestRecord.decodeCanonical(
-                    from: &reader,
-                    namespace: namespace,
-                    authority: authority,
-                    codecVersion: codecVersion
+        do {
+            for _ in 0 ..< recordCount {
+                try records.append(
+                    CodeMapRootManifestRecord.decodeCanonical(
+                        from: &reader,
+                        namespace: namespace,
+                        authority: authority,
+                        codecVersion: codecVersion
+                    )
                 )
-            )
+            }
+        } catch {
+            throw CodeMapRootManifestDecodeFailure.recordValidation
         }
-        guard reader.isAtEnd else { throw CodeMapRootManifestModelError.corruptRecord }
-        let snapshot = try CodeMapRootManifestSnapshot(
-            namespace: namespace,
-            authority: authority,
-            manifestGeneration: manifestGeneration,
-            lastAccessEpochSeconds: lastAccessEpochSeconds,
-            records: records
-        )
+        guard reader.isAtEnd else { throw CodeMapRootManifestDecodeFailure.trailingPayload }
+        let snapshot: CodeMapRootManifestSnapshot
+        do {
+            snapshot = try CodeMapRootManifestSnapshot(
+                namespace: namespace,
+                authority: authority,
+                manifestGeneration: manifestGeneration,
+                lastAccessEpochSeconds: lastAccessEpochSeconds,
+                records: records
+            )
+        } catch {
+            throw CodeMapRootManifestDecodeFailure.recordValidation
+        }
         if codecVersion == version {
-            guard try encode(snapshot: snapshot) == data else {
-                throw CodeMapRootManifestModelError.corruptRecord
+            guard (try? encode(snapshot: snapshot)) == data else {
+                throw CodeMapRootManifestDecodeFailure.nonCanonicalEncoding
             }
         }
         return snapshot

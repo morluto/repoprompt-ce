@@ -151,6 +151,17 @@ struct CodeMapRootManifestMaintenanceResult: Equatable {
     let accounting: CodeMapRootManifestAccounting
 }
 
+struct CodeMapRootManifestDecodeFailureAccounting: Equatable {
+    let counts: [CodeMapRootManifestDecodeFailure: UInt64]
+
+    var totalCount: UInt64 {
+        counts.values.reduce(0) { partial, count in
+            let (sum, overflow) = partial.addingReportingOverflow(count)
+            return overflow ? .max : sum
+        }
+    }
+}
+
 private enum ManifestAuthorityReplacementPolicy {
     case unconstrained
     case exactPredecessor(CodeMapRootManifestAuthority?)
@@ -178,6 +189,7 @@ actor CodeMapRootManifestStore {
     ] = [:]
     private var pendingAccessRefreshes: [String: ManifestPendingAccessRefresh] = [:]
     private var accessRefreshTask: Task<Void, Never>?
+    private var decodeFailureCounts: [CodeMapRootManifestDecodeFailure: UInt64] = [:]
 
     init(
         rootURL: URL,
@@ -221,6 +233,10 @@ actor CodeMapRootManifestStore {
         nextWriterSessionSequence = sequence == .max ? nil : sequence + 1
         activeWriterSessions.insert(token)
         return token
+    }
+
+    func decodeFailureAccounting() -> CodeMapRootManifestDecodeFailureAccounting {
+        CodeMapRootManifestDecodeFailureAccounting(counts: decodeFailureCounts)
     }
 
     func endManifestWriterSession(_ token: CodeMapRootManifestWriterSessionToken) {
@@ -355,6 +371,10 @@ actor CodeMapRootManifestStore {
                 expectedNamespace: namespace,
                 filenameDigest: name
             )
+        } catch let failure as CodeMapRootManifestDecodeFailure {
+            recordDecodeFailure(failure)
+            try await quarantineIfCurrent(layout: layout, shard: shard, name: name, descriptor: descriptor)
+            return .miss
         } catch {
             try await quarantineIfCurrent(layout: layout, shard: shard, name: name, descriptor: descriptor)
             return .miss
@@ -1350,9 +1370,17 @@ actor CodeMapRootManifestStore {
             return .valid(snapshot, identity)
         } catch CodeMapRootManifestStoreError.insecureLeaf {
             return .insecure
+        } catch let failure as CodeMapRootManifestDecodeFailure {
+            recordDecodeFailure(failure)
+            return .corrupt
         } catch {
             return .corrupt
         }
+    }
+
+    private func recordDecodeFailure(_ failure: CodeMapRootManifestDecodeFailure) {
+        let current = decodeFailureCounts[failure, default: 0]
+        decodeFailureCounts[failure] = current == .max ? .max : current + 1
     }
 
     private static func openLayout(rootURL: URL, create: Bool) throws -> ManifestStoreLayout {
