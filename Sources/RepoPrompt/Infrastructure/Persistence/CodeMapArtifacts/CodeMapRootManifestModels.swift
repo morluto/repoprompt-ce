@@ -8,6 +8,7 @@ enum CodeMapRootManifestModelError: Error, Equatable {
     case invalidAuthority
     case invalidMode
     case invalidContribution
+    case invalidOrdering
     case artifactKeyMismatch
     case inputTooLarge
     case corruptRecord
@@ -22,6 +23,9 @@ enum CodeMapRootManifestDecodeFailure: Error, Hashable {
     case namespaceValidation
     case namespaceDigestMismatch
     case expectedNamespaceMismatch
+    case authorityValidation
+    case orderingValidation
+    case contributionValidation
     case recordValidation
     case trailingPayload
     case nonCanonicalEncoding
@@ -579,7 +583,7 @@ struct CodeMapRootManifestRecord: Hashable {
                 )
             )
         default:
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestModelError.invalidContribution
         }
         let contributionEnvelope: CodeMapRootManifestContributionEnvelope?
         if codecVersion >= 2, let contributionIdentity {
@@ -635,7 +639,7 @@ struct CodeMapRootManifestRecord: Hashable {
         guard record.sourceAuthorityGeneration == sourceAuthorityGeneration,
               record.sourceAuthorityDigest == sourceAuthorityDigest
         else {
-            throw CodeMapRootManifestModelError.corruptRecord
+            throw CodeMapRootManifestModelError.invalidAuthority
         }
         return record
     }
@@ -692,17 +696,23 @@ struct CodeMapRootManifestSnapshot: Hashable {
             lhs.repositoryRelativePath.utf8.lexicographicallyPrecedes(rhs.repositoryRelativePath.utf8)
         }
         guard sorted == records,
-              Set(records.map(\.repositoryRelativePath)).count == records.count,
-              records.allSatisfy({
-                  namespace.contains(repositoryRelativePath: $0.repositoryRelativePath) &&
-                      $0.locatorIdentity.repositoryNamespace == namespace.repositoryNamespace &&
-                      $0.locatorIdentity.objectFormat == namespace.objectFormat &&
-                      $0.locatorIdentity.pipelineIdentity == namespace.pipelineIdentity &&
-                      $0.artifactKey.pipelineIdentity == namespace.pipelineIdentity &&
-                      $0.sourceAuthorityGeneration == authority.authorityGeneration &&
-                      $0.sourceAuthorityDigest == authority.digest
-              })
+              Set(records.map(\.repositoryRelativePath)).count == records.count
         else {
+            throw CodeMapRootManifestModelError.invalidOrdering
+        }
+        guard records.allSatisfy({
+            $0.sourceAuthorityGeneration == authority.authorityGeneration &&
+                $0.sourceAuthorityDigest == authority.digest
+        }) else {
+            throw CodeMapRootManifestModelError.invalidAuthority
+        }
+        guard records.allSatisfy({
+            namespace.contains(repositoryRelativePath: $0.repositoryRelativePath) &&
+                $0.locatorIdentity.repositoryNamespace == namespace.repositoryNamespace &&
+                $0.locatorIdentity.objectFormat == namespace.objectFormat &&
+                $0.locatorIdentity.pipelineIdentity == namespace.pipelineIdentity &&
+                $0.artifactKey.pipelineIdentity == namespace.pipelineIdentity
+        }) else {
             throw CodeMapRootManifestModelError.corruptRecord
         }
         self.namespace = namespace
@@ -839,12 +849,16 @@ enum CodeMapRootManifestCodec {
             throw CodeMapRootManifestDecodeFailure.recordValidation
         }
         let namespace: CodeMapRootManifestNamespace
-        let authority: CodeMapRootManifestAuthority
         do {
             namespace = try CodeMapRootManifestNamespace(canonicalBytes: namespaceBytes)
-            authority = try CodeMapRootManifestAuthority(canonicalBytes: authorityBytes)
         } catch {
             throw CodeMapRootManifestDecodeFailure.namespaceValidation
+        }
+        let authority: CodeMapRootManifestAuthority
+        do {
+            authority = try CodeMapRootManifestAuthority(canonicalBytes: authorityBytes)
+        } catch {
+            throw CodeMapRootManifestDecodeFailure.authorityValidation
         }
         guard namespace.storageDigestHex == filenameDigest else {
             throw CodeMapRootManifestDecodeFailure.namespaceDigestMismatch
@@ -862,6 +876,12 @@ enum CodeMapRootManifestCodec {
                     )
                 )
             }
+        } catch CodeMapRootManifestModelError.invalidContribution {
+            throw CodeMapRootManifestDecodeFailure.contributionValidation
+        } catch CodeMapRootManifestModelError.invalidAuthority {
+            throw CodeMapRootManifestDecodeFailure.authorityValidation
+        } catch CodeMapRootManifestModelError.staleAuthority {
+            throw CodeMapRootManifestDecodeFailure.authorityValidation
         } catch {
             throw CodeMapRootManifestDecodeFailure.recordValidation
         }
@@ -875,6 +895,14 @@ enum CodeMapRootManifestCodec {
                 lastAccessEpochSeconds: lastAccessEpochSeconds,
                 records: records
             )
+        } catch CodeMapRootManifestModelError.invalidOrdering {
+            throw CodeMapRootManifestDecodeFailure.orderingValidation
+        } catch CodeMapRootManifestModelError.invalidContribution {
+            throw CodeMapRootManifestDecodeFailure.contributionValidation
+        } catch CodeMapRootManifestModelError.invalidAuthority {
+            throw CodeMapRootManifestDecodeFailure.authorityValidation
+        } catch CodeMapRootManifestModelError.staleAuthority {
+            throw CodeMapRootManifestDecodeFailure.authorityValidation
         } catch {
             throw CodeMapRootManifestDecodeFailure.recordValidation
         }

@@ -2030,15 +2030,30 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         hostile.append(("artifact key pipeline mismatch", checksummedManifest(keyMismatch)))
 
         for (label, data) in hostile {
+            let expectedFailure: CodeMapRootManifestDecodeFailure? = switch label {
+            case "invalid contribution tag", "terminal outcome with contribution":
+                .contributionValidation
+            case "duplicate path", "out-of-order path":
+                .orderingValidation
+            case "record authority mismatch":
+                .authorityValidation
+            default:
+                nil
+            }
             XCTAssertThrowsError(
                 try CodeMapRootManifestCodec.decodeStored(
                     data,
                     filenameDigest: fixture.namespace.storageDigestHex
                 ),
                 label
-            )
+            ) { error in
+                if let expectedFailure {
+                    XCTAssertEqual(error as? CodeMapRootManifestDecodeFailure, expectedFailure, label)
+                }
+            }
         }
     }
+
 
     func testStoredManifestDecodeFailureAttributesValidatedFrameStage() async throws {
         let root = try makeSecureRoot()
