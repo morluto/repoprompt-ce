@@ -392,7 +392,21 @@ extension FileSystemService {
     /// Rebuilds the service's canonical path snapshot after bounded incremental
     /// recovery attempts fail. Existing files are marked modified so downstream
     /// content and codemap caches cannot survive an ambiguous recovery interval.
-    func reconcileEntireTreeAfterRecoveryFailure() async throws -> [FileSystemDelta] {
+    func reconcileEntireTreeAfterRecoveryFailure(
+        expectedWatcherIngressGeneration: UInt64? = nil
+    ) async throws -> [FileSystemDelta] {
+        #if DEBUG
+            if let fullResyncWillStartHandlerForTesting {
+                await fullResyncWillStartHandlerForTesting()
+            }
+            if fullResyncFailuresRemainingForTesting > 0 {
+                fullResyncFailuresRemainingForTesting -= 1
+                throw NSError(
+                    domain: "FileSystemServiceFullResyncTesting",
+                    code: 1
+                )
+            }
+        #endif
         let actualItems = try await gatherPathsUsingEnumerator(
             rootURL: rootURL,
             skipSymlinks: skipSymlinks,
@@ -443,6 +457,11 @@ extension FileSystemService {
             deltas.append(.fileModified(relativePath, modificationDate))
         }
 
+        if let expectedWatcherIngressGeneration,
+           expectedWatcherIngressGeneration != watcherIngressGeneration
+        {
+            throw CancellationError()
+        }
         visitedInventory.installOrdinary(paths: Set(reconciledItems.keys), items: reconciledItems)
         pathCompsCache.removeAll()
         return deltas
