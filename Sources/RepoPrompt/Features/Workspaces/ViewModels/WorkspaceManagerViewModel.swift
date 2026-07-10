@@ -235,6 +235,13 @@ enum WorkspaceOpenError: LocalizedError {
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 /// Authorized workspace-owned persistent storage. Construction is restricted to this file,
 /// where workspace storage paths are resolved.
+///
+/// Note: This is a point-in-time URL snapshot, not a fully revocable capability. Callers that
+/// cross suspension points (e.g. `await` in `GitDiffSnapshotPublisher`) can use a stale URL if
+/// `setWorkspaceEphemeral` changes the workspace's disposition while they are suspended. Callers
+/// that are synchronous on the MainActor (e.g. `AgentAttachmentStore`) see the current value.
+/// Fully revocable sidecar storage would require recomputing the directory at every write site
+/// through the `WorkspaceManagerViewModel`; this is a known, explicitly accepted race (F3).
 struct WorkspacePersistentStorage: Equatable {
     let workspaceDirectory: URL
 
@@ -8224,6 +8231,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     /// Sets a workspace's ephemeral property by ID and establishes the disk-writer barrier.
+    ///
+    /// The barrier is applied before `isEphemeral` is updated so that in-flight `WorkspaceDiskWriter`
+    /// enqueues are dropped. However, `WorkspacePersistentStorage` URLs issued before the transition
+    /// remain valid until the caller's synchronous MainActor window ends; any `await` that suspends
+    /// this actor can let a sidecar write to the now-stale persistent directory. This is the
+    /// explicitly accepted F3 race documented on `WorkspacePersistentStorage`.
     func setWorkspaceEphemeral(_ workspaceID: UUID, _ value: Bool) async {
         guard let idx = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
 
