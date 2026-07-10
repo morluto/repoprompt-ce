@@ -2298,7 +2298,6 @@ actor WorkspaceFileContextStore {
     private var codemapRootMutationFenceWaitersByRootEpoch: [
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
-    private var codemapProjectionPreloadReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
     private var codemapProjectionPreloadPendingTriggerByRootEpoch: [
         WorkspaceCodemapRootEpoch: CodemapProjectionPreloadTrigger
     ] = [:]
@@ -9831,7 +9830,6 @@ actor WorkspaceFileContextStore {
             for continuation in rootMutationWaiters.values {
                 continuation.resume()
             }
-            codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
             codemapProjectionPreloadPendingTriggerByRootEpoch.removeValue(forKey: rootEpoch)
             if let cleanup = detachCodemapSession(
                 rootEpoch: rootEpoch,
@@ -18057,7 +18055,9 @@ actor WorkspaceFileContextStore {
         // disk mutation still needs one restoration preload, while committed work needs the same
         // reschedule against the new public catalog.
         if token.shouldRescheduleProjectionPreload {
-            codemapProjectionPreloadReschedulePendingRootEpochs.insert(token.rootEpoch)
+            if codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] == nil {
+                codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] = .rootReady
+            }
         }
         _ = didCommitMutation
         schedulePendingCodemapProjectionPreloadIfFullyUnfenced(rootEpoch: token.rootEpoch)
@@ -18416,7 +18416,9 @@ actor WorkspaceFileContextStore {
         // preload even when the disk operation fails; successful mutations observe the same
         // post-publication scheduling point.
         if rootStatesByID[token.rootEpoch.rootID]?.lifetimeID == token.rootEpoch.rootLifetimeID {
-            codemapProjectionPreloadReschedulePendingRootEpochs.insert(token.rootEpoch)
+            if codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] == nil {
+                codemapProjectionPreloadPendingTriggerByRootEpoch[token.rootEpoch] = .rootReady
+            }
         }
         _ = didCommitMutation
         let waiters = codemapRootMutationFenceWaitersByRootEpoch.removeValue(forKey: token.rootEpoch) ?? [:]
@@ -18429,15 +18431,14 @@ actor WorkspaceFileContextStore {
     private func schedulePendingCodemapProjectionPreloadIfFullyUnfenced(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) {
-        guard codemapProjectionPreloadReschedulePendingRootEpochs.contains(rootEpoch),
+        guard let trigger = codemapProjectionPreloadPendingTriggerByRootEpoch[rootEpoch],
               codemapRootMutationFenceTokensByRootEpoch[rootEpoch] == nil,
               codemapPathInvalidationFlightsByRootEpoch[rootEpoch] == nil,
               !codemapPathFenceTokensByID.values.contains(where: { $0.rootEpoch == rootEpoch }),
               codemapCleanupFlightsByRootID[rootEpoch.rootID] == nil,
               rootStatesByID[rootEpoch.rootID]?.lifetimeID == rootEpoch.rootLifetimeID
         else { return }
-        codemapProjectionPreloadReschedulePendingRootEpochs.remove(rootEpoch)
-        let trigger = codemapProjectionPreloadPendingTriggerByRootEpoch.removeValue(forKey: rootEpoch) ?? .rootReady
+        codemapProjectionPreloadPendingTriggerByRootEpoch.removeValue(forKey: rootEpoch)
         scheduleCodemapProjectionPreloadAfterRootReady(rootEpoch: rootEpoch, trigger: trigger)
     }
 
