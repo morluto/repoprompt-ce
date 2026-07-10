@@ -226,7 +226,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let workspace = window.workspaceManager.createWorkspace(
             name: "Steer Resume \(UUID().uuidString.prefix(8))",
             repoPaths: [FileManager.default.currentDirectoryPath],
-            ephemeral: true
+            ephemeral: false
         )
         await window.workspaceManager.switchWorkspace(
             to: workspace,

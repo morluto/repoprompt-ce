@@ -734,7 +734,7 @@ final class TabContextRoutingTests: XCTestCase {
         let workspace = window.workspaceManager.createWorkspace(
             name: "Persist Resolved Tab Context \(UUID().uuidString.prefix(8))",
             repoPaths: [logicalRoot.path],
-            ephemeral: true
+            ephemeral: false
         )
         let initialSwitchResult = await window.workspaceManager.switchWorkspace(
             to: workspace,
@@ -1647,7 +1647,7 @@ final class TabContextRoutingTests: XCTestCase {
         let workspace = window.workspaceManager.createWorkspace(
             name: "Selection Tool Persistence \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
-            ephemeral: true
+            ephemeral: false
         )
         let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
         window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
