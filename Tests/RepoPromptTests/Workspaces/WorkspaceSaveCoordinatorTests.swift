@@ -36,6 +36,53 @@ final class WorkspaceSaveCoordinatorTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), Data("successful".utf8))
     }
 
+    func testSupersededPayloadReportsReplacementFailure() async throws {
+        let storageRoot = try makeTestDirectory(named: "SupersededReplacementFailure")
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+        let url = storageRoot.appendingPathComponent("payload.json")
+        let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
+        let gate = WorkspaceSavePreparationGate()
+        await writer.setAtomicWriteGateForTesting {
+            await gate.pauseFirstPreparation()
+        }
+        await writer.setFailAtomicWriteForTesting(true)
+
+        let workspaceID = UUID()
+        let olderWorkspace = WorkspaceModel(
+            id: workspaceID,
+            dateModified: Date(timeIntervalSince1970: 1000),
+            name: "Workspace",
+            repoPaths: []
+        )
+        let newerWorkspace = WorkspaceModel(
+            id: workspaceID,
+            dateModified: Date(timeIntervalSince1970: 2000),
+            name: "Workspace",
+            repoPaths: []
+        )
+        let olderData = try JSONEncoder().encode(olderWorkspace)
+        let newerData = try JSONEncoder().encode(newerWorkspace)
+        let firstData = Data("first".utf8)
+
+        let firstTask = Task { await writer.enqueueAndWait(data: firstData, url: url) }
+        await gate.waitUntilPaused()
+        let newerTask = Task { await writer.enqueueAndWait(data: newerData, url: url) }
+        let olderTask = Task { await writer.enqueueAndWait(data: olderData, url: url) }
+        let flushTask = Task { await writer.flush(url: url) }
+        await drainMainActorTasks()
+        await gate.release()
+
+        let firstOutcome = await firstTask.value
+        let newerOutcome = await newerTask.value
+        let olderOutcome = await olderTask.value
+        let flushOutcome = await flushTask.value
+        XCTAssertEqual(firstOutcome, .failed)
+        XCTAssertEqual(newerOutcome, .failed)
+        XCTAssertEqual(olderOutcome, .failed)
+        XCTAssertEqual(flushOutcome, .failed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testSuccessfulThenFailedPayloadsReceiveTheirOwnOutcomes() async throws {
         let storageRoot = try makeTestDirectory(named: "SuccessfulThenFailed")
         defer { try? FileManager.default.removeItem(at: storageRoot) }

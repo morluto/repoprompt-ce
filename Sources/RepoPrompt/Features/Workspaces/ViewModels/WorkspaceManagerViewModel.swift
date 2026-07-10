@@ -6790,6 +6790,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             var newestMetadata: WorkspaceSavePayloadMetadata?
             var newestLifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
             var newestReceiptID: UUID?
+            var supersededReceiptIDs: [UUID] = []
             var task: Task<Void, Never>?
         }
 
@@ -6848,7 +6849,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                    let existingMetadata = pending.newestMetadata,
                    metadata.activeSelectionRevision > existingMetadata.activeSelectionRevision
                 {
-                    resolveReceipt(pending.newestReceiptID, with: .superseded)
+                    if let oldReceiptID = pending.newestReceiptID {
+                        pending.supersededReceiptIDs.append(oldReceiptID)
+                    }
                     pending.newestData = data
                     pending.newestMetadata = metadata
                     pending.newestLifecycleCorrelation = lifecycleCorrelation ?? pending.newestLifecycleCorrelation
@@ -6856,11 +6859,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                     decision = "replacedExistingNewerSelectionRevision"
                 } else if Self.shouldKeepExistingWorkspacePayload(existing: pending.newestData, incoming: data, url: url) {
                     decision = "keptExistingNewerDate"
-                    resolveReceipt(receiptID, with: .superseded)
+                    if let receiptID {
+                        pending.supersededReceiptIDs.append(receiptID)
+                    }
                     WorkspaceSaveTracer.event("workspaceSave.coalesce", metadata: metadata, url: url, extra: ["decision": decision])
+                    pendingByURL[url] = pending
                     return
                 } else {
-                    resolveReceipt(pending.newestReceiptID, with: .superseded)
+                    if let oldReceiptID = pending.newestReceiptID {
+                        pending.supersededReceiptIDs.append(oldReceiptID)
+                    }
                     pending.newestData = data
                     pending.newestMetadata = metadata
                     pending.newestLifecycleCorrelation = lifecycleCorrelation ?? pending.newestLifecycleCorrelation
@@ -7146,10 +7154,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             let metadata = slot.newestMetadata
             let lifecycleCorrelation = slot.newestLifecycleCorrelation
             let receiptID = slot.newestReceiptID
+            let supersededReceiptIDs = slot.supersededReceiptIDs
             slot.newestData = Data()
             slot.newestMetadata = nil
             slot.newestLifecycleCorrelation = nil
             slot.newestReceiptID = nil
+            slot.supersededReceiptIDs = []
             pendingByURL[url] = slot
             let latestRecord = metadata?.selectionKey.flatMap { latestSelectionByWorkspaceTab[$0] }
             let lastWrittenRevision = metadata?.selectionKey.map { lastWrittenSelectionRevisionByWorkspaceTab[$0, default: 0] } ?? 0
@@ -7216,6 +7226,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await self?.writerFinished(
                     for: url,
                     receiptID: receiptID,
+                    supersededReceiptIDs: supersededReceiptIDs,
                     effective: effective,
                     writeSucceeded: writeSucceeded,
                     outcome: outcome
@@ -7230,11 +7241,17 @@ class WorkspaceManagerViewModel: ObservableObject {
         private func writerFinished(
             for url: URL,
             receiptID: UUID?,
+            supersededReceiptIDs: [UUID],
             effective: EffectiveWritePayload,
             writeSucceeded: Bool,
             outcome: WriteOutcome
         ) {
             resolveReceipt(receiptID, with: outcome)
+            let supersededOutcome: WriteOutcome = (outcome == .failed) ? .failed : .superseded
+            for supersededReceiptID in supersededReceiptIDs {
+                resolveReceipt(supersededReceiptID, with: supersededOutcome)
+            }
+            guard var slot = pendingByURL[url] else { return }
             drainOutcomeByURL[url] = Self.combinedDrainOutcome(
                 drainOutcomeByURL[url] ?? .superseded,
                 outcome
@@ -7248,8 +7265,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                     effective.effectiveSelectionRevision
                 )
             }
-            guard var slot = pendingByURL[url] else { return }
             if slot.newestData.isEmpty {
+                // No follow-up write; any receipts that were superseded by the just-finished
+                // write are resolved here.
+                for supersededReceiptID in slot.supersededReceiptIDs {
+                    resolveReceipt(supersededReceiptID, with: supersededOutcome)
+                }
+                slot.supersededReceiptIDs = []
                 pendingByURL.removeValue(forKey: url)
                 let drainOutcome = drainOutcomeByURL.removeValue(forKey: url) ?? outcome
                 if let waiters = flushWaitersByURL.removeValue(forKey: url) {
