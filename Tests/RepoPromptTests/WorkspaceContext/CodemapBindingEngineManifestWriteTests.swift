@@ -288,13 +288,141 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
 
         let accounting = await fixture.engine.accounting()
         XCTAssertEqual(fault.triggeredCount, 1)
-        XCTAssertEqual(accounting.counters.manifestWrites, 1)
+        XCTAssertEqual(accounting.counters.manifestWrites, 2)
         XCTAssertEqual(accounting.counters.manifestFailures, 1)
-        XCTAssertEqual(accounting.counters.manifestWriteBatches, 2)
-        XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
-        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
-        XCTAssertEqual(accounting.dirtyManifestCount, 1)
+        XCTAssertEqual(accounting.counters.manifestWriteBatches, 3)
+        XCTAssertEqual(accounting.counters.manifestWriteItems, 5)
+        XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 2)
+        XCTAssertEqual(accounting.dirtyManifestCount, 0)
         XCTAssertEqual(hookEvents.values(kind: .manifestFailure).count, 1)
+    }
+
+    func testDeferredWorkDrainsAfterOneShotFailureAndSurvivesReload() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
+            ]
+        )
+        let writeGate = EngineBlockingGate()
+        let fault = EngineManifestFaultOnPublication(2)
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                afterWriteShardAdmission: { writeGate.enterAndWait() },
+                faultAction: fault.action
+            )
+        )
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
+        XCTAssertTrue(writeGate.waitUntilEntered())
+        let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
+        let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
+
+        writeGate.release()
+        guard case .ready = await first.value else { return XCTFail("Expected first ready.") }
+        guard case .ready = await second.value else { return XCTFail("Expected second ready.") }
+        guard case .ready = await third.value else { return XCTFail("Expected third ready.") }
+
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.counters.manifestWrites, 2)
+        XCTAssertEqual(accounting.counters.manifestFailures, 1)
+        XCTAssertEqual(accounting.dirtyManifestCount, 0)
+
+        await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+        let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await reloaded.engine.registerRoot(reloaded.registration)
+        for path in ["Sources/One.swift", "Sources/Two.swift", "Sources/Three.swift"] {
+            guard await isReady(reloaded.engine.demand(reloaded.demand(path: path))) else {
+                return XCTFail("Expected batched manifest record for \(path) after reload.")
+            }
+        }
+    }
+
+    func testDeferredWorkRecoversAfterRepeatedFailure() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
+            ]
+        )
+        let writeGate = EngineBlockingGate()
+        let fault = EngineManifestFaultOnPublications([2, 3])
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                afterWriteShardAdmission: { writeGate.enterAndWait() },
+                faultAction: fault.action
+            )
+        )
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
+        XCTAssertTrue(writeGate.waitUntilEntered())
+        let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
+        let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
+
+        writeGate.release()
+        guard case .ready = await first.value else { return XCTFail("Expected first ready.") }
+        guard case .ready = await second.value else { return XCTFail("Expected second ready.") }
+        guard case .ready = await third.value else { return XCTFail("Expected third ready.") }
+
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.counters.manifestWrites, 2)
+        XCTAssertEqual(accounting.counters.manifestFailures, 2)
+        XCTAssertEqual(accounting.dirtyManifestCount, 0)
+    }
+
+    func testDeferredWorkAbandonsAfterMaxAttemptsAndLosesDurabilityOnReload() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/One.swift": SwiftFixtureSource.emptyStruct("One"),
+                "Sources/Two.swift": SwiftFixtureSource.emptyStruct("Two"),
+                "Sources/Three.swift": SwiftFixtureSource.emptyStruct("Three")
+            ]
+        )
+        let writeGate = EngineBlockingGate()
+        let fault = EngineManifestFaultOnPublications(Array(2..<100))
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            manifestStoreHooks: CodeMapRootManifestStoreHooks(
+                afterWriteShardAdmission: { writeGate.enterAndWait() },
+                faultAction: fault.action
+            )
+        )
+        let fixture = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        let first = Task { await fixture.engine.demand(fixture.demand(path: "Sources/One.swift")) }
+        XCTAssertTrue(writeGate.waitUntilEntered())
+        let second = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Two.swift")) }
+        let third = Task { await fixture.engine.demand(fixture.demand(path: "Sources/Three.swift")) }
+
+        writeGate.release()
+        guard case .ready = await first.value else { return XCTFail("Expected first ready.") }
+        guard case .ready = await second.value else { return XCTFail("Expected second overlay ready.") }
+        guard case .ready = await third.value else { return XCTFail("Expected third overlay ready.") }
+
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.counters.manifestWrites, 1)
+        XCTAssertGreaterThanOrEqual(accounting.counters.manifestFailures, 3)
+        XCTAssertEqual(accounting.dirtyManifestCount, 0)
+
+        await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+        let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
+        _ = await reloaded.engine.registerRoot(reloaded.registration)
+        let secondAfterReload = await reloaded.engine.demand(reloaded.demand(path: "Sources/Two.swift"))
+        let thirdAfterReload = await reloaded.engine.demand(reloaded.demand(path: "Sources/Three.swift"))
+        XCTAssertFalse(isReady(secondAfterReload))
+        XCTAssertFalse(isReady(thirdAfterReload))
     }
 
     func testSameNamespaceWriterDrainsUnloadedPredecessorBeforeSuccessor() async throws {
