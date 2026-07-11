@@ -485,7 +485,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         workspaceManager: WorkspaceManagerViewModel,
         workspace: WorkspaceModel
     ) throws -> URL {
-        try workspaceManager.persistentStorage(for: workspace).workspaceDirectory
+        try workspaceManager.featureArtifactStorage(for: workspace).workspaceDirectory
     }
 
     #if DEBUG
@@ -1116,15 +1116,10 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
             // If artifacts requested, use the publisher
             if artifacts {
-                let workspaceDirectory: URL
-                do {
-                    workspaceDirectory = try Self.persistentArtifactDirectory(
-                        workspaceManager: workspaceManager,
-                        workspace: workspace
-                    )
-                } catch WorkspacePersistenceError.ephemeralWorkspace {
-                    throw MCPError.invalidParams("Temporary workspaces cannot publish persistent Git artifacts.")
-                }
+                let workspaceDirectory = try Self.persistentArtifactDirectory(
+                    workspaceManager: workspaceManager,
+                    workspace: workspace
+                )
 
                 let modeRaw = args["mode"]?.stringValue?.lowercased() ?? "standard"
                 guard let mode = GitDiffPublishMode(rawValue: modeRaw) else {

@@ -364,7 +364,7 @@ extension AgentModeViewModel {
                 )
             }
             return try workspaceManager
-                .persistentStorage(for: workspace)
+                .featureArtifactStorage(for: workspace)
                 .workspaceDirectory
         }
         if let workspaceManager, let workspace = workspaceManager.activeWorkspace {

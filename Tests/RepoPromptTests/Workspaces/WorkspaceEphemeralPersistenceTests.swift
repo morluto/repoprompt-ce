@@ -142,12 +142,16 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         let manager = makeFixture().manager
         var workspace = WorkspaceModel(name: "Temporary Attachment", repoPaths: [])
         workspace.isEphemeral = true
+        manager.workspaces = [workspace]
 
         XCTAssertThrowsError(
             try manager.persistentStorage(for: workspace, baseRoot: storageRoot)
         ) { error in
             XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
+        let featureStorage = try manager.featureArtifactStorage(for: workspace)
+        XCTAssertTrue(featureStorage.workspaceDirectory.path.contains("RepoPromptCE-EphemeralArtifacts"))
+        XCTAssertFalse(featureStorage.workspaceDirectory.path.hasPrefix(storageRoot.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 
@@ -198,6 +202,10 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         )
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
+        let sidecarStorage = try manager.persistentStorage(for: workspace)
+        let attachmentSource = storageRoot.appendingPathComponent("source.png")
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: attachmentSource)
 
         let gate = WorkspaceEphemeralPersistenceGate()
         let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
@@ -220,6 +228,11 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
             "A writer already admitted before conversion must be cancelled at the final write boundary"
         )
         XCTAssertThrowsError(try manager.saveWorkspaceToFile(workspace)) { error in
+            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
+        }
+        XCTAssertThrowsError(
+            try AgentAttachmentStore().importImageFile(sourceURL: attachmentSource, storage: sidecarStorage)
+        ) { error in
             XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
     }
@@ -265,7 +278,7 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         await XCTAssertThrowsErrorAsync {
             try await fixture.prompt.publishGitDiffArtifacts(inclusionMode: .all)
         } errorHandler: { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
+            XCTAssertNotEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
         }
     }
 
@@ -275,14 +288,12 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         var workspace = WorkspaceModel(name: "MCP Temporary", repoPaths: [])
         workspace.isEphemeral = true
 
-        XCTAssertThrowsError(
-            try MCPGitToolProvider.test_persistentArtifactDirectory(
-                workspaceManager: fixture.manager,
-                workspace: workspace
-            )
-        ) { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        fixture.manager.workspaces = [workspace]
+        let directory = try MCPGitToolProvider.test_persistentArtifactDirectory(
+            workspaceManager: fixture.manager,
+            workspace: workspace
+        )
+        XCTAssertTrue(directory.path.contains("RepoPromptCE-EphemeralArtifacts"))
     }
 
     @MainActor
@@ -309,14 +320,11 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         ephemeral.isEphemeral = true
         fixture.manager.workspaces = [ephemeral]
         fixture.manager.activeWorkspace = ephemeral
-        XCTAssertThrowsError(
-            try AgentModeViewModel.test_worktreePreviewDirectory(
-                publishArtifacts: true,
-                workspaceManager: fixture.manager
-            )
-        ) { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        let ephemeralDirectory = try AgentModeViewModel.test_worktreePreviewDirectory(
+            publishArtifacts: true,
+            workspaceManager: fixture.manager
+        )
+        XCTAssertTrue(ephemeralDirectory.path.contains("RepoPromptCE-EphemeralArtifacts"))
     }
 
     @MainActor

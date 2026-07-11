@@ -35,6 +35,7 @@ struct AgentAttachmentStore {
     }
 
     func importImageFile(sourceURL: URL, storage: WorkspacePersistentStorage) throws -> ImportResult {
+        try storage.validateAuthorization()
         let sourceURL = sourceURL.standardizedFileURL
         guard sourceURL.isFileURL else {
             throw Error.invalidSourceURL
@@ -65,6 +66,7 @@ struct AgentAttachmentStore {
     }
 
     func clearConsumedLocalFiles(_ attachments: [AgentImageAttachment], storage: WorkspacePersistentStorage) {
+        guard (try? storage.validateAuthorization()) != nil else { return }
         guard !attachments.isEmpty else { return }
         let storageRoot = Self.managedStorageRootURL(for: storage.workspaceDirectory)
         let storagePrefix = storageRoot.path + "/"

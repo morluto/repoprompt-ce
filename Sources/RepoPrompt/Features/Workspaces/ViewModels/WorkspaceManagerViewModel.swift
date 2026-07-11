@@ -235,17 +235,40 @@ enum WorkspaceOpenError: LocalizedError {
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 /// Authorized workspace-owned persistent storage. Construction is restricted to this file,
 /// where workspace storage paths are resolved.
+fileprivate final class WorkspaceStorageAuthorization: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    func invalidate() { lock.withLock { valid = false } }
+
+    func validate() throws {
+        guard lock.withLock({ valid }) else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+    }
+}
+
 struct WorkspacePersistentStorage: Equatable {
     let workspaceDirectory: URL
+    private let authorization: WorkspaceStorageAuthorization
 
-    fileprivate init(authorizedWorkspaceDirectory: URL) {
+    fileprivate init(
+        authorizedWorkspaceDirectory: URL,
+        authorization: WorkspaceStorageAuthorization = WorkspaceStorageAuthorization()
+    ) {
         workspaceDirectory = authorizedWorkspaceDirectory.standardizedFileURL
+        self.authorization = authorization
     }
+
+    func validateAuthorization() throws { try authorization.validate() }
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.workspaceDirectory == rhs.workspaceDirectory }
 }
 
 @MainActor
 class WorkspaceManagerViewModel: ObservableObject {
     private static let logger = Logger(subsystem: "com.repoprompt.workspace", category: "WorkspaceSwitch")
+    private var persistentStorageAuthorizations: [UUID: WorkspaceStorageAuthorization] = [:]
 
     @Published var workspaces: [WorkspaceModel] = [] {
         didSet {
@@ -1386,10 +1409,36 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func persistentStorage(for workspace: WorkspaceModel) throws -> WorkspacePersistentStorage {
         let authoritativeWorkspace = workspaces.first(where: { $0.id == workspace.id }) ?? workspace
-        return try persistentStorage(
-            for: authoritativeWorkspace,
-            baseRoot: currentBaseRoot
+        guard authoritativeWorkspace.persistenceDisposition == .persistent else {
+            throw WorkspacePersistenceError.ephemeralWorkspace
+        }
+        let authorization = persistentStorageAuthorizations[authoritativeWorkspace.id]
+            ?? WorkspaceStorageAuthorization()
+        persistentStorageAuthorizations[authoritativeWorkspace.id] = authorization
+        return WorkspacePersistentStorage(
+            authorizedWorkspaceDirectory: workspaceDirectory(for: authoritativeWorkspace),
+            authorization: authorization
         )
+    }
+
+    func featureArtifactStorage(for workspace: WorkspaceModel) throws -> WorkspacePersistentStorage {
+        let authoritativeWorkspace = workspaces.first(where: { $0.id == workspace.id }) ?? workspace
+        if authoritativeWorkspace.persistenceDisposition == .ephemeral {
+            return WorkspacePersistentStorage(
+                authorizedWorkspaceDirectory: Self.ephemeralArtifactDirectory(for: authoritativeWorkspace.id)
+            )
+        }
+        return try persistentStorage(for: authoritativeWorkspace)
+    }
+
+    nonisolated private static func ephemeralArtifactDirectory(for workspaceID: UUID) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptCE-EphemeralArtifacts", isDirectory: true)
+            .appendingPathComponent(workspaceID.uuidString, isDirectory: true)
+    }
+
+    private func removeEphemeralArtifacts(for workspaceID: UUID) {
+        try? FileManager.default.removeItem(at: Self.ephemeralArtifactDirectory(for: workspaceID))
     }
 
     nonisolated func persistentStorage(for workspace: WorkspaceModel, baseRoot: URL) throws -> WorkspacePersistentStorage {
@@ -5805,6 +5854,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
+        removeEphemeralArtifacts(for: workspace.id)
 
         let workspaceDir = workspaceDirectory(for: workspace)
 
@@ -8209,10 +8259,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let idx = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
 
         if value {
+            workspaces[idx].isEphemeral = true
+            persistentStorageAuthorizations.removeValue(forKey: workspaceID)?.invalidate()
             await WorkspaceDiskWriter.shared.setPersistenceBlocked(true, workspaceID: workspaceID)
             guard workspaces.indices.contains(idx), workspaces[idx].id == workspaceID else { return }
-            workspaces[idx].isEphemeral = true
+            removeEphemeralArtifacts(for: workspaceID)
         } else {
+            removeEphemeralArtifacts(for: workspaceID)
             await WorkspaceDiskWriter.shared.setPersistenceBlocked(false, workspaceID: workspaceID)
             guard workspaces.indices.contains(idx), workspaces[idx].id == workspaceID else { return }
             workspaces[idx].isEphemeral = false
