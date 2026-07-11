@@ -380,7 +380,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
     }
 
-    func testDeferredWorkAbandonsAfterMaxAttemptsAndLosesDurabilityOnReload() async throws {
+    func testDeferredWorkAbandonsAfterMaxAttemptsWithoutPublishingDeferredRecords() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
@@ -391,7 +391,7 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
             ]
         )
         let writeGate = EngineBlockingGate()
-        let fault = EngineManifestFaultOnPublications(Array(2..<100))
+        let fault = EngineManifestFaultOnPublications(Array(2 ..< 100))
         let runtime = try CodeMapArtifactRuntime(
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
             manifestStoreHooks: CodeMapRootManifestStoreHooks(
@@ -416,13 +416,26 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertGreaterThanOrEqual(accounting.counters.manifestFailures, 3)
         XCTAssertEqual(accounting.dirtyManifestCount, 0)
 
-        await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
-        let reloaded = try await makeEngineFixture(root: root, runtime: runtime)
-        _ = await reloaded.engine.registerRoot(reloaded.registration)
-        let secondAfterReload = await reloaded.engine.demand(reloaded.demand(path: "Sources/Two.swift"))
-        let thirdAfterReload = await reloaded.engine.demand(reloaded.demand(path: "Sources/Three.swift"))
-        XCTAssertFalse(isReady(secondAfterReload))
-        XCTAssertFalse(isReady(thirdAfterReload))
+        let capability = try await eligible(fixture.capabilityService.state(for: fixture.rootEpoch))
+        let pipeline = try SyntaxManager.shared.pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let namespace = try CodeMapRootManifestNamespace(
+            capability: capability,
+            pipelineIdentity: pipeline
+        )
+        let authority = try CodeMapRootManifestAuthority(
+            namespace: namespace,
+            token: capability.repositoryAuthority
+        )
+        guard case let .hit(snapshot) = try await runtime.manifestStore.loadCurrentManifest(
+            namespace: namespace,
+            currentAuthority: authority
+        ) else {
+            return XCTFail("Expected the first successful manifest publication.")
+        }
+        XCTAssertEqual(snapshot.records.map(\.repositoryRelativePath), ["Sources/One.swift"])
     }
 
     func testSameNamespaceWriterDrainsUnloadedPredecessorBeforeSuccessor() async throws {
