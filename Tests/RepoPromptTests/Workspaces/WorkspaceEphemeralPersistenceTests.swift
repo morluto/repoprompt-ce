@@ -111,7 +111,7 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testEphemeralGitDataLoadFailsBeforeCreatingSidecars() async {
+    func testEphemeralGitDataLoadUsesEphemeralArtifactDirectoryWithoutPersistentSidecars() async throws {
         let storageRoot = temporaryStorageRoot()
         defer { try? FileManager.default.removeItem(at: storageRoot) }
 
@@ -125,14 +125,16 @@ final class WorkspaceEphemeralPersistenceTests: XCTestCase {
         fixture.manager.workspaces = [workspace]
         fixture.manager.activeWorkspace = workspace
 
-        await XCTAssertThrowsErrorAsync {
-            try await fixture.files.ensureGitDataRootLoaded(
-                workspace: workspace,
-                workspaceManager: fixture.manager
-            )
-        } errorHandler: { error in
-            XCTAssertEqual(error as? WorkspacePersistenceError, .ephemeralWorkspace)
-        }
+        // Ephemeral workspaces load their Git-data root from the memory-only
+        // feature artifact directory (a temporary, auto-cleaned location) so
+        // published artifacts can be ingress-ed without writing persistent
+        // workspace storage to disk.
+        let root = try await fixture.files.ensureGitDataRootLoaded(
+            workspace: workspace,
+            workspaceManager: fixture.manager
+        )
+        XCTAssertTrue(root.fullPath.contains("RepoPromptCE-EphemeralArtifacts"))
+        XCTAssertFalse(root.fullPath.hasPrefix(storageRoot.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: storageRoot.path))
     }
 
