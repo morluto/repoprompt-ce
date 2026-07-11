@@ -17,8 +17,8 @@ PREFLIGHT_SOURCE = REPO_ROOT / ".agents/skills/rpce-contribution-check/scripts/p
 GUARDRAILS_TARGET = "guardrails"
 CONDUCTOR_SELFTEST_TARGET = "conductor-selftest"
 CI_APP_TEST_RUNNER_SELFTEST_TARGET = "ci-app-test-runner-selftest"
-SWIFT_LINT_TARGET = "dev-lint"
-ROOT_TEST_TARGET = "dev-test"
+SWIFT_LINT_TARGET = "lint-impacted RANGE=refs/remotes/origin/main...HEAD"
+ROOT_TEST_TARGET = "dev-test-impacted RANGE=refs/remotes/origin/main...HEAD FULL_FALLBACK=1"
 PROVIDER_TEST_TARGET = "dev-provider-test"
 REPOPROMPT_BUILD_TARGET = "dev-swift-build PRODUCT=RepoPrompt"
 MCP_BUILD_TARGET = "dev-swift-build PRODUCT=repoprompt-mcp"
@@ -184,7 +184,10 @@ class ContributionPreflightTests(unittest.TestCase):
                     result = self.run_preflight(repo, preflight, env, "pr-ready")
 
                     self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-                    self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, CI_APP_TEST_RUNNER_SELFTEST_TARGET])
+                    expected = [GUARDRAILS_TARGET, CI_APP_TEST_RUNNER_SELFTEST_TARGET]
+                    if outgoing_path == ".github/workflows/ci.yml":
+                        expected.append(SWIFT_LINT_TARGET)
+                    self.assert_make_lines_equal(env, expected)
                     self.assertIn("PR-ready preflight passed", result.stdout)
 
     def test_pr_ready_runs_xcode_validation_for_workspace_boundary_changes(self) -> None:
@@ -220,6 +223,7 @@ class ContributionPreflightTests(unittest.TestCase):
                 [
                     GUARDRAILS_TARGET,
                     CONDUCTOR_SELFTEST_TARGET,
+                    SWIFT_LINT_TARGET,
                     XCODE_GENERATOR_TEST_TARGET,
                     XCODE_VALIDATE_TARGET,
                 ],
@@ -264,6 +268,16 @@ class ContributionPreflightTests(unittest.TestCase):
 
     def test_pr_ready_selects_expected_heavyweight_targets_by_changed_path(self) -> None:
         cases = [
+            (
+                "SwiftFormat config",
+                ".swiftformat",
+                [GUARDRAILS_TARGET, SWIFT_LINT_TARGET],
+            ),
+            (
+                "style helper",
+                "Scripts/swift_style.sh",
+                [GUARDRAILS_TARGET, SWIFT_LINT_TARGET],
+            ),
             (
                 "provider Swift path",
                 "Packages/RepoPromptAgentProviders/Sources/Example.swift",
