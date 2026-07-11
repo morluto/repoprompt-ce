@@ -235,11 +235,13 @@ enum WorkspaceOpenError: LocalizedError {
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 /// Authorized workspace-owned persistent storage. Construction is restricted to this file,
 /// where workspace storage paths are resolved.
-fileprivate final class WorkspaceStorageAuthorization: @unchecked Sendable {
+private final class WorkspaceStorageAuthorization: @unchecked Sendable {
     private let lock = NSLock()
     private var valid = true
 
-    func invalidate() { lock.withLock { valid = false } }
+    func invalidate() {
+        lock.withLock { valid = false }
+    }
 
     func validate() throws {
         guard lock.withLock({ valid }) else {
@@ -260,9 +262,13 @@ struct WorkspacePersistentStorage: Equatable {
         self.authorization = authorization
     }
 
-    func validateAuthorization() throws { try authorization.validate() }
+    func validateAuthorization() throws {
+        try authorization.validate()
+    }
 
-    static func == (lhs: Self, rhs: Self) -> Bool { lhs.workspaceDirectory == rhs.workspaceDirectory }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspaceDirectory == rhs.workspaceDirectory
+    }
 }
 
 @MainActor
@@ -1423,7 +1429,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func featureArtifactStorage(for workspace: WorkspaceModel) throws -> WorkspacePersistentStorage {
         let authoritativeWorkspace = workspaces.first(where: { $0.id == workspace.id }) ?? workspace
-        if authoritativeWorkspace.persistenceDisposition == .ephemeral {
+        if authoritativeWorkspace.persistenceDisposition == .skipEphemeral {
             return WorkspacePersistentStorage(
                 authorizedWorkspaceDirectory: Self.ephemeralArtifactDirectory(for: authoritativeWorkspace.id)
             )
@@ -1431,7 +1437,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         return try persistentStorage(for: authoritativeWorkspace)
     }
 
-    nonisolated private static func ephemeralArtifactDirectory(for workspaceID: UUID) -> URL {
+    private nonisolated static func ephemeralArtifactDirectory(for workspaceID: UUID) -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptCE-EphemeralArtifacts", isDirectory: true)
             .appendingPathComponent(workspaceID.uuidString, isDirectory: true)
