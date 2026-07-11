@@ -548,7 +548,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         return CodexAgentModeCoordinator(
-            windowID: 9_451,
+            windowID: 9451,
             workspacePathProvider: { _ in nil },
             codexControllerFactory: { _, _, _, _, _, _, _ in
                 fatalError("selection tests do not start Codex sessions")
