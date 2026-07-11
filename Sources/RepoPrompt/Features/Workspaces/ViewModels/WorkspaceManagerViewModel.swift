@@ -7695,6 +7695,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                 metadata: metadata
             )
 
+            // The workspace can change while the actor is awaiting the atomic write.
+            // A committed receipt only certifies the captured payload; it must not let
+            // the coordinator declare a newer in-memory version durable.
+            let postWriteStateVersion = stateVersionByWorkspaceID[current.id, default: capturedStateVersion]
+            if writeOutcome == .committed,
+               postWriteStateVersion != capturedStateVersion
+            {
+                return .superseded(version: postWriteStateVersion)
+            }
+
             if writeOutcome == .committed {
                 recordRepoPathBaseline(for: merged)
                 if indexFieldsChanged {
