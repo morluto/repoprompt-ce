@@ -248,7 +248,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         ))
     }
 
-    func testSystemAPIRetryPayloadMapsToTaskProgressWithAttemptAndDelay() {
+    func testSystemAPIRetryPayloadMapsToTaskProgressWithAttemptAndDelay() throws {
         let progress = ClaudeNativeProcessSessionController.test_parseAPIRetryProgressResult(from: [
             "type": "system",
             "subtype": "api_retry",
