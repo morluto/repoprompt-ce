@@ -184,39 +184,63 @@ import MCP
             var totals = AgentDebugMemoryTotals()
 
             if includeSessions {
+                struct CapturedSession {
+                    var payload: [String: Any]
+                    let codexController: CodexNativeSessionController?
+                    let claudeController: (any NativeAgentRuntimeControlling)?
+                    let acpController: ACPAgentSessionController?
+                }
+
                 for window in WindowStatesManager.shared.allWindows {
                     let agentModeVM = window.agentModeViewModel
-                    var sessionPayloads: [[String: Any]] = []
-                    sessionPayloads.reserveCapacity(agentModeVM.sessions.count)
-
-                    for session in agentModeVM.sessions.values.sorted(by: { lhs, rhs in
+                    let capturedWindowID = window.windowID
+                    let capturedWorkspace = window.workspaceManager.activeWorkspace.map { $0.name as Any } ?? NSNull()
+                    let capturedLiveSessionCount = agentModeVM.sessions.count
+                    let sortedSessions = agentModeVM.sessions.values.sorted(by: { lhs, rhs in
                         let lhsName = window.workspaceManager.composeTab(with: lhs.tabID)?.name ?? lhs.tabID.uuidString
                         let rhsName = window.workspaceManager.composeTab(with: rhs.tabID)?.name ?? rhs.tabID.uuidString
                         return lhsName.localizedStandardCompare(rhsName) == .orderedAscending
-                    }) {
-                        let codexProcessSnapshot = await session.codexController?.appServerProcessSnapshot()
-                        let claudeProcessSnapshot = await session.claudeController?.debugProcessSnapshot()
-                        let acpProcessSnapshot = await session.acpController?.debugProcessSnapshot()
-                        let payload = debugAgentMemorySessionPayload(
-                            session,
-                            window: window,
-                            codexProcessSnapshot: codexProcessSnapshot,
-                            claudeProcessSnapshot: claudeProcessSnapshot,
-                            acpProcessSnapshot: acpProcessSnapshot
+                    })
+                    var capturedSessions: [CapturedSession] = []
+                    capturedSessions.reserveCapacity(sortedSessions.count)
+
+                    // Capture every MainActor-owned field without suspension. Controller queries
+                    // happen in a second phase so actor reentrancy cannot produce a session payload
+                    // assembled from multiple lifecycle moments.
+                    for session in sortedSessions {
+                        totals.add(session: session)
+                        capturedSessions.append(CapturedSession(
+                            payload: debugAgentMemorySessionPayload(session, window: window),
+                            codexController: session.codexController,
+                            claudeController: session.claudeController,
+                            acpController: session.acpController
+                        ))
+                    }
+
+                    var sessionPayloads: [[String: Any]] = []
+                    sessionPayloads.reserveCapacity(capturedSessions.count)
+                    for var captured in capturedSessions {
+                        let codexProcessSnapshot = await captured.codexController?.appServerProcessSnapshot()
+                        let claudeProcessSnapshot = await captured.claudeController?.debugProcessSnapshot()
+                        let acpProcessSnapshot = await captured.acpController?.debugProcessSnapshot()
+                        debugAgentMemoryAttachRuntimeProcesses(
+                            to: &captured.payload,
+                            codex: codexProcessSnapshot,
+                            claude: claudeProcessSnapshot,
+                            acp: acpProcessSnapshot
                         )
                         totals.add(
-                            session: session,
                             codexProcessSnapshot: codexProcessSnapshot,
                             claudeProcessSnapshot: claudeProcessSnapshot,
                             acpProcessSnapshot: acpProcessSnapshot
                         )
-                        sessionPayloads.append(payload)
+                        sessionPayloads.append(captured.payload)
                     }
 
                     windowPayloads.append([
-                        "window_id": window.windowID,
-                        "workspace": window.workspaceManager.activeWorkspace.map { $0.name as Any } ?? NSNull(),
-                        "live_session_count": agentModeVM.sessions.count,
+                        "window_id": capturedWindowID,
+                        "workspace": capturedWorkspace,
+                        "live_session_count": capturedLiveSessionCount,
                         "sessions": sessionPayloads
                     ])
                 }
@@ -229,8 +253,8 @@ import MCP
                 "ok": true,
                 "op": op,
                 "debug_only": true,
-                "snapshot_consistency": "best_effort_non_atomic",
-                "notes": "Session/controller process snapshots are diagnostic probes and may race with provider startup or shutdown.",
+                "snapshot_consistency": "session_atomic_process_best_effort",
+                "notes": "Each session's fields and controller identities are captured without MainActor suspension. Process probes use those frozen identities and may observe later provider startup or shutdown.",
                 "timestamp": AgentMCPToolHelpers.timestamp(Date()),
                 "totals": totals.payload(),
                 "codex_model_polling": debugAgentMemoryCodexModelPollingPayload(codexModelPollingSnapshot)
@@ -247,10 +271,7 @@ import MCP
         @MainActor
         private static func debugAgentMemorySessionPayload(
             _ session: AgentModeViewModel.TabSession,
-            window: WindowState,
-            codexProcessSnapshot: CodexAppServerClient.ProcessSnapshot?,
-            claudeProcessSnapshot: AgentRuntimeProcessSnapshot?,
-            acpProcessSnapshot: AgentRuntimeProcessSnapshot?
+            window: WindowState
         ) -> [String: Any] {
             let itemStringBytes = debugAgentMemoryItemStringBytes(session.items)
             let transcriptProjectionRows = session.transcriptProjection.workingRows.count + session.transcriptProjection.archivedRows.count
@@ -348,10 +369,6 @@ import MCP
                 "pending_approval": session.pendingApproval != nil,
                 "pending_question_ui": session.hasPendingQuestionUI
             ]
-            runtime["codex_controller_process"] = debugAgentMemoryCodexProcessPayload(codexProcessSnapshot)
-            runtime["claude_controller_process"] = debugAgentMemoryRuntimeProcessPayload(claudeProcessSnapshot)
-            runtime["acp_controller_process"] = debugAgentMemoryRuntimeProcessPayload(acpProcessSnapshot)
-
             var payload: [String: Any] = [
                 "tab_id": session.tabID.uuidString,
                 "session_id": session.activeAgentSessionID?.uuidString as Any? ?? NSNull(),
@@ -368,6 +385,19 @@ import MCP
             payload["projections"] = projections
             payload["runtime"] = runtime
             return payload
+        }
+
+        private static func debugAgentMemoryAttachRuntimeProcesses(
+            to payload: inout [String: Any],
+            codex: CodexAppServerClient.ProcessSnapshot?,
+            claude: AgentRuntimeProcessSnapshot?,
+            acp: AgentRuntimeProcessSnapshot?
+        ) {
+            guard var runtime = payload["runtime"] as? [String: Any] else { return }
+            runtime["codex_controller_process"] = debugAgentMemoryCodexProcessPayload(codex)
+            runtime["claude_controller_process"] = debugAgentMemoryRuntimeProcessPayload(claude)
+            runtime["acp_controller_process"] = debugAgentMemoryRuntimeProcessPayload(acp)
+            payload["runtime"] = runtime
         }
 
         private static func debugAgentMemoryCodexProcessPayload(
@@ -546,12 +576,24 @@ import MCP
             var codexModelPollingResidentBytes: UInt64 = 0
 
             @MainActor
+            mutating func add(session: AgentModeViewModel.TabSession) {
+                addSessionState(session)
+            }
+
             mutating func add(
-                session: AgentModeViewModel.TabSession,
                 codexProcessSnapshot: CodexAppServerClient.ProcessSnapshot?,
                 claudeProcessSnapshot: AgentRuntimeProcessSnapshot?,
                 acpProcessSnapshot: AgentRuntimeProcessSnapshot?
             ) {
+                addProcessState(
+                    codexProcessSnapshot: codexProcessSnapshot,
+                    claudeProcessSnapshot: claudeProcessSnapshot,
+                    acpProcessSnapshot: acpProcessSnapshot
+                )
+            }
+
+            @MainActor
+            private mutating func addSessionState(_ session: AgentModeViewModel.TabSession) {
                 liveSessions += 1
                 mcpOriginatedSessions += session.isMCPOriginated ? 1 : 0
                 items += session.items.count
@@ -607,6 +649,18 @@ import MCP
                     partial + instruction.utf8.count
                 }
                 codexControllers += session.codexController == nil ? 0 : 1
+                claudeControllers += session.claudeController == nil ? 0 : 1
+                acpControllers += session.acpController == nil ? 0 : 1
+                providerObjects += session.provider == nil ? 0 : 1
+                agentTasks += session.agentTask == nil ? 0 : 1
+                codexEventTasks += session.codexEventTask == nil ? 0 : 1
+            }
+
+            private mutating func addProcessState(
+                codexProcessSnapshot: CodexAppServerClient.ProcessSnapshot?,
+                claudeProcessSnapshot: AgentRuntimeProcessSnapshot?,
+                acpProcessSnapshot: AgentRuntimeProcessSnapshot?
+            ) {
                 if let codexProcessSnapshot {
                     let pid = Int(codexProcessSnapshot.pid)
                     codexControllerProcessIDs.append(pid)
@@ -615,7 +669,6 @@ import MCP
                     }
                     codexControllerResidentBytes += debugAgentMemoryChildProcessMetrics(pid: codexProcessSnapshot.pid)?.residentBytes ?? 0
                 }
-                claudeControllers += session.claudeController == nil ? 0 : 1
                 if let claudeProcessSnapshot {
                     let pid = Int(claudeProcessSnapshot.pid)
                     claudeControllerProcessIDs.append(pid)
@@ -624,7 +677,6 @@ import MCP
                     }
                     claudeControllerResidentBytes += debugAgentMemoryChildProcessMetrics(pid: claudeProcessSnapshot.pid)?.residentBytes ?? 0
                 }
-                acpControllers += session.acpController == nil ? 0 : 1
                 if let acpProcessSnapshot {
                     let pid = Int(acpProcessSnapshot.pid)
                     acpControllerProcessIDs.append(pid)
@@ -633,9 +685,6 @@ import MCP
                     }
                     acpControllerResidentBytes += debugAgentMemoryChildProcessMetrics(pid: acpProcessSnapshot.pid)?.residentBytes ?? 0
                 }
-                providerObjects += session.provider == nil ? 0 : 1
-                agentTasks += session.agentTask == nil ? 0 : 1
-                codexEventTasks += session.codexEventTask == nil ? 0 : 1
             }
 
             mutating func add(codexModelPollingSnapshot: CodexModelPollingService.RuntimeSnapshot) {
