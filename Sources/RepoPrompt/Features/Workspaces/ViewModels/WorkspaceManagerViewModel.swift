@@ -7432,6 +7432,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard var latestState = workspaceSaveStateByWorkspaceID[workspaceID] else { break }
             switch finalOutcome {
             case let .committed(version):
+                // A durable write of `version` just completed, so record it as the
+                // newest saved version immediately. This must happen even when a
+                // newer pending version is re-armed below; otherwise an interrupted
+                // loop (cancelled worker, or a guard exit before the newer version
+                // is processed) can resume a boundary waiter with `.committed(version)`
+                // while `lastSavedVersion` lags behind. That mismatch makes the close
+                // boundary report a version it never recorded as saved.
+                lastSavedVersionByWorkspaceID[workspaceID] = max(
+                    lastSavedVersionByWorkspaceID[workspaceID, default: -1],
+                    version
+                )
                 let latestVersion = stateVersionByWorkspaceID[workspaceID, default: request.requestedVersion]
                 if let pending = latestState.pendingLatest,
                    pending.requestedVersion < version ||
@@ -7452,11 +7463,6 @@ class WorkspaceManagerViewModel: ObservableObject {
                         sequence: nextWorkspaceSaveRequestSequence
                     )
                     nextWorkspaceSaveRequestSequence &+= 1
-                } else if latestState.pendingLatest == nil {
-                    lastSavedVersionByWorkspaceID[workspaceID] = max(
-                        lastSavedVersionByWorkspaceID[workspaceID, default: -1],
-                        version
-                    )
                 }
             case let .superseded(version):
                 let latestVersion = stateVersionByWorkspaceID[workspaceID, default: request.requestedVersion]
