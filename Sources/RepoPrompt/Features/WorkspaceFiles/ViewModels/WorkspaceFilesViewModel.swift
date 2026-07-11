@@ -3229,12 +3229,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         // `featureArtifactStorage`, so the Git-data root is resolved from that
         // same directory to stay consistent with where artifacts are written.
         // Persistent workspaces continue to use their on-disk `_git_data` folder.
-        let gitDataURL: URL
-        if workspace.persistenceDisposition == .skipEphemeral {
-            gitDataURL = try workspaceManager.featureArtifactStorage(for: workspace).workspaceDirectory
+        let gitDataURL = if workspace.persistenceDisposition == .skipEphemeral {
+            try workspaceManager.featureArtifactStorage(for: workspace).workspaceDirectory
                 .appendingPathComponent("_git_data", isDirectory: true)
         } else {
-            gitDataURL = workspaceManager.gitDataDirectory(for: workspace)
+            workspaceManager.gitDataDirectory(for: workspace)
         }
         if !isFolderAlreadyLoaded(gitDataURL) {
             try await loadSupplementalRoot(
