@@ -768,6 +768,21 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
             bindingGeneration: bindingGeneration
         )
     }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(5),
+        condition: @escaping @Sendable () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
+    }
 }
 
 private actor CoordinatorRecorder {
