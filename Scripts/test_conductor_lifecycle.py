@@ -1015,6 +1015,70 @@ class LifecycleQueueTests(LifecycleTestCase):
 
         self.assertEqual([row.split()[0:2] for row in rows], [["start", "a"], ["end", "a"], ["start", "b"], ["end", "b"]])
 
+    def test_terminal_job_status_persists_failure_record_and_summary(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        log = state.paths.jobs_dir / "ticket.log"
+        log.write_text(
+            "==> Building\nSources/Foo.swift:10:5: error: cannot find 'x' in scope\n",
+            encoding="utf-8",
+        )
+        job = self.make_job(
+            state,
+            "ticket",
+            "swift-build",
+            {"product": "RepoPrompt", "message": "secret prompt", "logFile": "/tmp/secret.log"},
+            ["build"],
+            job_state="failed",
+        )
+        job.exit_code = 1
+        job.error = "process exited with status 1"
+        job.finished_at = conductor.now()
+        job.log_path = log
+        state.jobs["ticket"] = job
+
+        payload = state.job_status("ticket", None)
+
+        self.assertIn("outputSummary", payload)
+        self.assertTrue(job.failure_record_written)
+        self.assertFalse(job.failure_record_pending)
+        record_path = state.paths.jobs_dir / "ticket.failure.json"
+        summary_path = state.paths.jobs_dir / "ticket.summary.json"
+        self.assertTrue(record_path.exists())
+        self.assertTrue(summary_path.exists())
+        data = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["ticket"], "ticket")
+        self.assertEqual(data["failureClass"], "compilerFailure")
+        # Unbounded user args are redacted from the aggregate record.
+        self.assertNotIn("message", data["args"])
+        self.assertNotIn("logFile", data["args"])
+        self.assertEqual(data["args"]["product"], "RepoPrompt")
+
+    def test_job_status_is_idempotent_for_failure_record_write(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        log = state.paths.jobs_dir / "ticket.log"
+        log.write_text("error: cannot find 'x' in scope\n", encoding="utf-8")
+        job = self.make_job(
+            state,
+            "ticket",
+            "swift-build",
+            {"product": "RepoPrompt"},
+            ["build"],
+            job_state="failed",
+        )
+        job.exit_code = 1
+        job.finished_at = conductor.now()
+        job.log_path = log
+        state.jobs["ticket"] = job
+
+        with mock.patch.object(state.failure_store, "write") as write_mock:
+            state.job_status("ticket", None)
+            state.job_status("ticket", None)
+
+        write_mock.assert_called_once()
+        self.assertTrue(job.failure_record_written)
+
 
 class XCTestStallWatchdogTests(LifecycleTestCase):
     def make_watchdog_job(

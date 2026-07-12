@@ -52,6 +52,11 @@ FAILURE_CLASSES = {
     "unknown",
 }
 
+# Operation args that are unbounded, user-supplied strings or paths. These are
+# filtered out of aggregate failure records so the record never carries a raw
+# prompt, log contents, or a filesystem path.
+REDACTED_RECORD_ARG_KEYS = {"message", "logFile"}
+
 EXIT_CLASSES = {
     "completed",
     "timeout",
@@ -64,7 +69,7 @@ EXIT_CLASSES = {
 
 AGGREGATE_JSON_PRIVACY_NOTE = (
     "aggregate-only; excludes raw logs, source content, prompts, transcripts, "
-    "credentials, and environment dumps"
+    "credentials, environment dumps, and unbounded operation args"
 )
 
 
@@ -175,7 +180,7 @@ class FailureRecord:
             fingerprint=getattr(job, "fingerprint", None),
             operation=operation,
             operation_label=operation_display_name(operation, getattr(job, "args", {})),
-            args=dict(getattr(job, "args", {}) or {}),
+            args=filter_args_for_record(getattr(job, "args", {}) or {}),
             lanes=list(getattr(job, "lanes", []) or []),
             created_at=getattr(job, "created_at", None),
             started_at=getattr(job, "started_at", None),
@@ -254,6 +259,7 @@ class FailureRecord:
                 value = _field_default(field)
             kwargs[field.name] = value
 
+        kwargs["args"] = filter_args_for_record(kwargs.get("args"))
         return cls(**kwargs)
 
 
@@ -264,6 +270,13 @@ def _field_default(field: dataclasses.Field) -> Any:
     if field.default_factory is not None:
         return field.default_factory()
     return None
+
+
+def filter_args_for_record(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a copy of operation args with unbounded/redacted keys removed."""
+    if not args:
+        return {}
+    return {key: value for key, value in args.items() if key not in REDACTED_RECORD_ARG_KEYS}
 
 
 class FailureRecordStore:
@@ -288,6 +301,7 @@ class FailureRecordStore:
         self.max_records = max_records
         self.now = now
         self._lock = threading.RLock()
+        self._written_tickets: set[str] = set()
 
     def _record_path(self, ticket: str) -> Path:
         return self.jobs_dir / f"{ticket}.failure.json"
@@ -337,13 +351,20 @@ class FailureRecordStore:
 
         Both the record and its summary are written to temp files and then
         atomically renamed so readers never see a partially-written file.
+        If the record write fails after a summary was already replaced, the
+        summary is rolled back so the store is never left pointing to a record
+        that does not exist.
         """
         with self._lock:
             self.jobs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
             ticket = record.ticket
+            if ticket in self._written_tickets:
+                return self._record_path(ticket)
+
             summary_path = self._summary_path(ticket)
             record.resource_summary = dict(record.resource_summary)
+            summary_written = False
 
             if summary is not None:
                 try:
@@ -352,6 +373,7 @@ class FailureRecordStore:
                         json.dumps(summary, indent=2, sort_keys=True),
                     )
                     record.resource_summary["summaryPath"] = str(summary_path)
+                    summary_written = True
                 except OSError:
                     # Do not let a summary write failure point the record at a
                     # summary file that was not persisted.
@@ -366,8 +388,15 @@ class FailureRecordStore:
                     json.dumps(record.to_dict(), indent=2, sort_keys=True),
                 )
             except OSError as exc:
+                if summary_written:
+                    # Roll back the summary so an orphan summary file does not
+                    # reference a record that was not persisted.
+                    with contextlib.suppress(OSError):
+                        summary_path.unlink()
+                    record.resource_summary.pop("summaryPath", None)
                 raise FailureDiagnosticsError(f"could not write failure record: {exc}") from exc
 
+            self._written_tickets.add(ticket)
             self.retention_pass()
             return record_path
 

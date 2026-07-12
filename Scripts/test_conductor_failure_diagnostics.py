@@ -331,6 +331,59 @@ class FailureRecordTests(unittest.TestCase):
         self.assertEqual(payload["privacy"], failure_diagnostics.AGGREGATE_JSON_PRIVACY_NOTE)
         self.assertEqual(payload["count"], 1)
 
+    def test_record_from_job_filters_unbounded_args(self) -> None:
+        job = FakeJob(
+            args={
+                "product": "RepoPrompt",
+                "message": "secret user prompt",
+                "logFile": "/tmp/secret.log",
+                "filter": "ExampleTests",
+            }
+        )
+        record = failure_diagnostics.FailureRecord.from_job(job, output_summary=None)
+        self.assertEqual(record.args, {"product": "RepoPrompt", "filter": "ExampleTests"})
+        self.assertNotIn("message", record.args)
+        self.assertNotIn("logFile", record.args)
+
+    def test_from_dict_filters_unbounded_args(self) -> None:
+        data = {
+            "schemaVersion": 1,
+            "schemaLineage": "repoprompt-ce.failure-record",
+            "ticket": "abc",
+            "terminalState": "failed",
+            "failureClass": "testFailure",
+            "args": {
+                "product": "RepoPrompt",
+                "message": "secret user prompt",
+                "logFile": "/tmp/secret.log",
+            },
+        }
+        record = failure_diagnostics.FailureRecord.from_dict(data)
+        self.assertEqual(record.args, {"product": "RepoPrompt"})
+        self.assertNotIn("message", record.args)
+        self.assertNotIn("logFile", record.args)
+
+    def test_format_recent_failures_json_omits_redacted_args(self) -> None:
+        data = {
+            "schemaVersion": 1,
+            "schemaLineage": "repoprompt-ce.failure-record",
+            "ticket": "abc",
+            "terminalState": "failed",
+            "failureClass": "testFailure",
+            "args": {
+                "product": "RepoPrompt",
+                "message": "secret user prompt",
+                "logFile": "/tmp/secret.log",
+            },
+        }
+        record = failure_diagnostics.FailureRecord.from_dict(data)
+        output = failure_diagnostics.format_recent_failures([record], json_mode=True)
+        payload = json.loads(output)
+        args = payload["records"][0]["args"]
+        self.assertEqual(args, {"product": "RepoPrompt"})
+        self.assertNotIn("message", args)
+        self.assertNotIn("logFile", args)
+
 
 class FailureRecordStoreTests(unittest.TestCase):
     def make_store(self, **kwargs: Any) -> failure_diagnostics.FailureRecordStore:
@@ -545,6 +598,87 @@ class FailureRecordStoreTests(unittest.TestCase):
         store.retention_pass()
 
         self.assertTrue(temp_path.exists())
+
+    def test_write_suppresses_duplicate_per_ticket(self) -> None:
+        store = self.make_store()
+        record = failure_diagnostics.FailureRecord(
+            ticket="abc",
+            operation="test",
+            terminal_state="failed",
+            failure_class="testFailure",
+            recorded_at=time.time(),
+        )
+        summary = {"headline": "first"}
+        record_path = store.write(record, summary)
+        record_text = record_path.read_text(encoding="utf-8")
+        summary_text = store._summary_path("abc").read_text(encoding="utf-8")
+
+        record2 = failure_diagnostics.FailureRecord(
+            ticket="abc",
+            operation="build",
+            terminal_state="failed",
+            failure_class="compilerFailure",
+            recorded_at=time.time(),
+        )
+        summary2 = {"headline": "second"}
+        record_path2 = store.write(record2, summary2)
+
+        self.assertEqual(record_path, record_path2)
+        self.assertEqual(record_path.read_text(encoding="utf-8"), record_text)
+        self.assertEqual(store._summary_path("abc").read_text(encoding="utf-8"), summary_text)
+        loaded = store.load_all()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].operation, "test")
+        self.assertEqual(loaded[0].failure_class, "testFailure")
+
+    def test_concurrent_duplicate_writes_are_suppressed(self) -> None:
+        now = 1000000.0
+        store = self.make_store(now=lambda: now, max_age_seconds=3600, max_records=100)
+
+        def write_record() -> None:
+            record = failure_diagnostics.FailureRecord(
+                ticket="dup",
+                operation="test",
+                terminal_state="failed",
+                failure_class="testFailure",
+                recorded_at=now,
+                finished_at=now,
+            )
+            store.write(record, None)
+
+        threads = [threading.Thread(target=write_record) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        loaded = store.load_all()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].ticket, "dup")
+
+    def test_write_rolls_back_summary_when_record_write_fails(self) -> None:
+        store = self.make_store()
+        record = failure_diagnostics.FailureRecord(
+            ticket="abc",
+            operation="test",
+            terminal_state="failed",
+            failure_class="testFailure",
+            recorded_at=time.time(),
+        )
+        summary = {"headline": "first"}
+
+        def fake_write_text_atomic(path: Path, text: str) -> None:
+            if path.name.endswith(".summary.json"):
+                path.write_text(text, encoding="utf-8")
+            else:
+                raise OSError("disk full")
+
+        with patch.object(store, "_write_text_atomic", side_effect=fake_write_text_atomic):
+            with self.assertRaises(failure_diagnostics.FailureDiagnosticsError):
+                store.write(record, summary)
+
+        self.assertFalse(store._summary_path("abc").exists())
+        self.assertFalse(store._record_path("abc").exists())
 
 
 class ConductorIntegrationTests(unittest.TestCase):

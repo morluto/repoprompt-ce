@@ -1144,6 +1144,8 @@ class Job:
     diagnostic_paths: List[Path] = dataclasses.field(default_factory=list, repr=False)
     output_summary: Optional[Dict[str, Any]] = None
     tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
+    failure_record_pending: bool = False
+    failure_record_written: bool = False
 
     def to_payload(self, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         queue_wait_seconds = None
@@ -2174,10 +2176,13 @@ class DaemonState:
             self._release_global_heavy_slot(global_heavy_slot)
             if output_transport is not None:
                 output_transport.close_all()
-            refresh_after_release = False
+            # Persist the failure record before any job cleanup (in particular
+            # before retention pass) so the record owns the lifetime of the job
+            # summary and local log it references.
+            if job is not None and job.state in TERMINAL_STATES:
+                self._refresh_output_summary(job)
             with self.condition:
                 if job is not None:
-                    refresh_after_release = job.state in TERMINAL_STATES and job.output_summary is None
                     for lane in list(job.lanes):
                         if self.active_lanes.get(lane) == job.ticket:
                             del self.active_lanes[lane]
@@ -2185,8 +2190,6 @@ class DaemonState:
                     self._retention_pass_locked()
                 self._schedule_locked()
                 self.condition.notify_all()
-            if job is not None and refresh_after_release:
-                threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
 
     @staticmethod
     def _take_complete_output_lines(pending: bytearray, chunk: bytes) -> List[bytes]:
@@ -2563,17 +2566,32 @@ class DaemonState:
             job.timed_out,
             job.log_path,
         )
-        record = failure_diagnostics.FailureRecord.from_job(
-            job,
-            summary,
-            jobs_dir=self.paths.jobs_dir,
-        )
         with self.condition:
             current = self.jobs.get(job.ticket)
-            if current is job and current.output_summary is None:
-                current.output_summary = summary
-                self.condition.notify_all()
-        self.failure_store.write(record, summary)
+            if current is None or current is not job:
+                return
+            if current.failure_record_pending or current.failure_record_written:
+                return
+            current.failure_record_pending = True
+            # Snapshot the job state while protected by the condition, then
+            # persist the record outside the critical section.
+            record = failure_diagnostics.FailureRecord.from_job(
+                current,
+                summary,
+                jobs_dir=self.paths.jobs_dir,
+            )
+        try:
+            self.failure_store.write(record, summary)
+        except Exception as exc:
+            with self.condition:
+                current.failure_record_pending = False
+            self._append_system_line_locked(job, f"failure record write failed: {exc}\n")
+            return
+        with self.condition:
+            current.output_summary = summary
+            current.failure_record_written = True
+            current.failure_record_pending = False
+            self.condition.notify_all()
 
     def _append_tail_locked(self, job: Job, text: str) -> None:
         lines = text.splitlines(keepends=True)
