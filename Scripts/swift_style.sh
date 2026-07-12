@@ -142,7 +142,12 @@ collect_swift_files(){
         done < "$changed_file"
         rm -f -- "$changed_file"
         if (( fallback == 0 )); then
-            mapfile -t SWIFT_FILES < <(printf '%s\n' "${SWIFT_FILES[@]}" | sed '/^$/d' | LC_ALL=C sort -u)
+            local sorted
+            sorted="$(printf '%s\n' "${SWIFT_FILES[@]}" | sed '/^$/d' | LC_ALL=C sort -u)"
+            SWIFT_FILES=()
+            while IFS= read -r file; do
+                [[ -n "$file" ]] && SWIFT_FILES+=("$file")
+            done <<< "$sorted"
             SWIFT_FILES_COLLECTED=1
             return
         fi
