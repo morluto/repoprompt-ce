@@ -79,7 +79,8 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         try await waitUntil { provider.callCount == 2 }
         helper.clickSuggestionForTesting(at: 1)
         provider.completeRefresh()
-        try await waitUntil { helper.suggestionsForTesting == [refreshed] }
+        try await waitUntil { provider.completedRefreshCount == 1 }
+        XCTAssertEqual(helper.suggestionsForTesting, [first, clicked])
 
         let handled = helper.handleCommandIfNeeded(
             textView: textView,
@@ -106,6 +107,7 @@ private final class DelayedSuggestionProvider {
     let refreshed: [MentionSuggestion]
     private var continuation: CheckedContinuation<[MentionSuggestion], Never>?
     private(set) var callCount = 0
+    private(set) var completedRefreshCount = 0
 
     init(initial: [MentionSuggestion], refreshed: [MentionSuggestion]) {
         self.initial = initial
@@ -117,9 +119,11 @@ private final class DelayedSuggestionProvider {
         if callCount == 1 {
             return initial
         }
-        return await withCheckedContinuation { continuation in
+        let suggestions = await withCheckedContinuation { continuation in
             self.continuation = continuation
         }
+        completedRefreshCount += 1
+        return suggestions
     }
 
     func completeRefresh() {

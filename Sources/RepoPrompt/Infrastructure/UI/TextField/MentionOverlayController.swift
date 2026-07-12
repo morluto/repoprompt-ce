@@ -107,13 +107,6 @@ final class MentionOverlayController {
         for w in windows {
             w.orderOut(nil)
             w.parent?.removeChildWindow(w)
-            // Clear the SwiftUI hosting content before the window is released.
-            // On macOS 26, NSHostingView deallocation during window teardown can
-            // trigger an InvalidTransition from SwiftUI's internal phase state
-            // machine (phase: idle → targetPhase: failed(deinit)). Releasing the
-            // hosting view explicitly lets SwiftUI tear down while the window is
-            // still alive and its phase is valid.
-            w.clearHostingContentForTeardown()
         }
         windows.removeAll()
         ownerWindow = nil
@@ -574,16 +567,6 @@ extension MentionOverlayController {
             }
 
             setFrame(f, display: true)
-        }
-
-        /// Remove the SwiftUI hosting view from the window's content hierarchy.
-        /// On macOS 26, deallocating an `NSHostingView` during `NSWindow` teardown
-        /// can trigger `InvalidTransition { phase: idle, targetPhase: failed(deinit) }`
-        /// from SwiftUI's internal phase state machine. Clearing `contentView`
-        /// while the window is still alive lets SwiftUI tear down gracefully.
-        func clearHostingContentForTeardown() {
-            hostingView = nil
-            contentView = nil
         }
     }
 }
