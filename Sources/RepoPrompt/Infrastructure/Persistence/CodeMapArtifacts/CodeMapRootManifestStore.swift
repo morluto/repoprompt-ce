@@ -774,10 +774,13 @@ actor CodeMapRootManifestStore {
         ) == snapshot else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
-        // The pre-publication reconciliation above already projected this exact encoded byte
-        // count while holding the same maintenance lock. No competing writer can change quota
-        // authority before this point, so rescanning and decoding the entire manifest store
-        // after the atomic replacement is redundant and can monopolize a cooperative executor.
+        _ = try reconcileLocked(
+            layout: layout,
+            maximumEntries: nil,
+            protectingDigest: name,
+            incomingByteCount: 0,
+            replacedByteCount: 0
+        )
         if semanticUnchanged {
             return .unchanged(manifestGeneration: nextGeneration)
         }
