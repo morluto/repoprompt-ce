@@ -5707,9 +5707,16 @@ extension PromptViewModel {
                 bindings: bindings
             )
         }
+        guard let artifactWorkspaceDirectory = try? manager.featureArtifactStorage(for: workspace).workspaceDirectory else {
+            return .automaticOnly(
+                base: effectiveBase,
+                workspaceRootPaths: workspace.repoPaths,
+                bindings: bindings
+            )
+        }
         return await FrozenPromptGitReviewContext.make(
             workspaceID: workspace.id,
-            workspaceDirectoryPath: manager.workspaceDirectory(for: workspace).path,
+            workspaceDirectoryPath: artifactWorkspaceDirectory.path,
             workspaceRootPaths: workspace.repoPaths,
             tabID: creatorTabID,
             sessionID: sessionID,

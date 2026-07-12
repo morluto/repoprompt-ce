@@ -522,7 +522,14 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         guard let workspace = workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
         }
-        let workspaceDirectory = workspaceManager.workspaceDirectory(for: workspace)
+        // Reads, publication, selection ingress, and later artifact lookup must share
+        // one storage authority. Ephemeral workspaces use their lifecycle-managed
+        // temporary root here; mixing it with the durable workspace directory makes
+        // freshly published artifacts appear unmapped to Context Builder.
+        let workspaceDirectory = try Self.persistentArtifactDirectory(
+            workspaceManager: workspaceManager,
+            workspace: workspace
+        )
         let store = GitDiffSnapshotStore()
         let vcsService = VCSService.shared
 
@@ -1116,11 +1123,6 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
             // If artifacts requested, use the publisher
             if artifacts {
-                let workspaceDirectory = try Self.persistentArtifactDirectory(
-                    workspaceManager: workspaceManager,
-                    workspace: workspace
-                )
-
                 let modeRaw = args["mode"]?.stringValue?.lowercased() ?? "standard"
                 guard let mode = GitDiffPublishMode(rawValue: modeRaw) else {
                     throw MCPError.invalidParams("Invalid mode: \(modeRaw)")

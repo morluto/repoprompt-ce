@@ -7892,19 +7892,21 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaces[index].repoPaths.append(path)
             workspaces[index].dateModified = Date()
 
-            // Save asynchronously and flush for cross-window consistency
-            do {
-                let workspaceToSave = workspaces[index]
-                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, preserveDiskRepoPathsIfUnchangedSinceBaseline: false, source: .rootAdd)
-                await WorkspaceDiskWriter.shared.flush(url: finalURL)
-                recordRepoPathBaseline(for: workspaceToSave)
-                await rebuildAndSaveIndexAsync()
-                await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
-                postWorkspaceRepoPathsDidChange(for: workspaceToSave.id)
-            } catch {
-                print("Error saving workspace after adding folder: \(error)")
-                throw error
+            let workspaceToSave = workspaces[index]
+            if workspaceToSave.persistenceDisposition == .persistent {
+                // Save asynchronously and flush for cross-window consistency.
+                do {
+                    let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, preserveDiskRepoPathsIfUnchangedSinceBaseline: false, source: .rootAdd)
+                    await WorkspaceDiskWriter.shared.flush(url: finalURL)
+                    recordRepoPathBaseline(for: workspaceToSave)
+                    await rebuildAndSaveIndexAsync()
+                    await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
+                } catch {
+                    print("Error saving workspace after adding folder: \(error)")
+                    throw error
+                }
             }
+            postWorkspaceRepoPathsDidChange(for: workspaceToSave.id)
         }
 
         if workspace.id == activeWorkspace?.id {
