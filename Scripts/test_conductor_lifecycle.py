@@ -1942,6 +1942,39 @@ class SwiftJobsTests(LifecycleTestCase):
                     f"mismatch for {value!r}: python={python_valid}, shell={shell_valid}",
                 )
 
+    def test_invalid_swift_jobs_env_does_not_affect_non_swift_ops(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        # Invalid REPOPROMPT_SWIFT_JOBS should be ignored by sleep operations.
+        payload = state.enqueue(
+            {
+                "operation": "sleep",
+                "args": {"seconds": 0.1},
+                "env": {"REPOPROMPT_SWIFT_JOBS": "0"},
+            }
+        )
+        result = state.job_wait(payload["ticket"], None, timeout=5.0)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(result["exitCode"], 0)
+        self.assertNotIn("positive integer", (result.get("error") or "").lower())
+
+    def test_swift_build_all_rejects_invalid_swift_jobs_env_at_daemon(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        # swift-build product all uses __operation_runner, so the daemon must be
+        # the one that validates the limit in _run_job.
+        env = {"REPOPROMPT_SWIFT_JOBS": "0", "REPOPROMPT_DEV_HEAVY_SLOTS": "8"}
+        payload = state.enqueue(
+            {
+                "operation": "swift-build",
+                "args": {"product": "all"},
+                "env": env,
+            }
+        )
+        result = state.job_wait(payload["ticket"], None, timeout=5.0)
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("positive integer", (result.get("error") or "").lower())
+
 
 class ProcessTreeCancellationTests(LifecycleTestCase):
     def wait_until(self, predicate, timeout: float = 5.0) -> bool:

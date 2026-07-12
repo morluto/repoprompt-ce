@@ -2046,7 +2046,13 @@ class DaemonState:
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
                     return
-            swift_jobs_limit = configured_swift_jobs(env)
+            # Only parse/validate the Swift jobs limit for SwiftPM-invoking operations.
+            # Packaging/build scripts read REPOPROMPT_SWIFT_JOBS themselves and must not
+            # be blocked here; sleep/diagnostics and other lanes must not be affected.
+            if job.operation in {"swift-build", "test", "provider-test"}:
+                swift_jobs_limit = configured_swift_jobs(env)
+            else:
+                swift_jobs_limit = None
             start_line = f"$ {format_argv(argv)}\n"
             with job.log_path.open("ab") as log_file:
                 with self.lock:
