@@ -796,9 +796,15 @@ class LifecycleQueueTests(LifecycleTestCase):
             with state.condition:
                 job = state.jobs[ticket]
                 # A job becomes terminal before the runner's final persistence
-                # and lane-release work is complete. Wait for that finalizer so
-                # TemporaryDirectory cleanup cannot race its record write.
-                if job.state in conductor.TERMINAL_STATES and ticket not in state.active_lanes.values():
+                # and lane-release work is complete. The output-summary refresh
+                # is deliberately started after lanes are released, so waiting
+                # only for lane release still lets TemporaryDirectory cleanup
+                # race that final read of the job log.
+                if (
+                    job.state in conductor.TERMINAL_STATES
+                    and ticket not in state.active_lanes.values()
+                    and job.output_summary is not None
+                ):
                     return job
             time.sleep(0.01)
         with state.condition:
