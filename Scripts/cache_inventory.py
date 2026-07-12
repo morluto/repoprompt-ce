@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -487,12 +488,232 @@ def operation_diagnostics_build_cache(repo_root: Path, args: Dict[str, Any]) -> 
     return 0
 
 
+@dataclasses.dataclass
+class BuildCacheEntry:
+    path: Path
+    repo_root: Path
+    identity: SwiftPMCacheIdentity
+    size_bytes: Optional[int]
+    mtime: Optional[float]
+    current: bool
+    skip_reasons: List[str]
+
+    @property
+    def eligible(self) -> bool:
+        return not self.skip_reasons
+
+
+@dataclasses.dataclass
+class BuildCacheCleanupPlan:
+    entries: List[BuildCacheEntry]
+    apply: bool
+    dry_run: bool
+    confirmed: bool
+
+    @property
+    def eligible_entries(self) -> List[BuildCacheEntry]:
+        return [e for e in self.entries if e.eligible]
+
+    @property
+    def total_size_bytes(self) -> int:
+        return sum(e.size_bytes or 0 for e in self.eligible_entries)
+
+    def to_text(self) -> str:
+        lines: List[str] = []
+        lines.append("Build cache cleanup plan")
+        lines.append(f"dry_run={self.dry_run} apply={self.apply} confirmed={self.confirmed}")
+        if not self.eligible_entries:
+            lines.append("No eligible cache directories to remove.")
+        else:
+            lines.append(f"Eligible directories ({len(self.eligible_entries)} entries, {format_bytes(self.total_size_bytes)}):")
+            for e in self.eligible_entries:
+                mtime_text = "unknown" if e.mtime is None else time.strftime("%Y-%m-%d %H:%M", time.localtime(e.mtime))
+                lines.append(f"  {format_bytes(e.size_bytes):>9}  {e.path}  modified={mtime_text}")
+        skipped = [e for e in self.entries if not e.eligible]
+        if skipped:
+            lines.append(f"Skipped directories ({len(skipped)}):")
+            for e in skipped:
+                reasons = ", ".join(e.skip_reasons)
+                lines.append(f"  {format_bytes(e.size_bytes):>9}  {e.path}  reasons={reasons}")
+        return "\n".join(lines)
+
+
+def plan_build_cache_cleanup(
+    repo_root: Path,
+    *,
+    dry_run: bool = True,
+    apply: bool = False,
+    confirm: bool = False,
+    limit: Optional[int] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> BuildCacheCleanupPlan:
+    """Build a conservative, safety-checked plan for cache cleanup.
+
+    By default the plan is dry-run. Actual deletion requires both apply=True and
+    confirm=True, and the caller must ensure the current .build is never removed.
+    """
+    if env is None:
+        env = dict(os.environ)
+    resolved_root = repo_root.resolve()
+    repo_roots = managed_worktree_repo_roots(resolved_root)
+    entries: List[BuildCacheEntry] = []
+    seen_paths: set[Path] = set()
+
+    for config in ("debug", "release"):
+        identity = resolve_swiftpm_cache_identity(resolved_root, config, env)
+        configuration = identity.configuration
+
+        def add_entry(path: Path, worktree_root: Path, current: bool) -> None:
+            try:
+                path = path.resolve()
+            except OSError:
+                pass
+            if path in seen_paths:
+                return
+            seen_paths.add(path)
+            if not path.exists():
+                return
+
+            skip_reasons: List[str] = []
+            if current:
+                skip_reasons.append("current")
+            roots: List[Path] = list(repo_roots)
+            if identity.developer_root:
+                roots.append(Path(identity.developer_root))
+            if not any(is_path_within(path, r) for r in roots):
+                skip_reasons.append("out-of-scope")
+            if path.is_symlink():
+                skip_reasons.append("symlink")
+            if is_active_swiftpm_scratch(path):
+                skip_reasons.append("active-lock")
+            if is_live_bound_to_path(path, worktree_root):
+                skip_reasons.append("live-bound")
+            if is_dirty_worktree(worktree_root):
+                skip_reasons.append("dirty-worktree")
+
+            size = directory_size_bytes(path)
+            mtime = latest_mtime(path)
+            entry_identity = resolve_swiftpm_cache_identity(worktree_root, configuration, env)
+            entries.append(
+                BuildCacheEntry(
+                    path=path,
+                    repo_root=worktree_root,
+                    identity=entry_identity,
+                    size_bytes=size,
+                    mtime=mtime,
+                    current=current,
+                    skip_reasons=skip_reasons,
+                )
+            )
+
+        for worktree_root in repo_roots:
+            worktree_identity = resolve_swiftpm_cache_identity(worktree_root, configuration, env)
+            add_entry(worktree_identity.effective_path, worktree_root, worktree_root == resolved_root)
+            legacy_build = worktree_root / ".build"
+            if legacy_build != worktree_identity.effective_path and legacy_build.exists():
+                add_entry(legacy_build, worktree_root, worktree_root == resolved_root)
+
+        if identity.developer_root:
+            for candidate in _list_developer_root_candidates(resolved_root, identity.developer_root, configuration):
+                if candidate in seen_paths:
+                    continue
+                add_entry(candidate, resolved_root, current=False)
+
+    entries.sort(key=lambda e: (not e.skip_reasons, e.current, e.path.name), reverse=True)
+    if limit is not None:
+        entries = entries[:limit]
+    return BuildCacheCleanupPlan(entries=entries, apply=apply, dry_run=dry_run, confirmed=confirm)
+
+
+def execute_build_cache_cleanup(plan: BuildCacheCleanupPlan) -> int:
+    """Execute a prepared cleanup plan. Returns 0 on success, 1 on failure."""
+    if not plan.apply:
+        print(plan.to_text())
+        return 0
+    if not plan.confirmed:
+        print("ERROR: cache cleanup --apply requires --confirm", file=sys.stderr)
+        return 1
+    if not plan.eligible_entries:
+        print(plan.to_text())
+        return 0
+
+    failed = 0
+    for entry in plan.eligible_entries:
+        try:
+            if not entry.path.exists() or entry.path.is_symlink():
+                print(f"Skipping {entry.path}: no longer present or is a symlink", flush=True)
+                continue
+            if is_active_swiftpm_scratch(entry.path):
+                print(f"Skipping {entry.path}: active lock acquired since plan", flush=True)
+                continue
+            if is_live_bound_to_path(entry.path, entry.repo_root):
+                print(f"Skipping {entry.path}: became live-bound since plan", flush=True)
+                continue
+            scope_roots: List[Path] = [entry.repo_root]
+            if entry.identity.developer_root:
+                scope_roots.append(Path(entry.identity.developer_root).expanduser().resolve())
+            if entry.identity.exact_path:
+                scope_roots.append(Path(entry.identity.exact_path).expanduser().resolve())
+            if not any(is_path_within(entry.path, r) for r in scope_roots):
+                print(f"Skipping {entry.path}: out of scope since plan", flush=True)
+                continue
+            if is_dirty_worktree(entry.repo_root):
+                print(f"Skipping {entry.path}: worktree became dirty since plan", flush=True)
+                continue
+            print(f"Removing {entry.path}", flush=True)
+            shutil.rmtree(entry.path)
+        except OSError as exc:
+            print(f"ERROR: failed to remove {entry.path}: {exc}", file=sys.stderr)
+            failed += 1
+    if failed:
+        return 1
+    print(f"Removed {len(plan.eligible_entries)} cache directories ({format_bytes(plan.total_size_bytes)}).")
+    return 0
+
+
+def operation_cache_cleanup(repo_root: Path, args: Dict[str, Any]) -> int:
+    env = args.get("env") or dict(os.environ)
+    dry_run = not bool(args.get("apply"))
+    apply = bool(args.get("apply"))
+    confirm = bool(args.get("confirm"))
+    limit = args.get("limit")
+    if limit is not None:
+        limit = max(1, int(limit))
+    plan = plan_build_cache_cleanup(
+        repo_root,
+        dry_run=dry_run,
+        apply=apply,
+        confirm=confirm,
+        limit=limit,
+        env=env,
+    )
+    if not apply:
+        print(plan.to_text())
+        return 0
+    return execute_build_cache_cleanup(plan)
+
+
 def _command_line_path() -> int:
     parser = argparse.ArgumentParser(prog="cache_inventory.py")
     parser.add_argument("--repo-root", required=True, type=Path)
     parser.add_argument("--configuration", default="debug")
     parser.add_argument("--format", choices=["path", "json", "key", "identity"], default="path")
+    parser.add_argument("--cleanup-plan", action="store_true")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
     ns = parser.parse_args()
+
+    if ns.cleanup_plan:
+        plan = plan_build_cache_cleanup(
+            ns.repo_root,
+            dry_run=not ns.apply,
+            apply=ns.apply,
+            confirm=ns.confirm,
+            limit=ns.limit,
+        )
+        print(plan.to_text())
+        return execute_build_cache_cleanup(plan) if ns.apply else 0
 
     identity = resolve_swiftpm_cache_identity(ns.repo_root, ns.configuration)
     if ns.format == "path":

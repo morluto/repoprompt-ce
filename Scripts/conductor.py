@@ -39,6 +39,7 @@ from debug_app_process import ProcessIdentityError, matching_processes, terminat
 import cache_inventory
 from cache_inventory import (
     BUILD_CACHE_DIAGNOSTIC_MAX_ROWS,
+    operation_cache_cleanup,
     operation_diagnostics_build_cache,
 )
 
@@ -104,6 +105,7 @@ IMPLEMENTED_OPERATIONS = {
     "app",
     "smoke",
     "diagnostics",
+    "cache",
     "release",
 }
 
@@ -153,6 +155,7 @@ Operation commands:
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
+  ./conductor cache cleanup [--dry-run|--apply --confirm] [--limit <n>]
   ./conductor release preflight|artifact|package|local-install
 
 Foundation validation operation:
@@ -1430,6 +1433,10 @@ class OperationRegistry:
                 return self._internal_argv("diagnostics_agent_mode_on", dict(args)), ["debugArtifact", "liveApp"], cwd, env, effective_timeout
             if subcommand == "build-cache":
                 return self._internal_argv("diagnostics_build_cache", dict(args)), lanes, cwd, env, effective_timeout
+        if operation == "cache":
+            subcommand = args.get("subcommand")
+            if subcommand == "cleanup":
+                return self._internal_argv("cache_cleanup", dict(args)), lanes, cwd, env, effective_timeout
         if operation == "release":
             subcommand = args.get("subcommand")
             if subcommand == "package":
@@ -4435,6 +4442,8 @@ def run_operation_runner(payload_json: str) -> int:
         return operation_diagnostics_agent_mode_on(repo_root, args)
     if kind == "diagnostics_build_cache":
         return operation_diagnostics_build_cache(repo_root, args)
+    if kind == "cache_cleanup":
+        return operation_cache_cleanup(repo_root, args)
     if kind == "release_preflight_missing":
         return operation_release_preflight_missing(repo_root)
     print(f"unknown internal operation runner kind: {kind}", file=sys.stderr)
@@ -4612,6 +4621,21 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         elif ns.subcommand == "build-cache":
             if ns.limit <= 0:
                 raise ConductorError("diagnostics build-cache --limit must be greater than zero")
+            args["limit"] = ns.limit
+    elif operation == "cache":
+        parser = argparse.ArgumentParser(prog="conductor cache")
+        subparsers = parser.add_subparsers(dest="subcommand", required=True)
+        cleanup = subparsers.add_parser("cleanup")
+        cleanup.add_argument("--apply", action="store_true")
+        cleanup.add_argument("--confirm", action="store_true")
+        cleanup.add_argument("--limit", type=int, default=None)
+        ns = parser.parse_args(rest)
+        args["subcommand"] = ns.subcommand
+        if ns.subcommand == "cleanup":
+            if ns.limit is not None and ns.limit <= 0:
+                raise ConductorError("cache cleanup --limit must be greater than zero")
+            args["apply"] = ns.apply
+            args["confirm"] = ns.confirm
             args["limit"] = ns.limit
     elif operation == "release":
         parser = argparse.ArgumentParser(prog="conductor release")
