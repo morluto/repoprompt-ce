@@ -549,6 +549,13 @@ struct WorkspaceAppliedIndexRootSnapshot: Equatable {
     let folders: [WorkspaceFolderRecord]
 }
 
+struct WorkspaceAppliedIndexRecordLookup: Equatable {
+    let root: WorkspaceRootRecord
+    let generation: UInt64
+    let filesByID: [UUID: WorkspaceFileRecord]
+    let foldersByID: [UUID: WorkspaceFolderRecord]
+}
+
 struct WorkspaceSliceRebasePathState: Equatable {
     let rootID: UUID
     let rootLifetimeID: UUID

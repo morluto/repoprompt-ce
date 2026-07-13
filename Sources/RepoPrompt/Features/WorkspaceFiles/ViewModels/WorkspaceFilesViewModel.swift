@@ -2020,10 +2020,14 @@ class WorkspaceFilesViewModel: ObservableObject {
             ))
         }
 
-        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
-              snapshot.root.id == event.rootID,
-              snapshot.root.standardizedFullPath == rootKey,
-              snapshot.generation >= event.generation
+        guard let lookup = await workspaceFileContextStore.appliedIndexRecordLookup(
+            rootID: event.rootID,
+            fileIDs: missingFileIDs,
+            folderIDs: missingFolderIDs
+        ),
+            lookup.root.id == event.rootID,
+            lookup.root.standardizedFullPath == rootKey,
+            lookup.generation >= event.generation
         else {
             return .requiresCanonicalResync
         }
@@ -2045,9 +2049,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         }
 
-        let canonicalFilesByID = Dictionary(uniqueKeysWithValues: snapshot.files.map { ($0.id, $0) })
         for fileID in missingFileIDs {
-            guard let record = canonicalFilesByID[fileID] else {
+            guard let record = lookup.filesByID[fileID] else {
                 return .requiresCanonicalResync
             }
             let fileByID = fileHierarchyIndex.filesByID[fileID]
@@ -2068,9 +2071,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         }
 
-        let canonicalFoldersByID = Dictionary(uniqueKeysWithValues: snapshot.folders.map { ($0.id, $0) })
         for folderID in missingFolderIDs {
-            guard let record = canonicalFoldersByID[folderID] else {
+            guard let record = lookup.foldersByID[folderID] else {
                 return .requiresCanonicalResync
             }
             let folderByID = fileHierarchyIndex.foldersByID[folderID]

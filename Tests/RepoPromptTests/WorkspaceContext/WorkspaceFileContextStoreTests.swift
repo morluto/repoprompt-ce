@@ -68,6 +68,41 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         XCTAssertEqual(scopedA?.location.absolutePath, rootA.appendingPathComponent("shared/file.txt").path)
     }
 
+    #if DEBUG
+        func testAppliedIndexRecordLookupReturnsOnlyRequestedCanonicalMembersWithBoundedWork() async throws {
+            let rootURL = try makeTemporaryRoot(name: "AppliedIndexRecordLookup")
+            try write("let first = true", to: rootURL.appendingPathComponent("Sources/First.swift"))
+            try write("let second = true", to: rootURL.appendingPathComponent("Sources/Second.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let files = await store.files(inRoot: root.id)
+            let folders = await store.folders(inRoot: root.id)
+            let first = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/First.swift" })
+            let sources = try XCTUnwrap(folders.first { $0.standardizedRelativePath == "Sources" })
+            let absentFileID = UUID()
+
+            await store.resetFilesInRootRequestCountForTesting()
+            await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
+            let lookup = await store.appliedIndexRecordLookup(
+                rootID: root.id,
+                fileIDs: [first.id, absentFileID],
+                folderIDs: [sources.id]
+            )
+
+            XCTAssertEqual(lookup?.root, root)
+            XCTAssertEqual(lookup?.generation, 0)
+            XCTAssertEqual(lookup?.filesByID, [first.id: first])
+            XCTAssertEqual(lookup?.foldersByID, [sources.id: sources])
+            let diagnostics = await store.appliedIndexRecordLookupDiagnosticsForTesting()
+            XCTAssertEqual(diagnostics.lookupRequests, 1)
+            XCTAssertEqual(diagnostics.requestedRecords, 3)
+            XCTAssertEqual(diagnostics.rootSnapshots, 0)
+            let enumerationCount = await store.fileEnumerationRequestCountForTesting()
+            XCTAssertEqual(enumerationCount, 0)
+        }
+    #endif
+
     func testStaticPathAndSearchSnapshotCachesReuseScopesAndBoundLRU() async throws {
         do {
             let caseLabel = "testRepeatedPathLookupReusesStaticSnapshotForUnchangedCatalogGeneration"
