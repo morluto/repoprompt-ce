@@ -582,6 +582,19 @@ class GlobalSettingsStore: ObservableObject {
             return AIModel.rawValueWithoutOpenAIServiceTier(raw)
         }
 
+        func normalizedTieredRoleOverrides(_ overrides: [String: String]?) -> [String: String]? {
+            overrides?.mapValues { raw in
+                guard let selection = AgentModelSelectionID.parse(raw) else { return raw }
+                let modelRaw = AIModel.rawValueWithoutOpenAIServiceTier(selection.modelRaw)
+                guard modelRaw != selection.modelRaw,
+                      !modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else {
+                    return raw
+                }
+                return AgentModelSelectionID(agentRaw: selection.agentRaw, modelRaw: modelRaw).rawValue
+            }
+        }
+
         var globalChanged = false
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         let planning = normalized(modelSelection.planningModel)
@@ -599,6 +612,11 @@ class GlobalSettingsStore: ObservableObject {
                 globalChanged = true
             }
         }
+        let roleOverrides = normalizedTieredRoleOverrides(globalDefaults.mcpAgentRoleOverrides)
+        if roleOverrides != globalDefaults.mcpAgentRoleOverrides {
+            globalDefaults.mcpAgentRoleOverrides = roleOverrides
+            globalChanged = true
+        }
 
         var changedWorkspaceIDs: [UUID] = []
         for workspaceID in agentModelsSettingsByWorkspaceID.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
@@ -609,6 +627,7 @@ class GlobalSettingsStore: ObservableObject {
             if let models = profile.contextBuilderModelsByAgent {
                 profile.contextBuilderModelsByAgent = models.mapValues { AIModel.rawValueWithoutOpenAIServiceTier($0) }
             }
+            profile.mcpAgentRoleOverrides = normalizedTieredRoleOverrides(profile.mcpAgentRoleOverrides)
             guard profile != old else { continue }
             settings.profile = profile
             agentModelsSettingsByWorkspaceID[workspaceID] = settings

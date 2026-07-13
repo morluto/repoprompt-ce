@@ -1517,15 +1517,27 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     func saveOpenAIShowServiceTierVariants() {
-        let wasEnabled = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
-        // When turning variants OFF, normalize saved model preferences to strip tier wrappers
-        if wasEnabled, !openAIShowServiceTierVariants {
-            GlobalSettingsStore.shared.normalizeDisabledOpenAIServiceTierVariants()
-        }
-        UserDefaults.standard.set(openAIShowServiceTierVariants, forKey: "openAIShowServiceTierVariants")
+        Self.persistOpenAIShowServiceTierVariants(openAIShowServiceTierVariants)
 
         Task {
             await updateAvailableModels()
+        }
+    }
+
+    @MainActor
+    static func persistOpenAIShowServiceTierVariants(
+        _ enabled: Bool,
+        defaults: UserDefaults = .standard,
+        normalizeDisabledVariants: @MainActor () -> Void = {
+            GlobalSettingsStore.shared.normalizeDisabledOpenAIServiceTierVariants()
+        }
+    ) {
+        let wasEnabled = defaults.bool(forKey: "openAIShowServiceTierVariants")
+        defaults.set(enabled, forKey: "openAIShowServiceTierVariants")
+
+        // Install the parsing policy before synchronous Agent Models notifications fire.
+        if wasEnabled, !enabled {
+            normalizeDisabledVariants()
         }
     }
 

@@ -2121,19 +2121,37 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
     func testTierCleanupNormalizesAllAgentModelsProfilesInOneSaveAndNotifiesExactScopes() throws {
         let workspaceID = UUID()
         let tierRaw = AIModel.openAIServiceTierVariant(base: .gpt54Pro, tier: "flex").rawValue
+        let tierSelectionRaw = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: tierRaw
+        ).rawValue
+        let normalizedSelectionRaw = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AIModel.gpt54Pro.rawValue
+        ).rawValue
+        let emptyBaseSelectionRaw = "\(AgentProviderKind.codexExec.rawValue):openai_tier__flex__"
+        let parseInvalidSelectionRaw = "agent-selection:\(AgentProviderKind.codexExec.rawValue):\(tierRaw)"
         let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             agentModelsSettings: [
                 workspaceID: WorkspaceAgentModelsSettings(
                     inheritanceMode: .useWorkspaceOverrides,
                     profile: AgentModelsSettingsProfile(
                         planningModelRaw: tierRaw,
-                        preferredComposeModelRaw: tierRaw
+                        preferredComposeModelRaw: tierRaw,
+                        mcpAgentRoleOverrides: [
+                            "explore": tierSelectionRaw,
+                            "engineer": emptyBaseSelectionRaw
+                        ]
                     )
                 )
             ],
             globalDefaults: GlobalDefaults(
                 discoverAgentRaw: AgentProviderKind.codexExec.rawValue,
-                discoverModelsByAgent: [AgentProviderKind.codexExec.rawValue: tierRaw]
+                discoverModelsByAgent: [AgentProviderKind.codexExec.rawValue: tierRaw],
+                mcpAgentRoleOverrides: [
+                    "code": tierSelectionRaw,
+                    "review": parseInvalidSelectionRaw
+                ]
             ),
             scalarPreferences: GlobalScalarPreferences(
                 modelSelection: .init(preferredComposeModel: tierRaw, planningModel: tierRaw)
@@ -2153,11 +2171,43 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             store.globalAgentModelsProfile().contextBuilderModelsByAgent?[AgentProviderKind.codexExec.rawValue],
             AIModel.gpt54Pro.rawValue
         )
+        XCTAssertEqual(store.globalAgentModelsProfile().mcpAgentRoleOverrides?["code"], normalizedSelectionRaw)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().mcpAgentRoleOverrides?["review"],
+            parseInvalidSelectionRaw,
+            "Parse-invalid overrides must survive byte-identical"
+        )
         XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["explore"],
+            normalizedSelectionRaw
+        )
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["engineer"],
+            emptyBaseSelectionRaw,
+            "A parsed tier wrapper with an empty base must survive without reconstruction"
+        )
         XCTAssertEqual(Set(recorder.snapshot().compactMap(\.scope)), Set(["global", "workspace"]))
 
         store.normalizeDisabledOpenAIServiceTierVariants()
         XCTAssertEqual(fileStore.saveCount, 1, "Cleanup must be idempotent")
+    }
+
+    func testDisablingServiceTierVariantsInstallsParsingPolicyBeforeCleanup() throws {
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: "openAIShowServiceTierVariants")
+        var policyObservedDuringCleanup: Bool?
+
+        APISettingsViewModel.persistOpenAIShowServiceTierVariants(
+            false,
+            defaults: defaults,
+            normalizeDisabledVariants: {
+                policyObservedDuringCleanup = defaults.bool(forKey: "openAIShowServiceTierVariants")
+            }
+        )
+
+        XCTAssertEqual(policyObservedDuringCleanup, false)
+        XCTAssertFalse(defaults.bool(forKey: "openAIShowServiceTierVariants"))
     }
 
     func testReloadNotifiesChangedAndRemovedAgentModelsScopesAfterInstallation() throws {
