@@ -1650,7 +1650,10 @@ fi
         )[0]
         self.assertNotIn("updaterController.startUpdater()", manager_init)
         self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
-        self.assertIn("guard updaterStarted, sparkleConfigurationValid else { return false }", sparkle_manager)
+        self.assertIn(
+            "guard updaterStarted, sparkleConfigurationValid, activeUserInitiatedChannel == nil else {",
+            sparkle_manager,
+        )
 
     def test_ci_secret_scan_covers_introduced_commit_range_and_checked_out_tree(self) -> None:
         workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
