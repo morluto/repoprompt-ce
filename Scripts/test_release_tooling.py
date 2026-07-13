@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1987,14 +1988,20 @@ sys.stdout.write(str(status))
             ]
         ).stdout.strip()
 
-        def write_appcast(enclosure_signature: str) -> None:
+        def write_appcast(
+            enclosure_signature: str,
+            *,
+            title: str = "Tip build v9.8.7",
+            display_version: str = "Tip build v9.8.7",
+        ) -> None:
             appcast.write_text(
                 f"""<?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
     <item>
+      <title>{title}</title>
       <sparkle:version>1.2.3</sparkle:version>
-      <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+      <sparkle:shortVersionString>{display_version}</sparkle:shortVersionString>
       <enclosure url="https://example.invalid/tip/{archive.name}"
                  length="{archive.stat().st_size}"
                  sparkle:edSignature="{enclosure_signature}" />
@@ -2039,10 +2046,73 @@ validate_generated_tip_appcast""",
         accepted = subprocess.run(command, env=env, text=True, capture_output=True)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
+        duplicate_version_tree = ET.parse(appcast)
+        duplicate_version_item = duplicate_version_tree.getroot().find("./channel/item")
+        self.assertIsNotNone(duplicate_version_item)
+        assert duplicate_version_item is not None
+        ET.SubElement(
+            duplicate_version_item,
+            "{http://www.andymatuschak.org/xml-namespaces/sparkle}version",
+        ).text = "999"
+        duplicate_version_tree.write(appcast, encoding="utf-8", xml_declaration=True)
+        rejected_duplicate_version = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_duplicate_version.returncode, 0)
+        self.assertIn(
+            "tip appcast item must contain exactly one sparkle:version",
+            rejected_duplicate_version.stderr,
+        )
+
+        write_appcast(signature, title="Version 9.8.7")
+        rejected_title = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_title.returncode, 0)
+        self.assertIn("Tip appcast title mismatch", rejected_title.stderr)
+
+        write_appcast(signature, display_version="9.8.7")
+        rejected_display_version = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_display_version.returncode, 0)
+        self.assertIn("Tip appcast display version mismatch", rejected_display_version.stderr)
+
         write_appcast("")
-        rejected = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected.stderr)
+        rejected_signature = subprocess.run(command, env=env, text=True, capture_output=True)
+        self.assertNotEqual(rejected_signature.returncode, 0)
+        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected_signature.stderr)
+
+    def test_tip_appcast_label_changes_display_metadata_without_changing_comparison_version(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        appcast = temp_dir / "appcast.xml"
+        appcast.write_text(
+            """<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel><item><title>Version 9.8.7</title>
+    <sparkle:version>29.8.52</sparkle:version>
+    <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
+  </item></channel>
+</rss>
+""",
+            encoding="utf-8",
+        )
+        command = [
+            "bash",
+            "-c",
+            """source "$1"
+APPCAST="$2"
+MARKETING_VERSION="9.8.7"
+label_generated_tip_appcast""",
+            "tip-appcast-label",
+            str(SCRIPT_DIR / "main_tip_release.sh"),
+            str(appcast),
+        ]
+
+        labeled = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(labeled.returncode, 0, labeled.stderr)
+        item = ET.parse(appcast).getroot().find("./channel/item")
+        self.assertIsNotNone(item)
+        assert item is not None
+        sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+        self.assertEqual(item.findtext(f"{{{sparkle}}}version"), "29.8.52")
+        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "Tip build v9.8.7")
+        self.assertEqual(item.findtext("title"), "Tip build v9.8.7")
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
