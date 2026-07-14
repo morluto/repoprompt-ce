@@ -203,9 +203,7 @@ final class PathSearchIndex: @unchecked Sendable {
         }
         defer { search_result_destroy(result) }
 
-        if stats.cancelled {
-            return .cancelled(diagnostics)
-        }
+        if stats.cancelled { return .cancelled(diagnostics) }
 
         let resultPointer = UnsafePointer<search_result_t>(result)
         let count = Int(resultPointer.pointee.count)
@@ -319,11 +317,125 @@ final class WorkspaceProjectedPathSearchShadowControl: @unchecked Sendable {
     }
 }
 
+struct WorkspacePathSearchOverlayHistoryMetrics: Equatable {
+    let recentPayloadCount: Int
+    let compactedPageCount: Int
+    let compactedPayloadCount: Int
+    let maximumCompactedPagePayloadCount: Int
+
+    var totalPayloadCount: Int {
+        recentPayloadCount + compactedPayloadCount
+    }
+
+    var isWithinStructuralBounds: Bool {
+        recentPayloadCount <= 16
+            && maximumCompactedPagePayloadCount <= 17
+            && compactedPayloadCount == compactedPageCount * 17
+    }
+}
+
+/// Persistent newest-first overlay history shared by materialized and projected path indexes.
+///
+/// Recent payloads are copied only within a fixed bound. Full batches move into immutable pages;
+/// pages share older tails across retained generations without nesting payload histories.
+struct WorkspacePathSearchOverlayHistory<Payload>: @unchecked Sendable {
+    private static var maximumRecentPayloadCount: Int {
+        16
+    }
+
+    private static var compactedPagePayloadCount: Int {
+        maximumRecentPayloadCount + 1
+    }
+
+    /// `previous` changes only during teardown after uniqueness has been established for that page.
+    private final class Page: @unchecked Sendable {
+        let payloadsNewestFirst: [Payload]
+        var previous: Page?
+
+        init(payloadsNewestFirst: [Payload], previous: Page?) {
+            precondition(payloadsNewestFirst.count == WorkspacePathSearchOverlayHistory.compactedPagePayloadCount)
+            self.payloadsNewestFirst = payloadsNewestFirst
+            self.previous = previous
+        }
+
+        deinit {
+            // Retain the tail before severing this page's link. Iteratively dismantle only a unique
+            // prefix; a retained generation or active traversal may still own any shared tail.
+            var tail = previous
+            previous = nil
+            while tail != nil, isKnownUniquelyReferenced(&tail) {
+                let next = tail?.previous
+                tail?.previous = nil
+                tail = next
+            }
+        }
+    }
+
+    private let recentPayloadsNewestFirst: [Payload]
+    private let compactedPageHead: Page?
+
+    init() {
+        recentPayloadsNewestFirst = []
+        compactedPageHead = nil
+    }
+
+    private init(recentPayloadsNewestFirst: [Payload], compactedPageHead: Page?) {
+        precondition(recentPayloadsNewestFirst.count <= Self.maximumRecentPayloadCount)
+        self.recentPayloadsNewestFirst = recentPayloadsNewestFirst
+        self.compactedPageHead = compactedPageHead
+    }
+
+    func appending(_ payload: Payload) -> Self {
+        if recentPayloadsNewestFirst.count < Self.maximumRecentPayloadCount {
+            var recent = [payload]
+            recent.reserveCapacity(recentPayloadsNewestFirst.count + 1)
+            recent.append(contentsOf: recentPayloadsNewestFirst)
+            return Self(recentPayloadsNewestFirst: recent, compactedPageHead: compactedPageHead)
+        }
+
+        var pagePayloads = [payload]
+        pagePayloads.reserveCapacity(Self.compactedPagePayloadCount)
+        pagePayloads.append(contentsOf: recentPayloadsNewestFirst)
+        return Self(
+            recentPayloadsNewestFirst: [],
+            compactedPageHead: Page(payloadsNewestFirst: pagePayloads, previous: compactedPageHead)
+        )
+    }
+
+    func visitNewestFirst(_ body: (Payload) -> Void) {
+        recentPayloadsNewestFirst.forEach(body)
+        var page = compactedPageHead
+        while let current = page {
+            current.payloadsNewestFirst.forEach(body)
+            page = current.previous
+        }
+    }
+
+    var metricsForTesting: WorkspacePathSearchOverlayHistoryMetrics {
+        var pageCount = 0
+        var payloadCount = 0
+        var maximumPagePayloadCount = 0
+        var page = compactedPageHead
+        while let current = page {
+            pageCount += 1
+            payloadCount += current.payloadsNewestFirst.count
+            maximumPagePayloadCount = max(maximumPagePayloadCount, current.payloadsNewestFirst.count)
+            page = current.previous
+        }
+        return WorkspacePathSearchOverlayHistoryMetrics(
+            recentPayloadCount: recentPayloadsNewestFirst.count,
+            compactedPageCount: pageCount,
+            compactedPayloadCount: payloadCount,
+            maximumCompactedPagePayloadCount: maximumPagePayloadCount
+        )
+    }
+}
+
 /// Immutable root-local search projection retained by catalog snapshots and active readers.
 ///
-/// Shard patches share one materialized base index and append immutable overlay segments.
-/// Every published generation owns its segment head, so compaction can replace the current chain
-/// without invalidating older readers that retained a previous generation.
+/// Shard patches share one materialized base index and append immutable overlay payloads.
+/// Every published generation owns an immutable history view whose compacted pages can share older
+/// tails without invalidating retained readers.
 final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
     enum BuildKind: Equatable {
         case full
@@ -337,8 +449,6 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         let score: Int32
         let tieBreakKey: String
     }
-
-    private static let maximumOverlaySegmentCount = 16
 
     private final class MaterializedBase: @unchecked Sendable {
         let entries: [WorkspaceSearchCatalogEntry]
@@ -365,57 +475,15 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         }
     }
 
-    private final class OverlaySegment: @unchecked Sendable {
+    private struct OverlaySegment: @unchecked Sendable {
         let entries: [WorkspaceSearchCatalogEntry]
         let index: PathSearchIndex?
         let affectedEntryIDs: Set<UUID>
-        let previous: OverlaySegment?
-        let depth: Int
-        private let compactedSegments: [OverlaySegment]?
 
-        init(
-            entries: [WorkspaceSearchCatalogEntry],
-            affectedEntryIDs: Set<UUID>,
-            previous: OverlaySegment?
-        ) {
+        init(entries: [WorkspaceSearchCatalogEntry], affectedEntryIDs: Set<UUID>) {
             self.entries = entries
             index = entries.isEmpty ? nil : PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
             self.affectedEntryIDs = affectedEntryIDs
-            self.previous = previous
-            depth = (previous?.depth ?? 0) + 1
-            compactedSegments = nil
-        }
-
-        static func compact(_ head: OverlaySegment) -> OverlaySegment {
-            // Compact only the chain of immutable handles. Payload indexes and tombstones remain
-            // shared, so compaction work is proportional to segment count rather than target size.
-            var segments: [OverlaySegment] = []
-            var segment: OverlaySegment? = head
-            while let current = segment {
-                segments.append(current)
-                segment = current.previous
-            }
-            return OverlaySegment(compactedSegments: segments)
-        }
-
-        private init(compactedSegments: [OverlaySegment]) {
-            entries = []
-            index = nil
-            affectedEntryIDs = []
-            previous = nil
-            depth = 1
-            self.compactedSegments = compactedSegments
-        }
-
-        func visitLeavesNewestFirst(_ body: (OverlaySegment) -> Void) {
-            var stack = [self]
-            while let segment = stack.popLast() {
-                if let compactedSegments = segment.compactedSegments {
-                    stack.append(contentsOf: compactedSegments.reversed())
-                } else {
-                    body(segment)
-                }
-            }
         }
     }
 
@@ -426,7 +494,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
 
     private let base: MaterializedBase?
     private let projectedIndex: WorkspaceProjectedPathSearchIndex?
-    private let overlaySegmentHead: OverlaySegment?
+    private let overlayHistory: WorkspacePathSearchOverlayHistory<OverlaySegment>
     private let shadowControl: WorkspaceProjectedPathSearchShadowControl?
 
     init(
@@ -441,7 +509,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         buildKind = .full
         base = MaterializedBase(entries: entries)
         projectedIndex = nil
-        overlaySegmentHead = nil
+        overlayHistory = WorkspacePathSearchOverlayHistory()
         self.shadowControl = shadowControl
     }
 
@@ -451,7 +519,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         entries: [WorkspaceSearchCatalogEntry],
         buildKind: BuildKind,
         base: MaterializedBase,
-        overlaySegmentHead: OverlaySegment?,
+        overlayHistory: WorkspacePathSearchOverlayHistory<OverlaySegment>,
         shadowControl: WorkspaceProjectedPathSearchShadowControl?
     ) {
         self.identity = identity
@@ -460,7 +528,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         self.buildKind = buildKind
         self.base = base
         projectedIndex = nil
-        self.overlaySegmentHead = overlaySegmentHead
+        self.overlayHistory = overlayHistory
         self.shadowControl = shadowControl
     }
 
@@ -477,7 +545,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         buildKind = .projectedReuse
         base = nil
         self.projectedIndex = projectedIndex
-        overlaySegmentHead = nil
+        overlayHistory = WorkspacePathSearchOverlayHistory()
         shadowControl = nil
     }
 
@@ -562,7 +630,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
                 entries: entries,
                 buildKind: .reused,
                 base: base,
-                overlaySegmentHead: overlaySegmentHead,
+                overlayHistory: overlayHistory,
                 shadowControl: shadowControl
             )
         }
@@ -601,21 +669,17 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
             return WorkspaceSearchRootPathIndex(identity: identity, rootPath: rootPath, entries: entries)
         }
         let segmentEntries = entries.filter { changedFileIDs.contains($0.id) }
-        var nextSegmentHead = OverlaySegment(
+        let nextOverlayHistory = overlayHistory.appending(OverlaySegment(
             entries: segmentEntries,
-            affectedEntryIDs: changedFileIDs,
-            previous: overlaySegmentHead
-        )
-        if nextSegmentHead.depth > Self.maximumOverlaySegmentCount {
-            nextSegmentHead = OverlaySegment.compact(nextSegmentHead)
-        }
+            affectedEntryIDs: changedFileIDs
+        ))
         return WorkspaceSearchRootPathIndex(
             identity: identity,
             rootPath: rootPath,
             entries: entries,
             buildKind: .overlay,
             base: base,
-            overlaySegmentHead: nextSegmentHead,
+            overlayHistory: nextOverlayHistory,
             shadowControl: nil
         )
     }
@@ -629,31 +693,25 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
 
         var candidateLists: [[Candidate]] = []
         var suppressedEntryIDs = Set<UUID>()
-        var segment = overlaySegmentHead
-        while let current = segment {
-            current.visitLeavesNewestFirst { leaf in
-                let boundedSegmentLimit = min(limit, leaf.entries.count)
-                let segmentOverfetch = min(
-                    suppressedEntryIDs.count,
-                    leaf.entries.count - boundedSegmentLimit
+        overlayHistory.visitNewestFirst { segment in
+            let boundedSegmentLimit = min(limit, segment.entries.count)
+            let segmentOverfetch = min(
+                suppressedEntryIDs.count,
+                segment.entries.count - boundedSegmentLimit
+            )
+            let candidates = segment.index?
+                .searchSynchronously(
+                    query,
+                    limit: boundedSegmentLimit + segmentOverfetch
                 )
-                let candidates = leaf.index?
-                    .searchSynchronously(
-                        query,
-                        limit: boundedSegmentLimit + segmentOverfetch
-                    )
-                    .compactMap { candidate -> Candidate? in
-                        guard leaf.entries.indices.contains(candidate.index) else { return nil }
-                        let entry = leaf.entries[candidate.index]
-                        guard !suppressedEntryIDs.contains(entry.id) else { return nil }
-                        return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
-                    } ?? []
-                if !candidates.isEmpty {
-                    candidateLists.append(candidates)
-                }
-                suppressedEntryIDs.formUnion(leaf.affectedEntryIDs)
-            }
-            segment = current.previous
+                .compactMap { candidate -> Candidate? in
+                    guard segment.entries.indices.contains(candidate.index) else { return nil }
+                    let entry = segment.entries[candidate.index]
+                    guard !suppressedEntryIDs.contains(entry.id) else { return nil }
+                    return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
+                } ?? []
+            if !candidates.isEmpty { candidateLists.append(candidates) }
+            suppressedEntryIDs.formUnion(segment.affectedEntryIDs)
         }
 
         let boundedBaseLimit = min(base.entries.count, limit)
@@ -670,9 +728,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
                     tieBreakKey: candidate.tieBreakKey
                 )
             }
-        if !baseCandidates.isEmpty {
-            candidateLists.append(baseCandidates)
-        }
+        if !baseCandidates.isEmpty { candidateLists.append(baseCandidates) }
 
         var candidateOffsets = Array(repeating: 0, count: candidateLists.count)
         var results: [Candidate] = []
@@ -746,14 +802,12 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         projectedIndex?.accumulatedChangedRelativePathCount
     }
 
-    var overlaySegmentCountForTesting: Int {
-        overlaySegmentHead?.depth ?? projectedIndex?.overlaySegmentCountForTesting ?? 0
+    var overlayHistoryMetricsForTesting: WorkspacePathSearchOverlayHistoryMetrics {
+        projectedIndex?.overlayHistoryMetricsForTesting ?? overlayHistory.metricsForTesting
     }
 
     private static func candidatePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
-        if lhs.score != rhs.score {
-            return lhs.score > rhs.score
-        }
+        if lhs.score != rhs.score { return lhs.score > rhs.score }
         switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
         case .orderedAscending:
             return true
@@ -779,8 +833,6 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
     let overlayEntryCount: Int
     let tombstoneCount: Int
     let accumulatedChangedRelativePathCount: Int
-
-    private static let maximumOverlaySegmentCount = 16
 
     private struct AffectedRelativePaths: @unchecked Sendable {
         private enum Storage: @unchecked Sendable {
@@ -838,9 +890,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
             case let .memory(paths):
                 return paths.contains(relativePath)
             case let .seeded(changed, entries):
-                if (try? changed.contains(relativePath)) == true {
-                    return true
-                }
+                if (try? changed.contains(relativePath)) == true { return true }
                 return WorkspaceProjectedPathSearchIndex.entryIndex(
                     relativePath: relativePath,
                     entries: entries
@@ -887,62 +937,21 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
         }
     }
 
-    private final class OverlaySegment: @unchecked Sendable {
+    private struct OverlaySegment: @unchecked Sendable {
         let entries: [WorkspaceSearchCatalogEntry]
         let index: PathSearchIndex?
         let affectedRelativePaths: AffectedRelativePaths
-        let previous: OverlaySegment?
-        let depth: Int
-        private let compactedSegments: [OverlaySegment]?
 
-        init(
-            entries: [WorkspaceSearchCatalogEntry],
-            affectedRelativePaths: AffectedRelativePaths,
-            previous: OverlaySegment?
-        ) {
+        init(entries: [WorkspaceSearchCatalogEntry], affectedRelativePaths: AffectedRelativePaths) {
             self.entries = entries
             index = entries.isEmpty ? nil : PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
             self.affectedRelativePaths = affectedRelativePaths
-            self.previous = previous
-            depth = (previous?.depth ?? 0) + 1
-            compactedSegments = nil
-        }
-
-        static func compact(_ head: OverlaySegment) -> OverlaySegment {
-            // Compact only handles; never merge changed-path payloads into a target-sized rebuild.
-            var segments: [OverlaySegment] = []
-            var segment: OverlaySegment? = head
-            while let current = segment {
-                segments.append(current)
-                segment = current.previous
-            }
-            return OverlaySegment(compactedSegments: segments)
-        }
-
-        private init(compactedSegments: [OverlaySegment]) {
-            entries = []
-            index = nil
-            affectedRelativePaths = AffectedRelativePaths([])
-            previous = nil
-            depth = 1
-            self.compactedSegments = compactedSegments
-        }
-
-        func visitLeavesNewestFirst(_ body: (OverlaySegment) -> Void) {
-            var stack = [self]
-            while let segment = stack.popLast() {
-                if let compactedSegments = segment.compactedSegments {
-                    stack.append(contentsOf: compactedSegments.reversed())
-                } else {
-                    body(segment)
-                }
-            }
         }
     }
 
     private let relativeBase: WorkspaceSearchRelativePathBase
     private let targetEntriesByBaseIndex: [WorkspaceSearchCatalogEntry?]
-    private let overlaySegmentHead: OverlaySegment?
+    private let overlayHistory: WorkspacePathSearchOverlayHistory<OverlaySegment>
     private let displayPrefix: String
     private let absolutePrefix: String
     private let unsegmentedChangedPathCount: Int
@@ -1017,9 +1026,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     switch record.baseAction {
                     case .reuse:
                         if try additionalChanged.contains(standardizedRelativePath) {
-                            if let matchedEntry {
-                                overlayEntries.append(matchedEntry)
-                            }
+                            if let matchedEntry { overlayEntries.append(matchedEntry) }
                         } else {
                             guard let matchedEntry,
                                   let baseOrdinal = record.baseOrdinal,
@@ -1048,9 +1055,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     planChangedPathCount += 1
                     if try additionalChanged.contains(standardizedRelativePath) {
                         remainingAdditionalChangedCount -= 1
-                        if let matchedEntry {
-                            overlayEntries.append(matchedEntry)
-                        }
+                        if let matchedEntry { overlayEntries.append(matchedEntry) }
                     } else if matchedEntry != nil {
                         return nil
                     }
@@ -1060,9 +1065,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                         overlayEntries.append(matchedEntry)
                     }
                 }
-                if matchedEntry != nil {
-                    authoritativeIndex += 1
-                }
+                if matchedEntry != nil { authoritativeIndex += 1 }
             }
         } catch {
             return nil
@@ -1088,13 +1091,12 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
         } catch {
             return nil
         }
-        overlaySegmentHead = affectedRelativePaths.isEmpty
-            ? nil
-            : OverlaySegment(
+        overlayHistory = affectedRelativePaths.isEmpty
+            ? WorkspacePathSearchOverlayHistory()
+            : WorkspacePathSearchOverlayHistory().appending(OverlaySegment(
                 entries: overlayEntries,
-                affectedRelativePaths: affectedRelativePaths,
-                previous: nil
-            )
+                affectedRelativePaths: affectedRelativePaths
+            ))
         entries = authoritativeEntries
         baseEntryCount = resolvedBaseEntryCount
         overlayEntryCount = overlayEntries.count
@@ -1211,13 +1213,12 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     || !baseRelativePaths.contains($0.standardizedRelativePath)
             }
             let affectedRelativePaths = changed.union(overlayEntries.map(\.standardizedRelativePath))
-            overlaySegmentHead = affectedRelativePaths.isEmpty
-                ? nil
-                : OverlaySegment(
+            overlayHistory = affectedRelativePaths.isEmpty
+                ? WorkspacePathSearchOverlayHistory()
+                : WorkspacePathSearchOverlayHistory().appending(OverlaySegment(
                     entries: overlayEntries,
-                    affectedRelativePaths: AffectedRelativePaths(affectedRelativePaths),
-                    previous: nil
-                )
+                    affectedRelativePaths: AffectedRelativePaths(affectedRelativePaths)
+                ))
             entries = authoritativeEntries
             baseEntryCount = targets.compactMap(\.self).count
             overlayEntryCount = overlayEntries.count
@@ -1232,7 +1233,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
     private init?(
         relativeBase: WorkspaceSearchRelativePathBase,
         targetEntriesByBaseIndex: [WorkspaceSearchCatalogEntry?],
-        overlaySegmentHead: OverlaySegment?,
+        overlayHistory: WorkspacePathSearchOverlayHistory<OverlaySegment>,
         unsegmentedChangedPathCount: Int,
         displayPrefix: String,
         absolutePrefix: String,
@@ -1246,7 +1247,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
         })
         else { return nil }
 
-        let previouslySegmentedPaths = Self.affectedPathsNewestFirst(overlaySegmentHead)
+        let previouslySegmentedPaths = Self.affectedPathsNewestFirst(overlayHistory)
         var nextUnsegmentedChangedPathCount = unsegmentedChangedPathCount
         for path in changed where !Self.contains(path, in: previouslySegmentedPaths) {
             if let baseIndex = Self.baseSearchIndex(
@@ -1258,19 +1259,15 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
         }
 
         let segmentEntries = authoritativeEntries.filter { changed.contains($0.standardizedRelativePath) }
-        var nextSegmentHead = OverlaySegment(
+        let nextOverlayHistory = overlayHistory.appending(OverlaySegment(
             entries: segmentEntries,
-            affectedRelativePaths: AffectedRelativePaths(changed),
-            previous: overlaySegmentHead
-        )
-        if nextSegmentHead.depth > Self.maximumOverlaySegmentCount {
-            nextSegmentHead = OverlaySegment.compact(nextSegmentHead)
-        }
+            affectedRelativePaths: AffectedRelativePaths(changed)
+        ))
 
-        let allAffectedRelativePaths = Self.affectedPathsNewestFirst(nextSegmentHead)
+        let allAffectedRelativePaths = Self.affectedPathsNewestFirst(nextOverlayHistory)
         self.relativeBase = relativeBase
         self.targetEntriesByBaseIndex = targetEntriesByBaseIndex
-        self.overlaySegmentHead = nextSegmentHead
+        self.overlayHistory = nextOverlayHistory
         entries = authoritativeEntries
         baseEntryCount = targetEntriesByBaseIndex.lazy.compactMap(\.self).count(where: {
             !Self.contains($0.standardizedRelativePath, in: allAffectedRelativePaths)
@@ -1284,13 +1281,11 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
         self.absolutePrefix = absolutePrefix
     }
 
-    private static func affectedPathsNewestFirst(_ head: OverlaySegment?) -> [AffectedRelativePaths] {
+    private static func affectedPathsNewestFirst(
+        _ history: WorkspacePathSearchOverlayHistory<OverlaySegment>
+    ) -> [AffectedRelativePaths] {
         var result: [AffectedRelativePaths] = []
-        var segment = head
-        while let current = segment {
-            current.visitLeavesNewestFirst { result.append($0.affectedRelativePaths) }
-            segment = current.previous
-        }
+        history.visitNewestFirst { result.append($0.affectedRelativePaths) }
         return result
     }
 
@@ -1310,9 +1305,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
                     isShadowed = true
                     break
                 }
-                if !isShadowed {
-                    result += 1
-                }
+                if !isShadowed { result += 1 }
             }
         }
         return result
@@ -1325,7 +1318,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
         WorkspaceProjectedPathSearchIndex(
             relativeBase: relativeBase,
             targetEntriesByBaseIndex: targetEntriesByBaseIndex,
-            overlaySegmentHead: overlaySegmentHead,
+            overlayHistory: overlayHistory,
             unsegmentedChangedPathCount: unsegmentedChangedPathCount,
             displayPrefix: displayPrefix,
             absolutePrefix: absolutePrefix,
@@ -1354,9 +1347,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
             else { return nil }
             return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
         }
-        if !baseCandidates.isEmpty {
-            candidateLists.append(baseCandidates)
-        }
+        if !baseCandidates.isEmpty { candidateLists.append(baseCandidates) }
         return Self.merge(candidateLists, limit: limit)
     }
 
@@ -1401,14 +1392,12 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
             }
         }
         guard !Task.isCancelled else { return .cancelled(diagnostics) }
-        if !baseCandidates.isEmpty {
-            candidateLists.append(baseCandidates)
-        }
+        if !baseCandidates.isEmpty { candidateLists.append(baseCandidates) }
         return .completed(Self.merge(candidateLists, limit: limit), diagnostics)
     }
 
-    var overlaySegmentCountForTesting: Int {
-        overlaySegmentHead?.depth ?? 0
+    var overlayHistoryMetricsForTesting: WorkspacePathSearchOverlayHistoryMetrics {
+        overlayHistory.metricsForTesting
     }
 
     private func overlayCandidateLists(
@@ -1417,31 +1406,25 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
     ) -> ([[Candidate]], [AffectedRelativePaths]) {
         var candidateLists: [[Candidate]] = []
         var suppressedRelativePaths: [AffectedRelativePaths] = []
-        var segment = overlaySegmentHead
-        while let current = segment {
-            current.visitLeavesNewestFirst { leaf in
-                let boundedSegmentLimit = min(limit, leaf.entries.count)
-                let segmentOverfetch = min(
-                    suppressedRelativePaths.reduce(0) { $0 + $1.count },
-                    leaf.entries.count - boundedSegmentLimit
-                )
-                let candidates = leaf.index?.searchSynchronously(
-                    query,
-                    limit: boundedSegmentLimit + segmentOverfetch
-                ).compactMap { candidate -> Candidate? in
-                    guard leaf.entries.indices.contains(candidate.index) else { return nil }
-                    let entry = leaf.entries[candidate.index]
-                    guard !Self.contains(entry.standardizedRelativePath, in: suppressedRelativePaths) else {
-                        return nil
-                    }
-                    return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
-                } ?? []
-                if !candidates.isEmpty {
-                    candidateLists.append(candidates)
+        overlayHistory.visitNewestFirst { segment in
+            let boundedSegmentLimit = min(limit, segment.entries.count)
+            let segmentOverfetch = min(
+                suppressedRelativePaths.reduce(0) { $0 + $1.count },
+                segment.entries.count - boundedSegmentLimit
+            )
+            let candidates = segment.index?.searchSynchronously(
+                query,
+                limit: boundedSegmentLimit + segmentOverfetch
+            ).compactMap { candidate -> Candidate? in
+                guard segment.entries.indices.contains(candidate.index) else { return nil }
+                let entry = segment.entries[candidate.index]
+                guard !Self.contains(entry.standardizedRelativePath, in: suppressedRelativePaths) else {
+                    return nil
                 }
-                suppressedRelativePaths.append(leaf.affectedRelativePaths)
-            }
-            segment = current.previous
+                return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
+            } ?? []
+            if !candidates.isEmpty { candidateLists.append(candidates) }
+            suppressedRelativePaths.append(segment.affectedRelativePaths)
         }
         return (candidateLists, suppressedRelativePaths)
     }
@@ -1474,9 +1457,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
     }
 
     private static func candidatePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
-        if lhs.score != rhs.score {
-            return lhs.score > rhs.score
-        }
+        if lhs.score != rhs.score { return lhs.score > rhs.score }
         switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
         case .orderedAscending:
             return true

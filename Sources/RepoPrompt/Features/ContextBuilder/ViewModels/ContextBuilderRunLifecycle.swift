@@ -111,6 +111,37 @@ enum ContextBuilderChildConnectionFinalizer {
     }
 }
 
+struct ContextBuilderResolvedRunAuthority {
+    let configuration: ContextBuilderMCPRunConfiguration
+    let agentKind: AgentProviderKind
+    let modelRaw: String
+}
+
+struct ContextBuilderMCPRunConfiguration {
+    let identity: WorkspaceSelectionIdentity
+    let nestedTabContext: MCPServerViewModel.TabContextSnapshot
+    let providerWorkspacePath: String
+    let discoveryTokenBudget: Int
+    let planTokenBudget: Int
+    let enhancementMode: PromptEnhancementMode
+    let allowClarifyingQuestions: Bool
+    let questionTimeoutSeconds: TimeInterval
+    let responseType: String?
+    let planningModelRaw: String?
+    let isSystemWorkspace: Bool
+
+    var effectiveTokenBudget: Int {
+        let wantsResponse = responseType.flatMap {
+            ContextBuilderResponseType(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        }?.wantsResponse ?? false
+        return ContextBuilderBudgetResolver.resolveBudget(
+            wantsResponse: wantsResponse,
+            discoveryTokenBudget: discoveryTokenBudget,
+            planTokenBudget: planTokenBudget
+        )
+    }
+}
+
 @MainActor
 final class ContextBuilderRunRecord {
     struct TeardownPayload {
@@ -127,6 +158,7 @@ final class ContextBuilderRunRecord {
     let modelRaw: String
     let progressReporter: ContextBuilderMCPProgressReporter?
     let workspaceContext: ContextBuilderWorkspaceContext?
+    let mcpConfiguration: ContextBuilderMCPRunConfiguration?
 
     var output = ContextBuilderAssistantOutputAccumulator()
     var executionTask: Task<Void, Never>?
@@ -154,6 +186,7 @@ final class ContextBuilderRunRecord {
         agentKind: AgentProviderKind,
         modelRaw: String,
         workspaceContext: ContextBuilderWorkspaceContext? = nil,
+        mcpConfiguration: ContextBuilderMCPRunConfiguration? = nil,
         continuation: CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>? = nil,
         restoreConfiguration: (() -> Void)? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil
@@ -166,6 +199,7 @@ final class ContextBuilderRunRecord {
         self.agentKind = agentKind
         self.modelRaw = modelRaw
         self.workspaceContext = workspaceContext
+        self.mcpConfiguration = mcpConfiguration
         self.continuation = continuation
         self.restoreConfiguration = restoreConfiguration
         self.progressReporter = progressReporter
