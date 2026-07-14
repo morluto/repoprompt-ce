@@ -8148,11 +8148,13 @@ class WorkspaceFilesViewModel: ObservableObject {
                     && canonicalRootPaths.contains(root.standardizedFullPath)
             }
         case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
-            let allowedRootsByID = Dictionary(
-                uniqueKeysWithValues: canonicalRoots.union(physicalRoots).map { ($0.id, $0) }
-            )
+            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: physicalRoots
+            ) else { return [] }
             return rootFolders.filter { root in
-                allowedRootsByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
+                    || selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
             }
         }
     }

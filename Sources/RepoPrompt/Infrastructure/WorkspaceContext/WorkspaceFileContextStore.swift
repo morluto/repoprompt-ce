@@ -6240,15 +6240,31 @@ actor WorkspaceFileContextStore {
     ) -> WorkspaceSessionRootLifetimeSnapshot? {
         guard !expectedPhysicalRoots.isEmpty else { return nil }
         let expectedPaths = Set(expectedPhysicalRoots.map(\.standardizedFullPath))
-        let requestedMatches: Bool = switch rootScope {
+        let requestedMatches: Bool
+        switch rootScope {
         case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths):
-            Set(requestedPhysicalRootPaths.map {
+            requestedMatches = Set(requestedPhysicalRootPaths.map {
                 StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
             }) == expectedPaths
-        case let .validatedSessionBoundWorkspace(_, requestedPhysicalRoots):
-            requestedPhysicalRoots == Set(expectedPhysicalRoots)
+        case let .validatedSessionBoundWorkspace(canonicalRoots, requestedPhysicalRoots):
+            let requestedValidation = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: requestedPhysicalRoots
+            )
+            let expectedValidation = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: [],
+                physicalRoots: Set(expectedPhysicalRoots)
+            )
+            if case let .valid(requestedSelector) = requestedValidation,
+               case let .valid(expectedSelector) = expectedValidation
+            {
+                requestedMatches = requestedSelector.physicalRootPathsByID
+                    == expectedSelector.physicalRootPathsByID
+            } else {
+                requestedMatches = false
+            }
         case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
-            false
+            requestedMatches = false
         }
         guard requestedMatches,
               expectedPhysicalRoots.allSatisfy({ expectedRoot in
@@ -6287,16 +6303,22 @@ actor WorkspaceFileContextStore {
             guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
                 return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
             }
+            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: physicalRoots
+            ) else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
             missing = (
-                canonicalRoots.map { ($0, WorkspaceRootKind.primaryWorkspace) }
-                    + physicalRoots.map { ($0, WorkspaceRootKind.sessionWorktree) }
+                selector.canonicalRootPathsByID.map { ($0.key, $0.value, WorkspaceRootKind.primaryWorkspace) }
+                    + selector.physicalRootPathsByID.map { ($0.key, $0.value, WorkspaceRootKind.sessionWorktree) }
             )
-            .compactMap { expectedRoot, expectedKind in
-                guard let currentRoot = rootStatesByID[expectedRoot.id]?.root,
+            .compactMap { rootID, expectedPath, expectedKind in
+                guard let currentRoot = rootStatesByID[rootID]?.root,
                       currentRoot.kind == expectedKind,
-                      currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath,
-                      publishedSeededAuthorityIsQueryable(rootID: expectedRoot.id)
-                else { return expectedRoot.standardizedFullPath }
+                      currentRoot.standardizedFullPath == expectedPath,
+                      publishedSeededAuthorityIsQueryable(rootID: rootID)
+                else { return expectedPath }
                 var isDirectory: ObjCBool = false
                 return FileManager.default.fileExists(
                     atPath: currentRoot.standardizedFullPath,
@@ -21372,14 +21394,16 @@ actor WorkspaceFileContextStore {
                 }
             }
         case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
-            let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.id, $0) })
-            let physicalByID = Dictionary(uniqueKeysWithValues: physicalRoots.map { ($0.id, $0) })
+            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: physicalRoots
+            ) else { return [] }
             return allRoots.filter { root in
                 switch root.kind {
                 case .primaryWorkspace:
-                    canonicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                    selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
                 case .sessionWorktree:
-                    physicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                    selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
                 case .workspaceGitData, .supplementalSystem:
                     false
                 }

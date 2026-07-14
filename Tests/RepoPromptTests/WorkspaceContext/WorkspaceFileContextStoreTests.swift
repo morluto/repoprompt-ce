@@ -4416,6 +4416,78 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertNotEqual(unloaded.generation, reloaded.generation)
         }
 
+        func testValidatedSessionSelectorDedupesNameOnlyReferences() async throws {
+            let rootURL = try makeTemporaryRoot(name: "ValidatedSelectorNameDedupe")
+            try write("let value = true", to: rootURL.appendingPathComponent("Target.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let scope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+                canonicalRoots: [
+                    WorkspaceRootRef(id: root.id, name: "First", fullPath: root.standardizedFullPath),
+                    WorkspaceRootRef(id: root.id, name: "Second", fullPath: root.standardizedFullPath)
+                ],
+                physicalRoots: []
+            )
+
+            let availability = await store.rootScopeAvailability(scope)
+            let scopedRoots = await store.rootRefs(scope: scope)
+            let codemapRootEpochs = await store.codemapRootEpochs(scope: scope)
+
+            XCTAssertEqual(availability, .available)
+            XCTAssertEqual(scopedRoots.map(\.id), [root.id])
+            XCTAssertEqual(Set(codemapRootEpochs.keys), [root.id])
+        }
+
+        func testValidatedSessionSelectorConflictsExposeNoRootsOrCodemapEpochs() async throws {
+            let firstURL = try makeTemporaryRoot(name: "ValidatedSelectorFirst")
+            let secondURL = try makeTemporaryRoot(name: "ValidatedSelectorSecond")
+            try write("let first = true", to: firstURL.appendingPathComponent("First.swift"))
+            try write("let second = true", to: secondURL.appendingPathComponent("Second.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let first = try await store.loadRoot(path: firstURL.path)
+            let second = try await store.loadRoot(path: secondURL.path)
+            let firstRef = WorkspaceRootRef(
+                id: first.id,
+                name: first.name,
+                fullPath: first.standardizedFullPath
+            )
+            let conflictingPathRef = WorkspaceRootRef(
+                id: first.id,
+                name: second.name,
+                fullPath: second.standardizedFullPath
+            )
+            let conflictingScopes: [WorkspaceLookupRootScope] = [
+                .validatedSessionBoundWorkspace(
+                    canonicalRoots: [firstRef, conflictingPathRef],
+                    physicalRoots: []
+                ),
+                .validatedSessionBoundWorkspace(
+                    canonicalRoots: [firstRef],
+                    physicalRoots: [firstRef]
+                )
+            ]
+
+            for scope in conflictingScopes {
+                let availability = await store.rootScopeAvailability(scope)
+                let scopedRoots = await store.rootRefs(scope: scope)
+                let codemapRootEpochs = await store.codemapRootEpochs(scope: scope)
+                let catalogAccess = await store.searchCatalogAccess(rootScope: scope)
+
+                XCTAssertEqual(
+                    availability,
+                    .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+                )
+                XCTAssertTrue(scopedRoots.isEmpty)
+                XCTAssertTrue(codemapRootEpochs.isEmpty)
+                XCTAssertEqual(
+                    catalogAccess,
+                    .unavailable(.sessionWorktreeUnavailable(missingPhysicalRootPaths: []))
+                )
+            }
+        }
+
         func testValidatedSessionScopeRejectsSamePathRootReplacement() async throws {
             let logicalRoot = try makeTemporaryRoot(name: "ValidatedSessionLogical")
             let worktree = try makeTemporaryRoot(name: "ValidatedSessionWorktree")
