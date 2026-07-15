@@ -99,6 +99,25 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         XCTAssertFalse(requests.contains { $0.method == "account/read" })
     }
 
+    func testLoginRejectsMatchingFailedCompletion() async {
+        let client = ManagedAuthRPCClientFake(
+            accountResult: Self.authenticatedAccount,
+            loginStartResult: Self.loginStart,
+            notificationAfterLoginStart: Self.loginCompleted(
+                loginID: "login-1",
+                success: false,
+                error: "Browser login was declined."
+            )
+        )
+        let service = makeService(client: client)
+
+        let result = await service.startManagedChatgptLogin { _ in }
+
+        XCTAssertEqual(result, .failed(message: "Browser login was declined."))
+        let requests = await client.recordedRequests()
+        XCTAssertEqual(requests.map(\.method), ["account/login/start"])
+    }
+
     func testLoginStartFailureDoesNotImplicitlyLogoutSharedCodexAccount() async {
         let client = ManagedAuthRPCClientFake(
             accountResult: Self.authenticatedAccount,
@@ -143,14 +162,19 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
 
     private static func loginCompleted(
         loginID: String,
-        success: Bool
+        success: Bool,
+        error: String? = nil
     ) -> CodexAppServerClient.Notification {
-        CodexAppServerClient.Notification(
+        var params: [String: CodexJSONValue] = [
+            "loginId": .string(loginID),
+            "success": .bool(success)
+        ]
+        if let error {
+            params["error"] = .string(error)
+        }
+        return CodexAppServerClient.Notification(
             method: "account/login/completed",
-            params: [
-                "loginId": .string(loginID),
-                "success": .bool(success)
-            ]
+            params: params
         )
     }
 }
