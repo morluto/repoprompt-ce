@@ -1135,7 +1135,17 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             path: "Sources/App.swift",
             text: SwiftFixtureSource.emptyStruct("ConcurrentTouch", trailingNewline: false)
         )
+        let unrelated = try await makeFixture(
+            root: root,
+            artifactStore: artifactStore,
+            namespaceScope: "\(#function)-unrelated",
+            worktreeByte: 0x94,
+            prefix: "",
+            path: "Sources/Unrelated.swift",
+            text: SwiftFixtureSource.emptyStruct("UnrelatedTouch", trailingNewline: false)
+        )
         let clock = ManifestAccessClock(500)
+        let scanRecorder = ManifestScanInspectionRecorder()
         let policy = CodeMapRootManifestStorePolicy(
             maximumRecordCountPerManifest: 10,
             maximumManifestByteCount: 64 * 1024,
@@ -1148,6 +1158,9 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
         let store = try CodeMapRootManifestStore(
             rootURL: root,
             policy: policy,
+            hooks: CodeMapRootManifestStoreHooks(
+                onManifestScanInspection: { scanRecorder.record($0) }
+            ),
             accessEpochSeconds: { clock.value }
         )
         _ = try await store.replaceCurrentManifest(
@@ -1156,6 +1169,14 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             records: [fixture.record],
             lastAccessEpochSeconds: 100
         )
+        _ = try await store.replaceCurrentManifest(
+            namespace: unrelated.namespace,
+            authority: unrelated.authority,
+            records: [unrelated.record],
+            lastAccessEpochSeconds: 100
+        )
+        XCTAssertTrue(scanRecorder.inspectedDigests.contains(unrelated.namespace.storageDigestHex))
+        scanRecorder.reset()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             for _ in 0 ..< 32 {
@@ -1171,6 +1192,7 @@ final class CodeMapRootManifestStoreTests: XCTestCase {
             try await group.waitForAll()
         }
         await store.waitForPendingAccessRefreshesForTesting()
+        XCTAssertEqual(scanRecorder.inspectedDigests, [])
         let touched = try decodeManifest(fixture.namespace, from: store)
         XCTAssertEqual(touched.lastAccessEpochSeconds, 500)
         XCTAssertEqual(touched.manifestGeneration, 1)
@@ -2703,6 +2725,23 @@ private final class ManifestAccessClock: @unchecked Sendable {
 
     init(_ value: UInt64) {
         self.value = value
+    }
+}
+
+private final class ManifestScanInspectionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var digests: [String] = []
+
+    var inspectedDigests: [String] {
+        lock.withLock { digests }
+    }
+
+    func record(_ digest: String) {
+        lock.withLock { digests.append(digest) }
+    }
+
+    func reset() {
+        lock.withLock { digests.removeAll(keepingCapacity: true) }
     }
 }
 

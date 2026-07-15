@@ -95,6 +95,7 @@ struct CodeMapRootManifestStoreHooks {
     var afterPublishRename: @Sendable () -> Void
     var beforeMaintenanceLock: @Sendable () async -> Void
     var beforeTerminalAuthorityCheck: @Sendable (CodeMapRootManifestStoreTerminalOperation) -> Void
+    var onManifestScanInspection: @Sendable (String) -> Void
     var faultAction: @Sendable (CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction
 
     init(
@@ -105,6 +106,7 @@ struct CodeMapRootManifestStoreHooks {
         beforeMaintenanceLock: @escaping @Sendable () async -> Void = {},
         beforeTerminalAuthorityCheck: @escaping @Sendable (CodeMapRootManifestStoreTerminalOperation) ->
             Void = { _ in },
+        onManifestScanInspection: @escaping @Sendable (String) -> Void = { _ in },
         faultAction: @escaping @Sendable (CodeMapRootManifestStoreFaultPoint) ->
             CodeMapRootManifestStoreFaultAction = { _ in .proceed }
     ) {
@@ -114,6 +116,7 @@ struct CodeMapRootManifestStoreHooks {
         self.afterPublishRename = afterPublishRename
         self.beforeMaintenanceLock = beforeMaintenanceLock
         self.beforeTerminalAuthorityCheck = beforeTerminalAuthorityCheck
+        self.onManifestScanInspection = onManifestScanInspection
         self.faultAction = faultAction
     }
 
@@ -652,14 +655,20 @@ actor CodeMapRootManifestStore {
         guard UInt64(encoded.count) <= policy.maximumManifestByteCount else {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
+        // Reconciliation is disk-derived maintenance; a proven no-growth access replacement can defer it.
+        let canSkipGlobalReconciliation = expectedSnapshot != nil &&
+            semanticUnchanged &&
+            existing.identity.map { UInt64(encoded.count) <= UInt64($0.size) } == true
 
-        _ = try reconcileLocked(
-            layout: layout,
-            maximumEntries: nil,
-            protectingDigest: name,
-            incomingByteCount: UInt64(encoded.count),
-            replacedByteCount: existing.snapshot.flatMap { _ in existing.identity }.map { UInt64($0.size) } ?? 0
-        )
+        if !canSkipGlobalReconciliation {
+            _ = try reconcileLocked(
+                layout: layout,
+                maximumEntries: nil,
+                protectingDigest: name,
+                incomingByteCount: UInt64(encoded.count),
+                replacedByteCount: existing.snapshot.flatMap { _ in existing.identity }.map { UInt64($0.size) } ?? 0
+            )
+        }
         guard Self.layoutIsCurrent(layout, rootURL: rootURL),
               Self.directoryIsCurrent(shard, parent: layout.manifests, name: namespace.shard)
         else {
@@ -670,6 +679,13 @@ actor CodeMapRootManifestStore {
            !current.isSecureRegularFile(in: shard.identity.device, expectedMode: Self.fileMode)
         {
             throw CodeMapRootManifestStoreError.insecureLeaf
+        }
+        if canSkipGlobalReconciliation {
+            guard let admittedExistingIdentity = existing.identity,
+                  publicationExistingIdentity == admittedExistingIdentity
+            else {
+                throw CodeMapRootManifestStoreError.insecureLeaf
+            }
         }
 
         let temporaryName = ".tmp.\(getpid()).\(UUID().uuidString.lowercased())"
@@ -774,13 +790,15 @@ actor CodeMapRootManifestStore {
         ) == snapshot else {
             throw CodeMapRootManifestStoreError.insecureLeaf
         }
-        _ = try reconcileLocked(
-            layout: layout,
-            maximumEntries: nil,
-            protectingDigest: name,
-            incomingByteCount: 0,
-            replacedByteCount: 0
-        )
+        if !canSkipGlobalReconciliation {
+            _ = try reconcileLocked(
+                layout: layout,
+                maximumEntries: nil,
+                protectingDigest: name,
+                incomingByteCount: 0,
+                replacedByteCount: 0
+            )
+        }
         if semanticUnchanged {
             return .unchanged(manifestGeneration: nextGeneration)
         }
@@ -1214,6 +1232,9 @@ actor CodeMapRootManifestStore {
                 guard Self.isCanonicalDigest(name) else { continue }
                 let descriptor = openat(shard.rawValue, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
                 guard descriptor >= 0 else { continue }
+                #if DEBUG
+                    hooks.onManifestScanInspection(name)
+                #endif
                 let inspection = inspectManifestDescriptor(
                     descriptor,
                     manifests: layout.manifests,
