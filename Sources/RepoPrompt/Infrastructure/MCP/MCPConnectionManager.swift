@@ -897,6 +897,7 @@ actor ServerNetworkManager {
         private let debugRestartStatusLimit = 50
         private var debugResolvedToolOperationOverrides: [String: @Sendable () async throws -> Value] = [:]
         private var debugExecutionWatchdogAbortTargets: [UUID: any MCPServerConnection] = [:]
+        private var debugTerminalRecordDirectoryURLForTesting: URL?
     #endif
 
     private var connections: [UUID: any MCPServerConnection] = [:]
@@ -5659,15 +5660,30 @@ actor ServerNetworkManager {
             appConnectionID: connectionID,
             connectionGeneration: connectionLifecycleGenerationByID[connectionID],
             errno: context.errno,
-            errorDescription: context.errorDescription
+            errorDescription: context.errorDescription,
+            toolName: context.toolExecution?.toolName,
+            invocationID: context.toolExecution?.invocationID,
+            elapsedMilliseconds: context.toolExecution?.elapsedMilliseconds,
+            handlerPhase: context.toolExecution?.handlerPhase,
+            handlerPhaseAgeMilliseconds: context.toolExecution?.handlerPhaseAgeMilliseconds,
+            executionDeadlineMilliseconds: context.toolExecution?.executionDeadlineMilliseconds,
+            cleanupGraceMilliseconds: context.toolExecution?.cleanupGraceMilliseconds
         )
         var claim = terminalRecordClaimsByConnectionID[connectionID] ?? MCPFirstTerminalRecordClaim()
+        // First terminal cause wins, including a generic peer/transport cause that
+        // races ahead of watchdog attribution. Durable records are never enriched later.
         guard let record = claim.claim(candidate) else { return }
         terminalRecordClaimsByConnectionID[connectionID] = claim
 
+        #if DEBUG
+            let terminalRecordDirectoryURL = debugTerminalRecordDirectoryURLForTesting
+                ?? MCPFilesystemConstants.eventsDirectoryURL()
+        #else
+            let terminalRecordDirectoryURL = MCPFilesystemConstants.eventsDirectoryURL()
+        #endif
         if MCPTerminalRecordStore.writeBestEffort(
             record,
-            to: MCPFilesystemConstants.eventsDirectoryURL()
+            to: terminalRecordDirectoryURL
         ) != nil {
             claim.markPersisted()
             terminalRecordClaimsByConnectionID[connectionID] = claim
@@ -5811,7 +5827,9 @@ actor ServerNetworkManager {
         invocationID: UUID,
         elapsedMilliseconds: Double,
         handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?,
-        handlerPhaseAgeMilliseconds: Double?
+        handlerPhaseAgeMilliseconds: Double?,
+        executionDeadlineMilliseconds: Double?,
+        cleanupGraceMilliseconds: Double?
     ) async {
         guard executionWatchdogTerminalConnections.insert(id).inserted else { return }
         let activeToolExecutionScopeCount = activeToolScopeIDs(ownedBy: id).values.reduce(0) { $0 + $1.count }
@@ -5833,7 +5851,16 @@ actor ServerNetworkManager {
         let closeContext = MCPConnectionCloseContext(
             reason: "tool_execution_watchdog",
             initiator: .app,
-            errorDescription: "Unresponsive tool execution exceeded the watchdog deadline"
+            errorDescription: "Unresponsive tool execution exceeded the watchdog deadline",
+            toolExecution: MCPTerminalToolExecutionContext(
+                toolName: toolName,
+                invocationID: invocationID,
+                elapsedMilliseconds: elapsedMilliseconds,
+                handlerPhase: handlerPhase?.phase.rawValue,
+                handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds,
+                executionDeadlineMilliseconds: executionDeadlineMilliseconds,
+                cleanupGraceMilliseconds: cleanupGraceMilliseconds
+            )
         )
         persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
 
@@ -8784,7 +8811,8 @@ actor ServerNetworkManager {
                 connectionID: UUID,
                 connection: any MCPServerConnection,
                 clientName: String,
-                sessionToken: String
+                sessionToken: String,
+                bootstrapPeerPID: Int? = nil
             ) {
                 if !isRunningState {
                     lifecycleGeneration &+= 1
@@ -8793,6 +8821,9 @@ actor ServerNetworkManager {
                 debugExecutionWatchdogAbortTargets[connectionID] = connection
                 connections[connectionID] = connection
                 connectionLifecycleGenerationByID[connectionID] = lifecycleGeneration
+                if let bootstrapPeerPID {
+                    bootstrapPeerPIDByConnectionID[connectionID] = bootstrapPeerPID
+                }
                 pendingConnections[connectionID] = clientName
                 bindSessionToken(sessionToken, to: connectionID)
                 if callLimiters[connectionID] == nil {
@@ -8804,6 +8835,10 @@ actor ServerNetworkManager {
                         fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                     )
                 }
+            }
+
+            func debugSetTerminalRecordDirectoryURLForTesting(_ directoryURL: URL?) {
+                debugTerminalRecordDirectoryURLForTesting = directoryURL
             }
 
             func debugSetToolExecutionWatchdogEnvironment(_ environment: MCPToolExecutionWatchdogEnvironment) {
@@ -11535,7 +11570,9 @@ actor ServerNetworkManager {
                                             invocationID: invocationID,
                                             elapsedMilliseconds: max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             handlerPhase: handlerPhase,
-                                            handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds
+                                            handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds,
+                                            executionDeadlineMilliseconds: selectedExecutionContract?.deadline?.mcpMilliseconds,
+                                            cleanupGraceMilliseconds: selectedExecutionContract?.cancellationGrace?.mcpMilliseconds
                                         )
                                         // The transport is already severed. Deliberately skip handlerResult so
                                         // execution-completion tracing cannot be mistaken for response delivery.

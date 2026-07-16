@@ -196,6 +196,32 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         XCTAssertTrue(event.description.contains("handler_phase=manage_selection.auto_selection_drain"))
         XCTAssertTrue(event.description.contains("handler_phase_transition=started"))
         XCTAssertTrue(event.description.contains("handler_phase_age_ms=2000.000"))
+        XCTAssertEqual(
+            [
+                MCPToolExecutionHandlerPhase.getCodeStructureSeedResolution,
+                .getCodeStructureSeedDemand,
+                .getCodeStructureProjectionWait,
+                .getCodeStructureGraphQuery,
+                .getCodeStructureTargetDemand,
+                .getCodeStructureGraphRequery,
+                .getCodeStructureFreeze,
+                .getCodeStructureRender,
+                .getCodeStructureAssembly,
+                .getCodeStructurePublicationRevalidation
+            ].map(\.rawValue),
+            [
+                "get_code_structure.seed_resolution",
+                "get_code_structure.seed_demand",
+                "get_code_structure.projection_wait",
+                "get_code_structure.graph_query",
+                "get_code_structure.target_demand",
+                "get_code_structure.graph_requery",
+                "get_code_structure.freeze",
+                "get_code_structure.render",
+                "get_code_structure.assembly",
+                "get_code_structure.publication_revalidation"
+            ]
+        )
     }
 
     func testExternalCancellationCancelsOwnedTasksAndPropagatesCancellation() async throws {

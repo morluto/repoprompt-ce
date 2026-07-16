@@ -13,6 +13,18 @@ enum MCPToolExecutionHandlerPhase: String, Equatable {
     case fileActionsPostMutationCatalog = "file_actions.post_mutation_catalog"
     case fileActionsPostMutationSelection = "file_actions.post_mutation_selection"
     case fileActionsReplyConstruction = "file_actions.reply_construction"
+    // Execution-stage namespace; intentionally independent from CodeStructureReplyDTO
+    // issue phase values such as "graph", "publication", and "readiness".
+    case getCodeStructureSeedResolution = "get_code_structure.seed_resolution"
+    case getCodeStructureSeedDemand = "get_code_structure.seed_demand"
+    case getCodeStructureProjectionWait = "get_code_structure.projection_wait"
+    case getCodeStructureGraphQuery = "get_code_structure.graph_query"
+    case getCodeStructureTargetDemand = "get_code_structure.target_demand"
+    case getCodeStructureGraphRequery = "get_code_structure.graph_requery"
+    case getCodeStructureFreeze = "get_code_structure.freeze"
+    case getCodeStructureRender = "get_code_structure.render"
+    case getCodeStructureAssembly = "get_code_structure.assembly"
+    case getCodeStructurePublicationRevalidation = "get_code_structure.publication_revalidation"
 }
 
 enum MCPToolExecutionHandlerPhaseTransition: String, Equatable {

@@ -1751,6 +1751,105 @@ import XCTest
             }
         }
 
+        func testGetCodeStructureWatchdogPersistsAttributedTerminalRecordThroughPeerPIDGuard() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let clock = ExecutionWatchdogManualClock()
+                let operationGate = MCPExecutionIgnoringCancellationGate()
+                let recorder = MCPExecutionTraceRecorder()
+                let manager = fixture.networkManager
+                let terminalRecordDirectory = fixture.rootURL.appendingPathComponent(
+                    "terminal-records",
+                    isDirectory: true
+                )
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.debugSetTerminalRecordDirectoryURLForTesting(terminalRecordDirectory)
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(
+                    toolName: MCPWindowToolName.getCodeStructure
+                ) {
+                    await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureAssembly)
+                    await operationGate.enterAndWait()
+                    return .null
+                }
+                do {
+                    let endpoint = try fixture.endpointA()
+                    let call = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.getCodeStructure,
+                            arguments: [
+                                "scope": "paths",
+                                "paths": [fixture.contextA.fileURL.path],
+                                "context_id": fixture.contextA.tabID.uuidString
+                            ]
+                        )
+                    }
+                    try await clock.waitForSleeperCount(1)
+                    try await operationGate.waitUntilEntered(count: 1)
+                    let invocationID = try XCTUnwrap(recorder.snapshot().first {
+                        $0.connectionID == endpoint.connectionID
+                            && $0.toolName == MCPWindowToolName.getCodeStructure
+                            && $0.phase == .started
+                    }?.invocationID)
+
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+                    try await clock.waitForSleeperCount(1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+                    await Self.assertSocketClosed(call)
+
+                    let didPersist = await Self.waitUntil {
+                        (try? FileManager.default.contentsOfDirectory(
+                            at: terminalRecordDirectory,
+                            includingPropertiesForKeys: nil
+                        ).contains { $0.lastPathComponent.hasPrefix("terminal-") }) == true
+                    }
+                    XCTAssertTrue(didPersist)
+                    let decoder = JSONDecoder()
+                    decoder.dateDecodingStrategy = .iso8601
+                    let records = try FileManager.default.contentsOfDirectory(
+                        at: terminalRecordDirectory,
+                        includingPropertiesForKeys: nil
+                    ).filter { $0.lastPathComponent.hasPrefix("terminal-") }.map {
+                        try decoder.decode(MCPTerminalRecord.self, from: Data(contentsOf: $0))
+                    }
+                    let record = try XCTUnwrap(records.first {
+                        $0.appConnectionID == endpoint.connectionID
+                            && $0.reason == "tool_execution_watchdog"
+                    })
+                    XCTAssertEqual(record.layer, .appAcceptedSocket)
+                    XCTAssertEqual(record.peerPID, Int(getpid()))
+                    XCTAssertEqual(record.toolName, MCPWindowToolName.getCodeStructure)
+                    XCTAssertEqual(record.invocationID, invocationID)
+                    XCTAssertGreaterThanOrEqual(record.elapsedMilliseconds ?? -1, 35000)
+                    XCTAssertEqual(record.handlerPhase, "get_code_structure.assembly")
+                    XCTAssertGreaterThanOrEqual(record.handlerPhaseAgeMilliseconds ?? -1, 35000)
+                    XCTAssertEqual(record.executionDeadlineMilliseconds, 30000)
+                    XCTAssertEqual(record.cleanupGraceMilliseconds, 5000)
+
+                    await operationGate.release()
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.getCodeStructure,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await manager.debugSetTerminalRecordDirectoryURLForTesting(nil)
+                    await fixture.cleanup()
+                } catch {
+                    await operationGate.release()
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.getCodeStructure,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await manager.debugSetTerminalRecordDirectoryURLForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         private static func waitUntil(
             timeout: Duration = .seconds(10),
             condition: () async -> Bool
