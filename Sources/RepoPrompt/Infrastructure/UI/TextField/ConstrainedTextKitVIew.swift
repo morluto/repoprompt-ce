@@ -103,7 +103,7 @@ struct ConstrainedTextKitView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: ConstrainedTextKitView
-        let undo = UndoManager()
+        private let undo = UndoManager()
         var internalText: String
         var highlightTask: Task<Void, Never>?
         var isActive = true
@@ -126,6 +126,21 @@ struct ConstrainedTextKitView: NSViewRepresentable {
 
         func undoManager(for view: NSTextView) -> UndoManager? {
             undo
+        }
+
+        func performExternalReplacement(
+            in textView: NSTextView,
+            mutation: () -> Void
+        ) {
+            TextViewUndoSafeReplacement.perform(
+                in: textView,
+                undoManager: undo,
+                mutation: mutation
+            )
+        }
+
+        func clearUndoHistory() {
+            undo.removeAllActions()
         }
     }
 
@@ -266,7 +281,12 @@ struct ConstrainedTextKitView: NSViewRepresentable {
 
         // Refresh text if external binding changed
         if tv.string != text {
-            tv.string = text
+            if tv.hasMarkedText() { return }
+
+            context.coordinator.performExternalReplacement(in: tv) {
+                tv.string = text
+                context.coordinator.internalText = text
+            }
             // ▼ Re-apply highlighting for the updated content
             applySyntaxHighlighting(to: tv, coordinator: context.coordinator)
             // Only ensure layout after text changes
@@ -281,7 +301,7 @@ struct ConstrainedTextKitView: NSViewRepresentable {
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.allowsUndo = false
         coordinator.highlightTask?.cancel()
-        coordinator.undo.removeAllActions()
+        coordinator.clearUndoHistory()
         coordinator.isActive = false
     }
 }
