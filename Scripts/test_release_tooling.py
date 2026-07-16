@@ -1371,7 +1371,9 @@ fi
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         universal_builder = (SCRIPT_DIR / "build_swiftpm_release_products.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        promote_script = (SCRIPT_DIR / "promote_release.sh").read_text(encoding="utf-8")
         release_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        promote_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release-promote.yml").read_text(encoding="utf-8")
         conductor = (SCRIPT_DIR / "conductor.py").read_text(encoding="utf-8")
 
         self.assertIn('SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"', package_script)
@@ -1396,18 +1398,28 @@ fi
         self.assertIn('--commit "$source_repository@$RELEASE_COMMIT"', release_script)
         self.assertIn('finalize_sentry_release', release_script)
         self.assertIn('releases finalize "$SENTRY_RELEASE_NAME"', release_script)
-        self.assertIn('record_sentry_production_deploy', release_script)
-        self.assertIn('releases deploys "$SENTRY_RELEASE_NAME" new', release_script)
-        self.assertIn('--env "$SENTRY_DEPLOY_ENVIRONMENT"', release_script)
-        self.assertIn('--name "$RELEASE_TAG"', release_script)
+        self.assertNotIn('record_sentry_production_deploy', release_script)
+        self.assertNotIn('releases deploys "$SENTRY_RELEASE_NAME" new', release_script)
         self.assertIn('SENTRY_AUTH_TOKEN="$(tr -d', release_script)
+
+        self.assertIn('preflight_sentry_deploy_access', promote_script)
+        self.assertIn('record_verified_sentry_deploy_if_needed', promote_script)
+        self.assertIn("'$value | @uri'", promote_script)
+        self.assertIn('sentry_api_request POST', promote_script)
+        self.assertNotIn('sentry-cli', promote_script)
+        sentry_request = promote_script.split("sentry_api_request() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("--retry", sentry_request)
 
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}\n\ncase", 1)[0]
         self.assertLess(publish_staged.index("prepare_sentry_release"), publish_staged.index("upload_required_sentry_symbols"))
         self.assertLess(publish_staged.index("upload_required_sentry_symbols"), publish_staged.index("gh release view"))
         self.assertLess(publish_staged.index("gh release view"), publish_staged.index("gh release create"))
         self.assertLess(publish_staged.index("gh release create"), publish_staged.index("finalize_sentry_release"))
-        self.assertLess(publish_staged.index("finalize_sentry_release"), publish_staged.index("record_sentry_production_deploy"))
+
+        promote_case = promote_script.split('    promote)\n', 1)[1].split('        ;;', 1)[0]
+        self.assertLess(promote_case.index("preflight_sentry_deploy_access"), promote_case.index("publish_reviewed_release"))
+        self.assertLess(promote_case.index("publish_reviewed_release"), promote_case.index("verify_anonymous_publish"))
+        self.assertLess(promote_case.index("verify_anonymous_publish"), promote_case.index("record_verified_sentry_deploy_if_needed"))
 
         stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
         publish_job = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
@@ -1423,7 +1435,16 @@ fi
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', publish_job)
         self.assertIn("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}", publish_job)
         self.assertIn("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}", publish_job)
-        self.assertIn("REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT: production", publish_job)
+
+        promote_job = promote_workflow.split("\n  promote:", 1)[1]
+        self.assertIn("Prepare Sentry promotion token file", promote_job)
+        self.assertIn("SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}", promote_job)
+        self.assertIn("chmod 600", promote_job)
+        self.assertIn("REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}", promote_job)
+        self.assertIn("REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}", promote_job)
+        self.assertIn("REPOPROMPT_SENTRY_DEPLOY_ENVIRONMENT: production", promote_job)
+        self.assertIn("Remove Sentry promotion token file", promote_job)
+        self.assertNotIn("sentry-cli", promote_job)
 
         self.assertIn('"REPOPROMPT_ENABLE_SENTRY"', conductor)
         self.assertIn('"REPOPROMPT_UPLOAD_SENTRY_SYMBOLS"', conductor)
@@ -2032,6 +2053,7 @@ validate_generated_tip_appcast""",
         ci_workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         release_candidate_workflow = (root / ".github" / "workflows" / "release-candidate.yml").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        promote_script = (SCRIPT_DIR / "promote_release.sh").read_text(encoding="utf-8")
         staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
         bootstrap_source = (
             root
@@ -2043,12 +2065,16 @@ validate_generated_tip_appcast""",
         ).read_text(encoding="utf-8")
 
         self.assertIn('.package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1")', package_manifest)
-        self.assertIn('repoPromptAppDependencies.append(.product(name: "Sentry", package: "sentry-cocoa"))', package_manifest)
+        self.assertIn('let sentryDependency = Target.Dependency.product(name: "Sentry", package: "sentry-cocoa")', package_manifest)
+        self.assertIn('repoPromptAppDependencies.append(sentryDependency)', package_manifest)
         self.assertIn('repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
+        self.assertIn('repoPromptTestDependencies.append(sentryDependency)', package_manifest)
+        self.assertIn('repoPromptTestSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))', package_manifest)
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', release_workflow)
         self.assertIn('name: Sentry-enabled Build', ci_workflow)
         self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', ci_workflow)
         self.assertIn('swift build --product RepoPrompt', ci_workflow)
+        self.assertIn('swift test --filter SentryTelemetryPrivacyTests', ci_workflow)
         self.assertIn('smoke_packaged_mcp_roundtrip.sh', release_candidate_workflow)
         self.assertIn('".build/release/RepoPrompt.app"', release_candidate_workflow)
         self.assertIn("SENTRY_DSN: ${{ secrets.SENTRY_DSN }}", release_workflow)
@@ -2066,14 +2092,17 @@ validate_generated_tip_appcast""",
         self.assertIn('event.serverName = nil', bootstrap_source)
         self.assertIn('deviceIdentifierKeys', bootstrap_source)
         self.assertIn('geoPayloadKeys', bootstrap_source)
-        self.assertIn('options.dist = nil', bootstrap_source)
+        self.assertIn('event.dist = nil', bootstrap_source)
+        self.assertIn('scrub(stacktrace: event.stacktrace)', bootstrap_source)
+        self.assertIn('event.debugMeta?.forEach', bootstrap_source)
         self.assertIn('options.tracesSampleRate = performanceTracingEnabled ? 0.05 : 0', bootstrap_source)
         self.assertIn('#if DEBUG\n                if let value = ProcessInfo.processInfo.environment["REPOPROMPT_SENTRY_DSN"]', bootstrap_source)
         self.assertIn('Official Sentry-enabled release publishing requires SENTRY_AUTH_TOKEN', release_script)
         self.assertIn('SENTRY_RELEASE_NAME="$BUNDLE_ID@$MARKETING_VERSION+$BUILD_NUMBER"', release_script)
         self.assertIn('prepare_sentry_release', release_script)
         self.assertIn('finalize_sentry_release', release_script)
-        self.assertIn('record_sentry_production_deploy', release_script)
+        self.assertNotIn('record_sentry_production_deploy', release_script)
+        self.assertIn('record_verified_sentry_deploy_if_needed', promote_script)
 
         pins = {pin["identity"]: pin for pin in package_resolved["pins"]}
         self.assertEqual(pins["sentry-cocoa"]["state"]["version"], "9.17.1")
