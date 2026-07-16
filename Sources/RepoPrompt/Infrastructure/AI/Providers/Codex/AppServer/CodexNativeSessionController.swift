@@ -1626,7 +1626,7 @@ final class CodexNativeSessionController {
             input.append([
                 "type": "text",
                 "text": trimmedText,
-                "textElements": []
+                "text_elements": []
             ])
         }
         guard !input.isEmpty else {
