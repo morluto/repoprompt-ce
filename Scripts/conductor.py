@@ -145,7 +145,8 @@ Operation commands:
   ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
   ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
-      (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
+    --execution-location-ui uses REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT (default 3s) and _CYCLES (default 3); Accessibility permission is required.
+    (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor diagnostics build-cache [--limit <n>]
   ./conductor release preflight|artifact|package|local-install
@@ -3843,6 +3844,18 @@ def find_debug_app_pids() -> List[str]:
     return [str(pid) for pid in matching_processes(debug_app_executable_path())]
 
 
+def execution_location_ui_smoke_timeout(env: Dict[str, str]) -> float:
+    try:
+        wait_seconds = max(0.0, float(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT", "3")))
+    except ValueError:
+        wait_seconds = 3.0
+    try:
+        cycles = max(1, int(env.get("REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES", "3")))
+    except ValueError:
+        cycles = 3
+    return cycles * (wait_seconds + 60.0) + 60.0
+
+
 def terminate_debug_app_processes() -> List[str]:
     return [str(pid) for pid in terminate_matching_processes(debug_app_executable_path())]
 
@@ -4316,11 +4329,20 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
             return code
 
     if args.get("executionLocationUI"):
+        debug_pids = find_debug_app_pids()
+        if len(debug_pids) != 1:
+            print(
+                "ERROR: execution-location UI smoke requires exactly one running RepoPrompt debug app "
+                f"matching {debug_app_executable_path()}; found {len(debug_pids)}.",
+                flush=True,
+            )
+            return 1
         code, _stdout, _stderr = run_operation_command(
             "execution location UI smoke",
-            [str(repo_root / "Scripts" / "smoke_agent_execution_location_popover.sh"), "RepoPrompt"],
+            [str(repo_root / "Scripts" / "smoke_agent_execution_location_popover.sh"), debug_pids[0]],
             repo_root,
             env=env,
+            timeout=execution_location_ui_smoke_timeout(env),
         )
         if code != 0:
             return code
