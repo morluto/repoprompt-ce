@@ -1751,7 +1751,7 @@ import XCTest
             }
         }
 
-        func testGetCodeStructureWatchdogPersistsAttributedTerminalRecordThroughPeerPIDGuard() async throws {
+        func testReadFileWatchdogPersistsAttributedTerminalRecordThroughPeerPIDGuard() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let clock = ExecutionWatchdogManualClock()
@@ -1766,7 +1766,7 @@ import XCTest
                 await manager.debugSetTerminalRecordDirectoryURLForTesting(terminalRecordDirectory)
                 await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
                 await manager.debugSetResolvedToolOperationOverride(
-                    toolName: MCPWindowToolName.getCodeStructure
+                    toolName: MCPWindowToolName.readFile
                 ) {
                     await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureAssembly)
                     await operationGate.enterAndWait()
@@ -1776,10 +1776,9 @@ import XCTest
                     let endpoint = try fixture.endpointA()
                     let call = Task {
                         try await endpoint.callTool(
-                            name: MCPWindowToolName.getCodeStructure,
+                            name: MCPWindowToolName.readFile,
                             arguments: [
-                                "scope": "paths",
-                                "paths": [fixture.contextA.fileURL.path],
+                                "path": fixture.contextA.fileURL.path,
                                 "context_id": fixture.contextA.tabID.uuidString
                             ]
                         )
@@ -1788,7 +1787,7 @@ import XCTest
                     try await operationGate.waitUntilEntered(count: 1)
                     let invocationID = try XCTUnwrap(recorder.snapshot().first {
                         $0.connectionID == endpoint.connectionID
-                            && $0.toolName == MCPWindowToolName.getCodeStructure
+                            && $0.toolName == MCPWindowToolName.readFile
                             && $0.phase == .started
                     }?.invocationID)
 
@@ -1818,7 +1817,7 @@ import XCTest
                     })
                     XCTAssertEqual(record.layer, .appAcceptedSocket)
                     XCTAssertEqual(record.peerPID, Int(getpid()))
-                    XCTAssertEqual(record.toolName, MCPWindowToolName.getCodeStructure)
+                    XCTAssertEqual(record.toolName, MCPWindowToolName.readFile)
                     XCTAssertEqual(record.invocationID, invocationID)
                     XCTAssertGreaterThanOrEqual(record.elapsedMilliseconds ?? -1, 35000)
                     XCTAssertEqual(record.handlerPhase, "get_code_structure.assembly")
@@ -1829,7 +1828,7 @@ import XCTest
                     await operationGate.release()
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugSetResolvedToolOperationOverride(
-                        toolName: MCPWindowToolName.getCodeStructure,
+                        toolName: MCPWindowToolName.readFile,
                         operation: nil
                     )
                     await manager.debugResetToolExecutionWatchdogEnvironment()
@@ -1839,7 +1838,7 @@ import XCTest
                     await operationGate.release()
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugSetResolvedToolOperationOverride(
-                        toolName: MCPWindowToolName.getCodeStructure,
+                        toolName: MCPWindowToolName.readFile,
                         operation: nil
                     )
                     await manager.debugResetToolExecutionWatchdogEnvironment()
@@ -1962,7 +1961,8 @@ import XCTest
                             && $0.toolName == MCPWindowToolName.getCodeStructure
                             && $0.phase == .detachedForSettlement
                     }
-                    let detachedEvent = try XCTUnwrap(detachEvents.only)
+                    XCTAssertEqual(detachEvents.count, 1)
+                    let detachedEvent = try XCTUnwrap(detachEvents.first)
                     XCTAssertTrue(detachedEvent.isAlwaysEmitted)
                     XCTAssertEqual(detachedEvent.cleanupDisposition, .detachAndSettle)
                     XCTAssertEqual(detachedEvent.cancellationOrigin, .watchdogDeadline)
