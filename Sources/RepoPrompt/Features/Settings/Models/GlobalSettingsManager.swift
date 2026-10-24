@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
+import RepoPromptShared
 
 // MARK: - Canonical Settings Keys
 
@@ -33,6 +36,10 @@ enum SettingKeys {
 
     /// App-wide UI font scale preset body size.
     static let fontPresetBodySize = "fontPresetBodySize"
+
+    /// Whether Agent Chats includes open Compose tabs without Agent sessions.
+    /// Referenced by Agent Mode Overview and the Agent Chats list.
+    static let agentModeShowComposeTabsWithoutAgentSessions = "agentModeShowComposeTabsWithoutAgentSessions"
 }
 
 extension Notification.Name {
@@ -50,601 +57,37 @@ extension Notification.Name {
 enum AgentModelsSettingsNotification {
     static let scopeKey = "scope"
     static let workspaceIDKey = "workspaceID"
+    static let sourceWorkspaceIDKey = "sourceWorkspaceID"
 
     enum Scope: String {
         case global
         case workspace
     }
-}
 
-// MARK: - Copy Global Settings (per workspace)
-
-struct CopyGlobalSettings: Codable {
-    var fileTreeOption: FileTreeOption
-    var codeMapUsage: CodeMapUsage
-    var gitInclusion: GitDiffInclusionMode
-    var workspaceID: UUID
-
-    // --- NEW: snapshot of Manual mode (persisted per workspace) ---
-    /// Manual mode's last-known settings (when Manual is not active).
-    var manualFileTreeOption: FileTreeOption? = nil
-    var manualCodeMapUsage: CodeMapUsage? = nil
-    var manualGitInclusion: GitDiffInclusionMode? = nil
-    var manualSelectedPromptIDs: Set<UUID>? = nil
-    var manualHasManualPromptSelection: Bool? = nil
-    var manualWorkingCopyCustomizations: CopyCustomizations? = nil
-    /// Optional: remembers the last non-manual preset for UX (copy context).
-    var lastNonManualCopyPresetID: UUID? = nil
-
-    init(
-        workspaceID: UUID,
-        fileTreeOption: FileTreeOption = .auto,
-        codeMapUsage: CodeMapUsage = .auto,
-        gitInclusion: GitDiffInclusionMode = .none,
-        manualFileTreeOption: FileTreeOption? = nil,
-        manualCodeMapUsage: CodeMapUsage? = nil,
-        manualGitInclusion: GitDiffInclusionMode? = nil,
-        manualSelectedPromptIDs: Set<UUID>? = nil,
-        manualHasManualPromptSelection: Bool? = nil,
-        manualWorkingCopyCustomizations: CopyCustomizations? = nil,
-        lastNonManualCopyPresetID: UUID? = nil
-    ) {
-        self.workspaceID = workspaceID
-        self.fileTreeOption = fileTreeOption
-        self.codeMapUsage = codeMapUsage
-        self.gitInclusion = gitInclusion
-        self.manualFileTreeOption = manualFileTreeOption
-        self.manualCodeMapUsage = manualCodeMapUsage
-        self.manualGitInclusion = manualGitInclusion
-        self.manualSelectedPromptIDs = manualSelectedPromptIDs
-        self.manualHasManualPromptSelection = manualHasManualPromptSelection
-        self.manualWorkingCopyCustomizations = manualWorkingCopyCustomizations
-        self.lastNonManualCopyPresetID = lastNonManualCopyPresetID
-    }
-}
-
-// MARK: - Chat Global Settings (per workspace)
-
-struct ChatGlobalSettings: Codable {
-    var fileTreeOption: FileTreeOption
-    var codeMapUsage: CodeMapUsage
-    var gitInclusion: GitDiffInclusionMode
-    var planActMode: PromptViewModel.PlanActMode
-    var proFileEdits: Bool
-    var workspaceID: UUID
-
-    // --- NEW: snapshot of Manual mode (persisted per workspace) ---
-    /// Manual mode's last-known chat settings (when Manual is not active).
-    var manualFileTreeOption: FileTreeOption? = nil
-    var manualCodeMapUsage: CodeMapUsage? = nil
-    var manualGitInclusion: GitDiffInclusionMode? = nil
-    var manualPlanActMode: PromptViewModel.PlanActMode? = nil
-    var manualProFileEdits: Bool? = nil
-    var manualSelectedPromptIDs: Set<UUID>? = nil
-    var manualHasManualPromptSelection: Bool? = nil
-    /// NEW: remember last non-manual preset so UI can restore it later
-    var lastNonManualChatPresetID: UUID? = nil
-    var lastNonManualChatPresetName: String? = nil
-
-    // MARK: - Legacy Context Builder Agent & Model (decode compatibility only)
-
-    var lastUsedDiscoverAgentRaw: String? = nil
-    /// Maps agent rawValue to last-used model rawValue for that agent
-    var lastUsedDiscoverModelsByAgent: [String: String]? = nil
-    /// Discovery token budget (workspace-scoped)
-    var discoveryTokenBudget: Int? = nil
-    /// Discovery prompt enhancement mode (workspace-scoped) - stores raw value of PromptEnhancementMode enum
-    var discoveryEnhancementMode: String? = nil
-    /// Default auto-plan setting for new/unstored tabs (workspace-scoped fallback).
-    /// Per-tab values live in ComposeTabState.contextBuilder.autoGeneratePlan.
-    var discoveryAutoGeneratePlan: Bool? = nil
-    /// Allow Context Builder to ask clarifying questions mid-run (workspace-scoped, UI-triggered)
-    var discoveryAllowClarifyingQuestions: Bool? = nil
-    /// Allow clarifying questions when discovery is triggered via MCP context_builder (workspace-scoped, defaults false)
-    var discoveryAllowClarifyingQuestionsForMCP: Bool? = nil
-    /// Timeout (in seconds) for clarifying question responses (workspace-scoped, defaults to 300)
-    var discoveryQuestionTimeoutSeconds: TimeInterval? = nil
-    /// Token budget for plan generation (workspace-scoped, defaults to 80k)
-    var discoveryPlanTokenBudget: Int? = nil
-
-    // MARK: - Context Builder Model (workspace-scoped)
-
-    var contextBuilderModelRaw: String? = nil
-
-    // MARK: - Legacy Context Builder Agent (decode compatibility only)
-
-    /// Former workspace-scoped agent selection. Runtime selection is global.
-    var contextBuilderAgentRaw: String? = nil
-    /// Former workspace-scoped model selection. Runtime selection is global.
-    var contextBuilderAgentModelRaw: String? = nil
-
-    // MARK: - Recommendation Wizard (workspace-scoped)
-
-    /// IDs of recommendations that have been dismissed/muted in this workspace.
-    var mutedRecommendationIDs: Set<String>? = nil
-    /// Timestamp of the last time user completed/dismissed the recommendation wizard.
-    var lastRecommendationWizardCompletedAt: Date? = nil
-
-    // MARK: - MCP Agent Role Default Overrides (legacy workspace-scoped)
-
-    /// Legacy workspace-scoped role-default overrides.
-    /// New code stores role defaults globally in GlobalDefaults.mcpAgentRoleOverrides and ignores this field
-    /// after one-time migration. Kept for backwards compatibility and rollback safety.
-    var mcpAgentRoleOverrides: [String: String]? = nil
-
-    // MARK: - Recommendation Bootstrap Tracking (workspace-scoped)
-
-    /// Legacy workspace bootstrap marker retained for decoding compatibility.
-    var didUserSetDiscoverAgentDefaults: Bool? = nil
-    /// Legacy workspace bootstrap marker retained for decoding compatibility.
-    var didUserSetContextBuilderDefaults: Bool? = nil
-    /// Set when we auto-apply recommendations on workspace creation (for idempotency).
-    var didAutoApplyRecommendationsAt: Date? = nil
-
-    init(
-        workspaceID: UUID,
-        fileTreeOption: FileTreeOption = .auto,
-        codeMapUsage: CodeMapUsage = .auto,
-        gitInclusion: GitDiffInclusionMode = .none,
-        planActMode: PromptViewModel.PlanActMode = .chat,
-        proFileEdits: Bool = false,
-        manualFileTreeOption: FileTreeOption? = nil,
-        manualCodeMapUsage: CodeMapUsage? = nil,
-        manualGitInclusion: GitDiffInclusionMode? = nil,
-        manualPlanActMode: PromptViewModel.PlanActMode? = nil,
-        manualProFileEdits: Bool? = nil,
-        manualSelectedPromptIDs: Set<UUID>? = nil,
-        manualHasManualPromptSelection: Bool? = nil,
-        lastNonManualChatPresetID: UUID? = nil,
-        lastNonManualChatPresetName: String? = nil,
-        lastUsedDiscoverAgentRaw: String? = nil,
-        lastUsedDiscoverModelsByAgent: [String: String]? = nil,
-        discoveryTokenBudget: Int? = nil,
-        discoveryEnhancementMode: String? = nil,
-        discoveryAutoGeneratePlan: Bool? = nil,
-        contextBuilderModelRaw: String? = nil,
-        contextBuilderAgentRaw: String? = nil,
-        contextBuilderAgentModelRaw: String? = nil
-    ) {
-        self.workspaceID = workspaceID
-        self.fileTreeOption = fileTreeOption
-        self.codeMapUsage = codeMapUsage
-        self.gitInclusion = gitInclusion
-        self.planActMode = planActMode
-        self.proFileEdits = proFileEdits
-        self.manualFileTreeOption = manualFileTreeOption
-        self.manualCodeMapUsage = manualCodeMapUsage
-        self.manualGitInclusion = manualGitInclusion
-        self.manualPlanActMode = manualPlanActMode
-        self.manualProFileEdits = manualProFileEdits
-        self.manualSelectedPromptIDs = manualSelectedPromptIDs
-        self.manualHasManualPromptSelection = manualHasManualPromptSelection
-        self.lastNonManualChatPresetID = lastNonManualChatPresetID
-        self.lastNonManualChatPresetName = lastNonManualChatPresetName
-        self.lastUsedDiscoverAgentRaw = lastUsedDiscoverAgentRaw
-        self.lastUsedDiscoverModelsByAgent = lastUsedDiscoverModelsByAgent
-        self.discoveryTokenBudget = discoveryTokenBudget
-        self.discoveryEnhancementMode = discoveryEnhancementMode
-        self.discoveryAutoGeneratePlan = discoveryAutoGeneratePlan
-        self.contextBuilderModelRaw = contextBuilderModelRaw
-        self.contextBuilderAgentRaw = contextBuilderAgentRaw
-        self.contextBuilderAgentModelRaw = contextBuilderAgentModelRaw
-    }
-}
-
-// MARK: - Global Defaults (cross-workspace seeding)
-
-/// Stores the global Context Builder agent/model selection (single source of truth).
-/// This is NOT per-workspace - it's the same across all workspaces.
-/// Persisted field names still use the legacy discover-agent keys for compatibility.
-struct GlobalDefaults: Codable, Equatable {
-    /// Global Context Builder agent selection (shared across all workspaces).
-    var discoverAgentRaw: String?
-    /// Maps agent rawValue to last-used model rawValue for that agent (global)
-    var discoverModelsByAgent: [String: String]?
-    var discoveryTokenBudget: Int?
-    var discoveryEnhancementMode: String?
-    /// Former preferred context-builder agent retained for decoding compatibility.
-    var contextBuilderAgentRaw: String?
-    /// Schema version for recommendations (used to clear mutes on new best practices)
-    var recommendationSchemaVersion: Int?
-    /// Schema version for discovery token budget (used to reset to new defaults)
-    var tokenBudgetSchemaVersion: Int?
-    /// True when the user has explicitly set the global Context Builder agent/model.
-    var didUserSetDiscoverAgentDefaults: Bool?
-    /// Global MCP Agent Mode role-default overrides (shared across all workspaces).
-    /// Keys are TaskLabelKind rawValues, values are AgentModelSelectionID rawValues.
-    var mcpAgentRoleOverrides: [String: String]?
-    /// One-time migration version for legacy workspace-scoped MCP role overrides.
-    var mcpAgentRoleOverridesMigrationVersion: Int?
-    /// Global provider filter used by recommendation generation. nil means all providers.
-    var recommendationProviderFilterRaw: [String]?
-    /// Cross-workspace override that disables Code Maps without mutating per-workspace modes.
-    var codeMapsGloballyDisabled: Bool?
-    /// Global per-repository visual identities for Git worktrees.
-    /// Stored as an additive optional field for schema-compatible rollout.
-    var worktreeVisualIdentitiesByRepositoryID: [String: WorktreeVisualIdentityRepositoryBucket]?
-}
-
-// MARK: - Scalar Settings Snapshots
-
-struct FileSystemSettingsSnapshot: Equatable {
-    var respectRepoIgnore: Bool
-    var respectCursorignore: Bool
-    var globalIgnoreDefaults: String
-    var enableHierarchicalIgnores: Bool
-    var skipSymlinks: Bool
-    var showEmptyFolders: Bool
-}
-
-/// In-memory diagnostics for settings writes that affect recommendation satisfaction.
-/// Kept deliberately small and non-persistent so callers can inspect recent writes
-/// during triage without changing app state or bloating the settings document.
-struct GlobalSettingsWriteDiagnostic: Equatable {
-    let timestamp: Date
-    let key: String
-    let oldValue: String?
-    let newValue: String?
-    let commit: Bool
-    let markUserDefined: Bool?
-    let reason: String
-    let caller: String
-}
-
-// MARK: - Global Settings Store (Persistent)
-
-/// This is the single source of truth for workspace default settings.
-/// Primary persistence is the Application Support JSON document at
-/// `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`.
-/// Windows use WindowSettingsManager to maintain local overlays.
-@MainActor
-class GlobalSettingsStore: ObservableObject {
-    static let shared = GlobalSettingsStore()
-
-    private let defaults: UserDefaults
-    private let fileStore: GlobalSettingsFileStoring
-
-    @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
-    @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
-    @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
-    @Published private(set) var codeMapsGloballyDisabled: Bool = false
-    /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
-    /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
-    @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason?
-    private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
-    private var scalarPreferences = GlobalScalarPreferences()
-
-    private static let defaultBackgroundAgentComposeTabHardLimit = 500
-    private static let defaultComposeTabSoftLimit = 50
-    private static let defaultAppearanceModeRaw = "System"
-    private static let defaultFilePathDisplayOptionRaw = "Full"
-    private static let defaultSelectedFilesSortMethodRaw = "nameAscending"
-    private static let defaultFileEditFormatRaw = "Diff"
-    private static let defaultComplexEditStrategyRaw = "Sequential split"
-    private static let telemetryEnabledDefaultsKey = "telemetry.enabled"
-    private static let settingsWriteDiagnosticsLimit = 80
-
-    private var settingsWriteDiagnostics: [GlobalSettingsWriteDiagnostic] = []
-
-    init(
-        defaults: UserDefaults = .standard,
-        fileStore: GlobalSettingsFileStoring = GlobalSettingsFileStore()
-    ) {
-        self.defaults = defaults
-        self.fileStore = fileStore
-        load()
-        ensureFileSystemGlobalIgnoreDefaultsSeeded()
-    }
-
-    func recentSettingsWriteDiagnostics() -> [GlobalSettingsWriteDiagnostic] {
-        settingsWriteDiagnostics
-    }
-
-    private func recordSettingsWriteDiagnostic(
-        key: String,
-        oldValue: String?,
-        newValue: String?,
-        commit: Bool,
-        markUserDefined: Bool? = nil,
-        reason: String?,
-        fileID: StaticString,
-        line: UInt,
-        function: StaticString
-    ) {
-        let fallbackReason = "\(function)"
-        let trimmedReason = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let diagnostic = GlobalSettingsWriteDiagnostic(
-            timestamp: Date(),
-            key: key,
-            oldValue: oldValue,
-            newValue: newValue,
-            commit: commit,
-            markUserDefined: markUserDefined,
-            reason: trimmedReason?.isEmpty == false ? trimmedReason! : fallbackReason,
-            caller: "\(fileID):\(line) \(function)"
-        )
-        settingsWriteDiagnostics.append(diagnostic)
-        if settingsWriteDiagnostics.count > Self.settingsWriteDiagnosticsLimit {
-            settingsWriteDiagnostics.removeFirst(settingsWriteDiagnostics.count - Self.settingsWriteDiagnosticsLimit)
-        }
-    }
-
-    // MARK: - Access Methods
-
-    func copySettings(for workspaceID: UUID) -> CopyGlobalSettings {
-        if let existing = copySettings[workspaceID] {
-            return existing
-        }
-        // Create default settings for new workspace
-        let newSettings = CopyGlobalSettings(workspaceID: workspaceID)
-        copySettings[workspaceID] = newSettings
-        save()
-        return newSettings
-    }
-
-    func chatSettings(for workspaceID: UUID) -> ChatGlobalSettings {
-        chatSettingsResult(for: workspaceID).settings
-    }
-
-    /// Returns chat settings for a workspace, along with whether they were newly created.
-    /// Use this when you need to know if this is a brand new workspace (for auto-apply).
-    func chatSettingsResult(for workspaceID: UUID) -> (settings: ChatGlobalSettings, isNew: Bool) {
-        if let existing = chatSettings[workspaceID] {
-            return (existing, false)
-        }
-        // Create default settings for new workspace
-        let newSettings = ChatGlobalSettings(workspaceID: workspaceID)
-        chatSettings[workspaceID] = newSettings
-        save()
-        return (newSettings, true)
-    }
-
-    func updateCopySettings(_ settings: CopyGlobalSettings) {
-        copySettings[settings.workspaceID] = settings
-        save()
-    }
-
-    func updateCopySettings(_ settings: CopyGlobalSettings, commit: Bool) {
-        copySettings[settings.workspaceID] = settings
-        if commit {
-            save()
-        }
-    }
-
-    func updateChatSettings(_ settings: ChatGlobalSettings) {
-        chatSettings[settings.workspaceID] = settings
-        // NOTE: We no longer sync workspace Context Builder agent/model to global defaults here.
-        // Global Context Builder settings are now the single source of truth, updated only via
-        // setGlobalContextBuilderAgentSelection() when the user explicitly changes them.
-        save()
-    }
-
-    func updateChatSettings(_ settings: ChatGlobalSettings, commit: Bool) {
-        chatSettings[settings.workspaceID] = settings
-        // NOTE: We no longer sync workspace Context Builder agent/model to global defaults here.
-        // Global Context Builder settings are now the single source of truth.
-        if commit {
-            save()
-        }
-    }
-
-    // MARK: - Scoped Agent Models Settings
-
-    func globalAgentModelsProfile() -> AgentModelsSettingsProfile {
-        AgentModelsSettingsProfile(
-            planningModelRaw: scalarPreferences.modelSelection?.planningModel,
-            preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
-            syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
-            contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
-            contextBuilderModelsByAgent: globalDefaults.discoverModelsByAgent,
-            mcpAgentRoleOverrides: globalDefaults.mcpAgentRoleOverrides,
-            restrictMCPAgentDiscoveryToRoleLabels: restrictMCPAgentDiscoveryToRoleLabels()
-        )
-    }
-
-    func setGlobalAgentModelsProfile(
-        _ profile: AgentModelsSettingsProfile,
-        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent
-    ) {
-        let oldProfile = globalAgentModelsProfile()
-        let normalized = normalizedAgentModelsProfile(profile)
-        var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
-        modelSelection.planningModel = normalized.planningModelRaw
-        modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
-        modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
-        scalarPreferences.modelSelection = modelSelection
-
-        var agentMode = scalarPreferences.agentMode ?? GlobalScalarPreferences.AgentModeSettings()
-        agentMode.restrictMCPAgentDiscoveryToRoleLabels = normalized.restrictMCPAgentDiscoveryToRoleLabels
-        scalarPreferences.agentMode = agentMode
-
-        globalDefaults.discoverAgentRaw = normalized.contextBuilderAgentRaw
-        globalDefaults.discoverModelsByAgent = normalized.contextBuilderModelsByAgent
-        globalDefaults.mcpAgentRoleOverrides = normalized.mcpAgentRoleOverrides
-        switch contextBuilderWriteIntent {
-        case .preserveExistingOwnership:
-            break
-        case .userInitiated:
-            globalDefaults.didUserSetDiscoverAgentDefaults = true
-        case .automaticSeed:
-            if globalDefaults.didUserSetDiscoverAgentDefaults != true {
-                globalDefaults.didUserSetDiscoverAgentDefaults = false
-            }
-        }
-
-        recordAgentModelsProfileWriteDiagnostic(
-            scope: .global,
-            workspaceID: nil,
-            oldProfile: oldProfile,
-            newProfile: normalized
-        )
-
-        objectWillChange.send()
-        save()
-        postAgentModelsSettingsDidChange(scope: .global)
-    }
-
-    func workspaceAgentModelsSettings(for workspaceID: UUID) -> WorkspaceAgentModelsSettings {
-        agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings()
-    }
-
-    func setWorkspaceAgentModelsInheritanceMode(
-        workspaceID: UUID,
-        mode: AgentModelsInheritanceMode
-    ) {
-        var settings = agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings()
-        let oldProfile = settings.profile
-        settings.inheritanceMode = mode
-        if mode == .useWorkspaceOverrides, settings.profile == nil {
-            settings.profile = globalAgentModelsProfile()
-        }
-        agentModelsSettingsByWorkspaceID[workspaceID] = settings
-        if oldProfile != settings.profile, let newProfile = settings.profile {
-            recordAgentModelsProfileWriteDiagnostic(
-                scope: .workspace,
-                workspaceID: workspaceID,
-                oldProfile: oldProfile,
-                newProfile: newProfile
-            )
-        }
-        save()
-        postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
-    }
-
-    func workspaceAgentModelsProfile(for workspaceID: UUID) -> AgentModelsSettingsProfile? {
-        agentModelsSettingsByWorkspaceID[workspaceID]?.profile
-    }
-
-    func setWorkspaceAgentModelsProfile(
-        workspaceID: UUID,
-        profile: AgentModelsSettingsProfile
-    ) {
-        let existing = agentModelsSettingsByWorkspaceID[workspaceID]
-        let oldProfile = existing?.profile
-        let normalized = normalizedAgentModelsProfile(profile)
-        let settings = WorkspaceAgentModelsSettings(
-            inheritanceMode: existing?.inheritanceMode ?? .useWorkspaceOverrides,
-            profile: normalized
-        )
-        agentModelsSettingsByWorkspaceID[workspaceID] = settings
-        recordAgentModelsProfileWriteDiagnostic(
-            scope: .workspace,
-            workspaceID: workspaceID,
-            oldProfile: oldProfile,
-            newProfile: normalized
-        )
-        save()
-        postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
-    }
-
-    func effectiveAgentModelsProfile(workspaceID: UUID?) -> AgentModelsSettingsProfile {
-        guard let workspaceID else { return globalAgentModelsProfile() }
-        let settings = workspaceAgentModelsSettings(for: workspaceID)
-        guard settings.inheritanceMode == .useWorkspaceOverrides,
-              let profile = settings.profile
-        else {
-            return globalAgentModelsProfile()
-        }
-        return normalizedAgentModelsProfile(profile)
-    }
-
-    func setAgentModelsMCPAgentRoleOverrides(
-        _ overrides: [String: String]?,
-        scope: AgentModelsEditingScope
-    ) {
-        updateAgentModelsProfile(scope: scope) { profile in
-            profile.mcpAgentRoleOverrides = overrides
-        }
-    }
-
-    func copyAgentModelsProfile(
-        from source: AgentModelsEditingScope,
-        to destination: AgentModelsEditingScope
-    ) {
-        let profile = agentModelsProfile(for: source)
-        switch destination {
+    static func userInfo(
+        scope: AgentModelsEditingScope,
+        sourceWorkspaceID: UUID? = nil
+    ) -> [String: Any] {
+        var userInfo: [String: Any] = switch scope {
         case .global:
-            setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .userInitiated)
+            [scopeKey: Scope.global.rawValue]
         case let .workspace(workspaceID):
-            let oldProfile = agentModelsSettingsByWorkspaceID[workspaceID]?.profile
-            let normalized = normalizedAgentModelsProfile(profile)
-            agentModelsSettingsByWorkspaceID[workspaceID] = WorkspaceAgentModelsSettings(
-                inheritanceMode: .useWorkspaceOverrides,
-                profile: normalized
-            )
-            recordAgentModelsProfileWriteDiagnostic(
-                scope: .workspace,
-                workspaceID: workspaceID,
-                oldProfile: oldProfile,
-                newProfile: normalized
-            )
-            save()
-            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+            [
+                scopeKey: Scope.workspace.rawValue,
+                workspaceIDKey: workspaceID
+            ]
         }
-    }
-
-    // MARK: - Scalar Preferences
-
-    func appearanceModeRaw() -> String {
-        scalarPreferences.ui?.appearanceMode ?? Self.defaultAppearanceModeRaw
-    }
-
-    func setAppearanceModeRaw(_ raw: String, commit: Bool = true) {
-        updateUIScalar(commit: commit) { settings in
-            settings.appearanceMode = raw
+        if let sourceWorkspaceID {
+            userInfo[sourceWorkspaceIDKey] = sourceWorkspaceID
         }
+        return userInfo
     }
+}
 
-    func useTransparency() -> Bool {
-        scalarPreferences.ui?.useTransparency ?? true
-    }
+// MARK: - App policy adapters
 
-    func setUseTransparency(_ enabled: Bool, commit: Bool = true) {
-        updateUIScalar(commit: commit) { settings in
-            settings.useTransparency = enabled
-        }
-    }
-
-    func collapseLatestFileChanges() -> Bool {
-        scalarPreferences.ui?.collapseLatestFileChanges ?? false
-    }
-
-    func setCollapseLatestFileChanges(_ enabled: Bool, commit: Bool = true) {
-        updateUIScalar(commit: commit) { settings in
-            settings.collapseLatestFileChanges = enabled
-        }
-    }
-
-    func showTooltips() -> Bool {
-        scalarPreferences.ui?.showTooltips ?? true
-    }
-
-    func setShowTooltips(_ enabled: Bool, commit: Bool = true) {
-        updateUIScalar(commit: commit) { settings in
-            settings.showTooltips = enabled
-        }
-    }
-
-    func showDatesInMessageTimestamps() -> Bool {
-        scalarPreferences.ui?.showDatesInMessageTimestamps ?? false
-    }
-
-    func setShowDatesInMessageTimestamps(_ enabled: Bool, commit: Bool = true) {
-        updateUIScalar(commit: commit) { settings in
-            settings.showDatesInMessageTimestamps = enabled
-        }
-    }
-
-    func experimentalAttributedTextEditor() -> Bool {
-        scalarPreferences.ui?.experimentalAttributedTextEditor ?? false
-    }
-
-    func setExperimentalAttributedTextEditor(_ enabled: Bool, commit: Bool = true) {
-        updateUIScalar(commit: commit) { settings in
-            settings.experimentalAttributedTextEditor = enabled
-        }
-    }
-
+/// Runtime catalogs, UI projections, and application side effects remain app-owned.
+extension GlobalSettingsStore {
     func fileMentionPickerStyle() -> FileMentionPickerStyle {
         FileMentionPickerStyle.normalized(rawValue: scalarPreferences.ui?.fileMentionPickerStyle)
     }
@@ -658,18 +101,6 @@ class GlobalSettingsStore: ObservableObject {
             settings.fileMentionPickerStyle = style.rawValue
         }
     }
-
-    func enableKeyboardShortcuts() -> Bool {
-        scalarPreferences.ui?.enableKeyboardShortcuts ?? true
-    }
-
-    func setEnableKeyboardShortcuts(_ enabled: Bool, commit: Bool = true) {
-        updateUIScalar(commit: commit) { settings in
-            settings.enableKeyboardShortcuts = enabled
-        }
-    }
-
-    // MARK: - History
 
     func historyIdleThresholdMinutes() -> Int {
         let raw = (defaults.object(forKey: HistoryMCPToolService.idleThresholdSettingsKey) as? Int)
@@ -702,390 +133,8 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     func reloadFontScaleBodySizeFromDisk() -> Double? {
-        do {
-            let document = try fileStore.load()
-            guard let diskRawValue = document.scalarPreferences?.ui?.fontScaleBodySize else {
-                return nil
-            }
-            let normalized = FontScalePreset(rawValue: diskRawValue)?.rawValue ?? FontScalePreset.normal.rawValue
-            var preferences = scalarPreferences
-            var uiSettings = preferences.ui ?? GlobalScalarPreferences.UISettings()
-            uiSettings.fontScaleBodySize = normalized
-            preferences.ui = uiSettings
-            guard preferences != scalarPreferences else {
-                return normalized
-            }
-
-            objectWillChange.send()
-            scalarPreferences = preferences
-            return normalized
-        } catch {
-            print("⚠️ Failed to reload font scale from global settings JSON at \(fileStore.fileURL.path): \(error)")
-            return nil
-        }
-    }
-
-    func promptSectionsOrderRaw() -> String {
-        scalarPreferences.promptPackaging?.promptSectionsOrder ?? ""
-    }
-
-    func setPromptSectionsOrderRaw(_ raw: String, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.promptSectionsOrder = raw
-        }
-    }
-
-    func duplicateUserInstructionsAtTop() -> Bool {
-        scalarPreferences.promptPackaging?.duplicateUserInstructionsAtTop ?? false
-    }
-
-    func setDuplicateUserInstructionsAtTop(_ enabled: Bool, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.duplicateUserInstructionsAtTop = enabled
-        }
-    }
-
-    func filePathDisplayOptionRaw() -> String {
-        scalarPreferences.promptPackaging?.filePathDisplayOption ?? Self.defaultFilePathDisplayOptionRaw
-    }
-
-    func setFilePathDisplayOptionRaw(_ raw: String, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.filePathDisplayOption = raw
-        }
-    }
-
-    func selectedFilesSortMethodRaw() -> String {
-        scalarPreferences.promptPackaging?.selectedFilesSortMethod ?? Self.defaultSelectedFilesSortMethodRaw
-    }
-
-    func setSelectedFilesSortMethodRaw(_ raw: String, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.selectedFilesSortMethod = raw
-        }
-    }
-
-    func fileEditFormatRaw() -> String {
-        scalarPreferences.promptPackaging?.fileEditFormat ?? Self.defaultFileEditFormatRaw
-    }
-
-    func setFileEditFormatRaw(_ raw: String, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.fileEditFormat = raw
-        }
-    }
-
-    func includeDatetimeInUserInstructions() -> Bool {
-        scalarPreferences.promptPackaging?.includeDatetimeInUserInstructions ?? false
-    }
-
-    func setIncludeDatetimeInUserInstructions(_ enabled: Bool, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.includeDatetimeInUserInstructions = enabled
-        }
-    }
-
-    func customPlanningPrompt() -> String {
-        scalarPreferences.promptPackaging?.customPlanningPrompt ?? ""
-    }
-
-    func setCustomPlanningPrompt(_ prompt: String, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.customPlanningPrompt = prompt
-        }
-    }
-
-    func modelTemperature() -> Double {
-        scalarPreferences.promptPackaging?.modelTemperature ?? 0.0
-    }
-
-    func setModelTemperature(_ temperature: Double, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.modelTemperature = temperature
-        }
-    }
-
-    func shouldSetModelTemperature() -> Bool {
-        scalarPreferences.promptPackaging?.setModelTemperature ?? true
-    }
-
-    func setShouldSetModelTemperature(_ enabled: Bool, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.setModelTemperature = enabled
-        }
-    }
-
-    func complexEditStrategyRaw() -> String {
-        scalarPreferences.promptPackaging?.complexEditStrategy ?? Self.defaultComplexEditStrategyRaw
-    }
-
-    func setComplexEditStrategyRaw(_ raw: String, commit: Bool = true) {
-        updatePromptPackagingScalar(commit: commit) { settings in
-            settings.complexEditStrategy = raw
-        }
-    }
-
-    func preferredComposeModelRaw() -> String? {
-        scalarPreferences.modelSelection?.preferredComposeModel
-    }
-
-    func setPreferredComposeModelRaw(
-        _ raw: String?,
-        commit: Bool = true,
-        reason: String? = nil,
-        honorSync: Bool = false,
-        fileID: StaticString = #fileID,
-        line: UInt = #line,
-        function: StaticString = #function
-    ) {
-        let oldAgentModelsProfile = globalAgentModelsProfile()
-        let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
-        let oldPlanning = scalarPreferences.modelSelection?.planningModel
-        let shouldMirror = honorSync && resolvedSyncChatModelWithOracleFromCurrentPreferences()
-        // Never let a blank chat model blank the Oracle. An empty/nil preferred value is
-        // produced by transient fallbacks (e.g. PromptViewModel.pickDiffCapableFallback when
-        // the model list is unhydrated); mirroring it would wipe the global Oracle planningModel
-        // — which is deliberately never auto-healed — and persist the blank across relaunch.
-        // Only mirror real model selections; the chat model can re-heal itself, the Oracle cannot.
-        // Treat whitespace-only as blank too — these raw values can arrive from the MCP/app_settings
-        // API, not just picker-backed AIModel.rawValue.
-        let shouldMirrorModel = shouldMirror && (raw?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-        updateModelSelectionScalar(commit: commit) { settings in
-            settings.preferredComposeModel = raw
-            if shouldMirrorModel {
-                settings.planningModel = raw
-            }
-        }
-        recordSettingsWriteDiagnostic(
-            key: "preferredComposeModelRaw",
-            oldValue: oldPreferred,
-            newValue: raw,
-            commit: commit,
-            reason: reason,
-            fileID: fileID,
-            line: line,
-            function: function
-        )
-        if shouldMirrorModel, oldPlanning != raw {
-            recordSettingsWriteDiagnostic(
-                key: "planningModelRaw",
-                oldValue: oldPlanning,
-                newValue: raw,
-                commit: commit,
-                reason: syncSiblingReason(from: reason),
-                fileID: fileID,
-                line: line,
-                function: function
-            )
-        }
-        if globalAgentModelsProfile() != oldAgentModelsProfile {
-            postAgentModelsSettingsDidChange(scope: .global)
-        }
-    }
-
-    func planningModelRaw() -> String? {
-        scalarPreferences.modelSelection?.planningModel
-    }
-
-    func setPlanningModelRaw(
-        _ raw: String?,
-        commit: Bool = true,
-        reason: String? = nil,
-        honorSync: Bool = false,
-        fileID: StaticString = #fileID,
-        line: UInt = #line,
-        function: StaticString = #function
-    ) {
-        let oldAgentModelsProfile = globalAgentModelsProfile()
-        let oldPlanning = scalarPreferences.modelSelection?.planningModel
-        let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
-        let shouldMirror = honorSync && resolvedSyncChatModelWithOracleFromCurrentPreferences()
-        updateModelSelectionScalar(commit: commit) { settings in
-            settings.planningModel = raw
-            if shouldMirror {
-                settings.preferredComposeModel = raw
-            }
-        }
-        recordSettingsWriteDiagnostic(
-            key: "planningModelRaw",
-            oldValue: oldPlanning,
-            newValue: raw,
-            commit: commit,
-            reason: reason,
-            fileID: fileID,
-            line: line,
-            function: function
-        )
-        if shouldMirror, oldPreferred != raw {
-            recordSettingsWriteDiagnostic(
-                key: "preferredComposeModelRaw",
-                oldValue: oldPreferred,
-                newValue: raw,
-                commit: commit,
-                reason: syncSiblingReason(from: reason),
-                fileID: fileID,
-                line: line,
-                function: function
-            )
-        }
-        if globalAgentModelsProfile() != oldAgentModelsProfile {
-            postAgentModelsSettingsDidChange(scope: .global)
-        }
-    }
-
-    func syncChatModelWithOracle() -> Bool {
-        resolvedSyncChatModelWithOracleFromCurrentPreferences()
-    }
-
-    func setSyncChatModelWithOracle(
-        _ enabled: Bool,
-        commit: Bool = true,
-        reason: String? = nil,
-        snapOnEnableToPlanning: Bool = false,
-        fileID: StaticString = #fileID,
-        line: UInt = #line,
-        function: StaticString = #function
-    ) {
-        let oldAgentModelsProfile = globalAgentModelsProfile()
-        let oldStoredValue = scalarPreferences.modelSelection?.syncChatModelWithOracle.map(String.init)
-        let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
-        let planning = scalarPreferences.modelSelection?.planningModel ?? ""
-        let shouldSnap = enabled && snapOnEnableToPlanning && !planning.isEmpty && planning != oldPreferred
-        updateModelSelectionScalar(commit: commit) { settings in
-            settings.syncChatModelWithOracle = enabled
-            if shouldSnap {
-                settings.preferredComposeModel = planning
-            }
-        }
-        recordSettingsWriteDiagnostic(
-            key: "syncChatModelWithOracle",
-            oldValue: oldStoredValue,
-            newValue: String(enabled),
-            commit: commit,
-            reason: reason,
-            fileID: fileID,
-            line: line,
-            function: function
-        )
-        if shouldSnap {
-            recordSettingsWriteDiagnostic(
-                key: "preferredComposeModelRaw",
-                oldValue: oldPreferred,
-                newValue: planning,
-                commit: commit,
-                reason: syncSnapReason(from: reason),
-                fileID: fileID,
-                line: line,
-                function: function
-            )
-        }
-        if globalAgentModelsProfile() != oldAgentModelsProfile {
-            postAgentModelsSettingsDidChange(scope: .global)
-        }
-    }
-
-    func mcpAutoStart() -> Bool {
-        scalarPreferences.mcp?.autoStart ?? false
-    }
-
-    func setMCPAutoStart(_ enabled: Bool, commit: Bool = true) {
-        updateMCPScalar(commit: commit) { settings in
-            settings.autoStart = enabled
-        }
-    }
-
-    func mcpShowModelPresets() -> Bool {
-        scalarPreferences.mcp?.showModelPresets ?? false
-    }
-
-    func setMCPShowModelPresets(_ enabled: Bool, commit: Bool = true) {
-        updateMCPScalar(commit: commit) { settings in
-            settings.showModelPresets = enabled
-        }
-    }
-
-    func mcpTemporarilyDisablePresets() -> Bool {
-        scalarPreferences.mcp?.temporarilyDisablePresets ?? false
-    }
-
-    func setMCPTemporarilyDisablePresets(_ enabled: Bool, commit: Bool = true) {
-        updateMCPScalar(commit: commit) { settings in
-            settings.temporarilyDisablePresets = enabled
-        }
-    }
-
-    func respectRepoIgnore() -> Bool {
-        scalarPreferences.fileSystem?.respectRepoIgnore ?? true
-    }
-
-    func setRespectRepoIgnore(_ enabled: Bool, commit: Bool = true) {
-        updateFileSystemScalar(commit: commit) { settings in
-            settings.respectRepoIgnore = enabled
-        }
-    }
-
-    func respectCursorignore() -> Bool {
-        scalarPreferences.fileSystem?.respectCursorignore ?? true
-    }
-
-    func setRespectCursorignore(_ enabled: Bool, commit: Bool = true) {
-        updateFileSystemScalar(commit: commit) { settings in
-            settings.respectCursorignore = enabled
-        }
-    }
-
-    func globalIgnoreDefaults() -> String {
-        if let stored = scalarPreferences.fileSystem?.globalIgnoreDefaults {
-            return stored
-        }
-        return IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
-    }
-
-    func setGlobalIgnoreDefaults(_ content: String, commit: Bool = true) {
-        updateFileSystemScalar(commit: commit) { settings in
-            settings.globalIgnoreDefaults = content
-        }
-    }
-
-    func enableHierarchicalIgnores() -> Bool {
-        scalarPreferences.fileSystem?.enableHierarchicalIgnores ?? true
-    }
-
-    func setEnableHierarchicalIgnores(_ enabled: Bool, commit: Bool = true) {
-        updateFileSystemScalar(commit: commit) { settings in
-            settings.enableHierarchicalIgnores = enabled
-        }
-    }
-
-    func skipSymlinks() -> Bool {
-        scalarPreferences.fileSystem?.skipSymlinks ?? true
-    }
-
-    func setSkipSymlinks(_ enabled: Bool, commit: Bool = true) {
-        updateFileSystemScalar(commit: commit) { settings in
-            settings.skipSymlinks = enabled
-        }
-    }
-
-    func showEmptyFolders() -> Bool {
-        scalarPreferences.fileSystem?.showEmptyFolders ?? false
-    }
-
-    func fileSystemSettingsSnapshot() -> FileSystemSettingsSnapshot {
-        let settings = scalarPreferences.fileSystem
-        return FileSystemSettingsSnapshot(
-            respectRepoIgnore: settings?.respectRepoIgnore ?? true,
-            respectCursorignore: settings?.respectCursorignore ?? true,
-            globalIgnoreDefaults: settings?.globalIgnoreDefaults ?? IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults,
-            enableHierarchicalIgnores: settings?.enableHierarchicalIgnores ?? true,
-            skipSymlinks: settings?.skipSymlinks ?? true,
-            showEmptyFolders: settings?.showEmptyFolders ?? false
-        )
-    }
-
-    func setShowEmptyFolders(_ enabled: Bool, commit: Bool = true) {
-        updateFileSystemScalar(commit: commit) { settings in
-            settings.showEmptyFolders = enabled
+        reloadFontScaleBodySizeFromDisk { rawValue in
+            FontScalePreset(rawValue: rawValue)?.rawValue ?? FontScalePreset.normal.rawValue
         }
     }
 
@@ -1100,28 +149,6 @@ class GlobalSettingsStore: ObservableObject {
         )
     }
 
-    func maxBackgroundAgentComposeTabs() -> Int {
-        let configuredLimit = scalarPreferences.agentMode?.maxBackgroundAgentComposeTabs ?? Self.defaultBackgroundAgentComposeTabHardLimit
-        let rawLimit = configuredLimit > 0 ? configuredLimit : Self.defaultBackgroundAgentComposeTabHardLimit
-        return max(Self.defaultComposeTabSoftLimit, rawLimit)
-    }
-
-    func setMaxBackgroundAgentComposeTabs(_ limit: Int?, commit: Bool = true) {
-        updateAgentModeScalar(commit: commit) { settings in
-            settings.maxBackgroundAgentComposeTabs = limit
-        }
-    }
-
-    func showBuiltInWorkflowCleanupGuidance() -> Bool {
-        scalarPreferences.agentMode?.showBuiltInWorkflowCleanupGuidance ?? true
-    }
-
-    func setShowBuiltInWorkflowCleanupGuidance(_ enabled: Bool, commit: Bool = true) {
-        updateAgentModeScalar(commit: commit) { settings in
-            settings.showBuiltInWorkflowCleanupGuidance = enabled
-        }
-    }
-
     func codexGoalSupportEnabled() -> Bool {
         CodexGoalSupport.isEnabled(persistedValue: scalarPreferences.agentMode?.codexGoalSupportEnabled)
     }
@@ -1132,6 +159,18 @@ class GlobalSettingsStore: ObservableObject {
             settings.codexGoalSupportEnabled = enabled
         }
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
+    }
+
+    func codexComputerUseEnabled() -> Bool {
+        CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled)
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
+        let oldValue = codexComputerUseEnabled()
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexComputerUseEnabled = enabled
+        }
+        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
     }
 
     func codexReasoningSummariesEnabled() -> Bool {
@@ -1146,102 +185,254 @@ class GlobalSettingsStore: ObservableObject {
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
     }
 
-    #if DEBUG
-        func claudeRawEventLoggingEnabled() -> Bool {
-            defaults.bool(forKey: "claudeRawEventLoggingEnabled")
+    /// App-global UI preference for the oversight-link confirmation. Nil reads as false; the flag
+    /// only skips the dialog and never relaxes runtime authorization or approval restrictions.
+    func suppressOversightLinkConfirmation() -> Bool {
+        scalarPreferences.agentMode?.suppressOversightLinkConfirmation == true
+    }
+
+    func setSuppressOversightLinkConfirmation(_ suppressed: Bool, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            // Clearing returns to the baseline scalar shape for older CE builds.
+            settings.suppressOversightLinkConfirmation = suppressed ? true : nil
+        }
+    }
+
+    func codexMemoriesEnabled() -> Bool {
+        CodexMemories.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMemoriesEnabled)
+    }
+
+    func codexAppsEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexAppsEnabled)
+    }
+
+    func codexPluginsEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexPluginsEnabled)
+    }
+
+    func codexMCPElicitationEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexMCPElicitationEnabled)
+    }
+
+    func codexToolSuggestionsEnabled() -> Bool {
+        CodexCapabilityPreference.isEnabled(persistedValue: scalarPreferences.agentMode?.codexToolSuggestionsEnabled)
+    }
+
+    func providerConversationCleanupAction() -> ProviderConversationCleanupAction {
+        guard let raw = scalarPreferences.agentMode?.providerConversationCleanupAction,
+              let action = ProviderConversationCleanupAction(rawValue: raw)
+        else {
+            return .archive
+        }
+        return action
+    }
+
+    func setProviderConversationCleanupAction(_ action: ProviderConversationCleanupAction, commit: Bool = true) {
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.providerConversationCleanupAction = action.rawValue
+        }
+    }
+
+    func autoEffortConfiguration() -> AutoEffortConfiguration {
+        .init(
+            enabled: scalarPreferences.agentMode?.autoEffortEnabled == true,
+            selectedBackendRawValue: scalarPreferences.agentMode?.autoEffortBackendRawValue,
+            revision: autoEffortSettingsRevision
+        )
+    }
+
+    func setAutoEffortBackend(_ id: DecisionServiceID, commit: Bool = true) {
+        setAutoEffortBackendRaw(id.rawValue, commit: commit)
+    }
+
+    func materializeModelRouterDefaultIfAbsent(_ id: DecisionServiceID) {
+        guard persistenceBlockReason == nil,
+              scalarPreferences.modelRouter?.selectedBackendRawValue == nil
+        else { return }
+        setModelRouterBackend(id)
+    }
+
+    func modelRouterConfiguration() -> AgentTaskRouterConfiguration {
+        let stored = scalarPreferences.modelRouter
+        let backendRaw = stored?.selectedBackendRawValue
+        let backendID = backendRaw.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : DecisionServiceID(rawValue: $0) }
+
+        let rolesMaterialized = stored?.candidateRoleRawValues != nil
+        let rawRoles = stored?.candidateRoleRawValues ?? []
+        let knownRoles = AgentModelCatalog.TaskLabelKind.allCases.filter { rawRoles.contains($0.rawValue) }
+        let unknownRoles = rawRoles.filter { raw in
+            !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && AgentModelCatalog.TaskLabelKind(rawValue: raw) == nil
         }
 
-        func setClaudeRawEventLoggingEnabled(_ enabled: Bool) {
-            defaults.set(enabled, forKey: "claudeRawEventLoggingEnabled")
+        let providersMaterialized = stored?.allowedProviderRawValues != nil
+        let rawProviders = stored?.allowedProviderRawValues ?? []
+        let knownProviders = Set(rawProviders.compactMap(AgentProviderKind.init(rawValue:)))
+        let unknownProviders = rawProviders.filter { raw in
+            !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && AgentProviderKind(rawValue: raw) == nil
         }
 
-        func claudeRawEventLogFilePath() -> String {
-            defaults.string(forKey: "claudeRawEventLogFilePath") ?? ""
+        let enabled = stored?.enabled ?? false
+        let primaryProvider = stored?.primaryProviderRawValue.flatMap(AgentProviderKind.init(rawValue:))
+        let subagentProvider = stored?.subagentProviderRawValue.flatMap(AgentProviderKind.init(rawValue:))
+        let storedCustomInstructions = stored?.customInstructions?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let customInstructions = storedCustomInstructions.count <= 1000
+            && storedCustomInstructions.utf8.count <= 4096
+            ? storedCustomInstructions
+            : ""
+        let validity: AgentTaskRouterConfiguration.Validity = if !enabled {
+            .disabled
+        } else if backendID == nil {
+            .backendMissing
+        } else {
+            .valid
         }
+        return AgentTaskRouterConfiguration(
+            enabled: enabled,
+            selectedBackendID: backendID,
+            selectedBackendRawValue: backendRaw,
+            candidateRoles: knownRoles,
+            allowedProviders: knownProviders,
+            candidateRolesMaterialized: rolesMaterialized,
+            allowedProvidersMaterialized: providersMaterialized,
+            unknownRoleRawValues: unknownRoles,
+            unknownProviderRawValues: unknownProviders,
+            primaryProvider: primaryProvider,
+            subagentProvider: subagentProvider,
+            customInstructions: customInstructions,
+            validity: validity,
+            revision: modelRouterSettingsRevision,
+            usageBalancing: AgentUsageBalancingConfiguration(
+                enabled: stored?.usageBalancingEnabled == true && AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) != nil,
+                preset: AgentUsageBalancingPreset.stored(stored?.usageBalancingPreset) ?? .evenPace,
+                overrideRouter: stored?.usageBalancingOverride == true
+            ),
+            allowPaidFastRouting: stored?.allowPaidFastRouting == true
+        )
+    }
 
-        func setClaudeRawEventLogFilePath(_ path: String) {
-            if path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                defaults.removeObject(forKey: "claudeRawEventLogFilePath")
-            } else {
-                defaults.set(path, forKey: "claudeRawEventLogFilePath")
+    func setUsageBalancingEnabled(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingEnabled = enabled }
+    }
+
+    func setUsageBalancingPreset(_ preset: AgentUsageBalancingPreset) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingPreset = preset.rawValue }
+    }
+
+    func setUsageBalancingOverride(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.usageBalancingOverride = enabled }
+    }
+
+    func setAllowPaidFastRouting(_ enabled: Bool) {
+        updateModelRouterScalar(commit: true) { $0.allowPaidFastRouting = enabled }
+    }
+
+    func setModelRouterBackend(_ backendID: DecisionServiceID, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { $0.selectedBackendRawValue = backendID.rawValue }
+    }
+
+    private func canonicalModelRouterCandidateRoleRawValues(
+        selectedRoles: Set<AgentModelCatalog.TaskLabelKind>,
+        preserving existingRawValues: [String]?
+    ) -> [String] {
+        AgentModelCatalog.TaskLabelKind.allCases
+            .filter(selectedRoles.contains)
+            .map(\.rawValue) + (existingRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentModelCatalog.TaskLabelKind(rawValue: $0) == nil
+            }
+    }
+
+    private func canonicalModelRouterAllowedProviderRawValues(
+        selectedProviders: Set<AgentProviderKind>,
+        preserving existingRawValues: [String]?
+    ) -> [String] {
+        AgentProviderKind.allCases
+            .filter(selectedProviders.contains)
+            .map(\.rawValue) + (existingRawValues ?? []).filter {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && AgentProviderKind(rawValue: $0) == nil
+            }
+    }
+
+    func setModelRouterCandidateRoles(_ roles: Set<AgentModelCatalog.TaskLabelKind>, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { settings in
+            settings.candidateRoleRawValues = canonicalModelRouterCandidateRoleRawValues(
+                selectedRoles: roles,
+                preserving: settings.candidateRoleRawValues
+            )
+        }
+    }
+
+    func setModelRouterAllowedProviders(_ providers: Set<AgentProviderKind>, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { settings in
+            settings.allowedProviderRawValues = canonicalModelRouterAllowedProviderRawValues(
+                selectedProviders: providers,
+                preserving: settings.allowedProviderRawValues
+            )
+        }
+    }
+
+    func setModelRouterProvider(_ provider: AgentProviderKind?, scope: AgentTaskRoutingScope, commit: Bool = true) {
+        updateModelRouterScalar(commit: commit) { settings in
+            switch scope {
+            case .primarySession: settings.primaryProviderRawValue = provider?.rawValue
+            case .subagent: settings.subagentProviderRawValue = provider?.rawValue
             }
         }
+    }
 
-        func agentModePerfDiagnosticsEnabled() -> Bool {
-            defaults.bool(forKey: "enableAgentModePerfDiagnostics")
+    /// Materializes the currently visible policy on first enable; subsequent provider additions
+    /// remain opt-in because these arrays are thereafter explicit.
+    func enableModelRouterWithCurrentPolicy(
+        backendID: DecisionServiceID,
+        roles: Set<AgentModelCatalog.TaskLabelKind>,
+        providers: Set<AgentProviderKind>,
+        commit: Bool = true
+    ) {
+        updateModelRouterScalar(commit: commit) { settings in
+            settings.selectedBackendRawValue = backendID.rawValue
+            settings.candidateRoleRawValues = canonicalModelRouterCandidateRoleRawValues(
+                selectedRoles: roles,
+                preserving: settings.candidateRoleRawValues
+            )
+            settings.allowedProviderRawValues = canonicalModelRouterAllowedProviderRawValues(
+                selectedProviders: providers,
+                preserving: settings.allowedProviderRawValues
+            )
+            settings.enabled = true
+        }
+    }
+
+    @discardableResult
+    func setAgentSessionHandoffInstructions(_ instructions: String, commit: Bool = true) -> Bool {
+        guard case .valid = AgentSessionHandoffInstructionsPolicy.validation(of: instructions) else {
+            return false
         }
 
-        func setAgentModePerfDiagnosticsEnabled(_ enabled: Bool) {
-            defaults.set(enabled, forKey: "enableAgentModePerfDiagnostics")
+        let proposedValue = instructions.isEmpty ? nil : instructions
+        guard scalarPreferences.agentMode?.agentSessionHandoffInstructions != proposedValue else {
+            return true
         }
 
-        func agentModePerfDiagnosticsOSLogEnabled() -> Bool {
-            defaults.bool(forKey: "emitAgentModePerfDiagnosticsToOSLog")
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.agentSessionHandoffInstructions = proposedValue
         }
+        return true
+    }
 
-        func setAgentModePerfDiagnosticsOSLogEnabled(_ enabled: Bool) {
-            defaults.set(enabled, forKey: "emitAgentModePerfDiagnosticsToOSLog")
-        }
-
+    #if DEBUG
         func worktreeStartupBenchmarkDiagnosticsEnabled() -> Bool {
             defaults.bool(forKey: WorktreeStartupBenchmarkDiagnostics.enabledDefaultsKey)
         }
+    #endif
 
+    #if DEBUG
         func setWorktreeStartupBenchmarkDiagnosticsEnabled(_ enabled: Bool) {
             defaults.set(enabled, forKey: WorktreeStartupBenchmarkDiagnostics.enabledDefaultsKey)
         }
     #endif
-
-    func restrictMCPAgentDiscoveryToRoleLabels() -> Bool {
-        scalarPreferences.agentMode?.restrictMCPAgentDiscoveryToRoleLabels ?? false
-    }
-
-    func setRestrictMCPAgentDiscoveryToRoleLabels(_ enabled: Bool, commit: Bool = true) {
-        let oldValue = restrictMCPAgentDiscoveryToRoleLabels()
-        updateAgentModeScalar(commit: commit) { settings in
-            settings.restrictMCPAgentDiscoveryToRoleLabels = enabled
-        }
-        if oldValue != enabled {
-            postAgentModelsSettingsDidChange(scope: .global)
-        }
-    }
-
-    func modelDiffOverrides() -> [String: Bool] {
-        scalarPreferences.modelOverrides?.diffOverrides ?? [:]
-    }
-
-    func setModelDiffOverrides(_ overrides: [String: Bool], commit: Bool = true) {
-        updateModelOverridesScalar(commit: commit) { settings in
-            settings.diffOverrides = overrides
-        }
-    }
-
-    func modelStreamOverrides() -> [String: Bool] {
-        scalarPreferences.modelOverrides?.streamOverrides ?? [:]
-    }
-
-    func setModelStreamOverrides(_ overrides: [String: Bool], commit: Bool = true) {
-        updateModelOverridesScalar(commit: commit) { settings in
-            settings.streamOverrides = overrides
-        }
-    }
-
-    func modelTemperatureOverrides() -> [String: Double] {
-        scalarPreferences.modelOverrides?.temperatureOverrides ?? [:]
-    }
-
-    func setModelTemperatureOverrides(_ overrides: [String: Double], commit: Bool = true) {
-        updateModelOverridesScalar(commit: commit) { settings in
-            settings.temperatureOverrides = overrides
-        }
-    }
-
-    func telemetryEnabled() -> Bool {
-        if let mirrored = defaults.object(forKey: Self.telemetryEnabledDefaultsKey) as? Bool {
-            return mirrored
-        }
-        return scalarPreferences.telemetry?.enabled ?? Self.defaultTelemetryEnabled
-    }
 
     func setTelemetryEnabled(_ enabled: Bool, commit: Bool = true) {
         defaults.set(enabled, forKey: Self.telemetryEnabledDefaultsKey)
@@ -1255,19 +446,11 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
-    func telemetryAppHangReportsEnabled() -> Bool {
-        scalarPreferences.telemetry?.appHangReportsEnabled ?? false
-    }
-
     func setTelemetryAppHangReportsEnabled(_ enabled: Bool, commit: Bool = true) {
         updateTelemetryScalar(commit: commit) { settings in
             settings.appHangReportsEnabled = enabled
         }
         SentryTelemetryBootstrap.restartIfStarted()
-    }
-
-    func telemetryPerformanceTracingEnabled() -> Bool {
-        scalarPreferences.telemetry?.performanceTracingEnabled ?? false
     }
 
     func setTelemetryPerformanceTracingEnabled(_ enabled: Bool, commit: Bool = true) {
@@ -1277,353 +460,8 @@ class GlobalSettingsStore: ObservableObject {
         SentryTelemetryBootstrap.restartIfStarted()
     }
 
-    func modelResponsesOverrides() -> [String: Bool] {
-        scalarPreferences.modelOverrides?.responsesOverrides ?? [:]
-    }
-
-    func setModelResponsesOverrides(_ overrides: [String: Bool], commit: Bool = true) {
-        updateModelOverridesScalar(commit: commit) { settings in
-            settings.responsesOverrides = overrides
-        }
-    }
-
-    func updateModelOverrides(
-        _ mutation: (inout GlobalScalarPreferences.ModelOverrideSettingsData) -> Void,
-        commit: Bool = true
-    ) {
-        updateModelOverridesScalar(commit: commit, mutation)
-    }
-
-    private func updateUIScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.UISettings) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.ui ?? GlobalScalarPreferences.UISettings()
-            mutation(&settings)
-            preferences.ui = settings
-        }
-    }
-
-    private func updatePromptPackagingScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.PromptPackagingSettings) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.promptPackaging ?? GlobalScalarPreferences.PromptPackagingSettings()
-            mutation(&settings)
-            preferences.promptPackaging = settings
-        }
-    }
-
-    private func updateModelSelectionScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.ModelSelectionSettings) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
-            mutation(&settings)
-            preferences.modelSelection = settings
-        }
-    }
-
-    private func updateMCPScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.MCPSettings) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.mcp ?? GlobalScalarPreferences.MCPSettings()
-            mutation(&settings)
-            preferences.mcp = settings
-        }
-    }
-
-    private func updateFileSystemScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.FileSystemSettings) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.fileSystem ?? GlobalScalarPreferences.FileSystemSettings()
-            mutation(&settings)
-            preferences.fileSystem = settings
-        }
-    }
-
-    private func updateAgentModeScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.AgentModeSettings) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.agentMode ?? GlobalScalarPreferences.AgentModeSettings()
-            mutation(&settings)
-            preferences.agentMode = settings
-        }
-    }
-
-    private func updateTelemetryScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.TelemetrySettings) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.telemetry ?? GlobalScalarPreferences.TelemetrySettings()
-            mutation(&settings)
-            preferences.telemetry = settings
-        }
-    }
-
-    private func updateModelOverridesScalar(
-        commit: Bool,
-        _ mutation: (inout GlobalScalarPreferences.ModelOverrideSettingsData) -> Void
-    ) {
-        updateScalarPreferences(commit: commit) { preferences in
-            var settings = preferences.modelOverrides ?? GlobalScalarPreferences.ModelOverrideSettingsData()
-            mutation(&settings)
-            preferences.modelOverrides = settings
-        }
-    }
-
-    private func updateScalarPreferences(commit: Bool, _ mutation: (inout GlobalScalarPreferences) -> Void) {
-        let before = scalarPreferences
-        mutation(&scalarPreferences)
-        // Notify SwiftUI observers (e.g. settings views that bind directly to the
-        // typed scalar accessors) whenever a scalar preference changes. The
-        // @Published `codeMapsGloballyDisabled` / copy/chat collections already
-        // cover other edit paths; scalar preferences are private so we fire
-        // objectWillChange manually to keep views in sync during the migration
-        // window.
-        if before != scalarPreferences {
-            objectWillChange.send()
-        }
-        if commit {
-            save()
-        }
-    }
-
-    // MARK: - Worktree Visual Identity
-
-    enum WorktreeVisualIdentityError: Error, Equatable {
-        case invalidColorHex(String)
-        case emptyRepositoryID
-        case emptyWorktreeID
-    }
-
-    func worktreeVisualIdentitiesByRepositoryID() -> [String: WorktreeVisualIdentityRepositoryBucket] {
-        globalDefaults.worktreeVisualIdentitiesByRepositoryID ?? [:]
-    }
-
-    func worktreeVisualIdentity(repositoryID: String, worktreeID: String) -> WorktreeVisualIdentity? {
-        let repositoryID = normalizedWorktreeIdentityKey(repositoryID)
-        let worktreeID = normalizedWorktreeIdentityKey(worktreeID)
-        guard !repositoryID.isEmpty, !worktreeID.isEmpty else { return nil }
-        return globalDefaults.worktreeVisualIdentitiesByRepositoryID?[repositoryID]?.identitiesByWorktreeID[worktreeID]
-    }
-
-    func fallbackWorktreeVisualIdentity(
-        repositoryID: String,
-        worktreeID: String,
-        label: String? = nil,
-        iconName: String? = nil,
-        markerStyle: WorktreeVisualMarkerStyle? = nil
-    ) -> WorktreeVisualIdentity {
-        WorktreeVisualIdentity(
-            label: normalizedWorktreeVisualLabel(label),
-            colorHex: Self.deterministicWorktreeColorHex(repositoryID: repositoryID, worktreeID: worktreeID),
-            iconName: normalizedWorktreeIconName(iconName) ?? WorktreeVisualIdentity.defaultIconName,
-            markerStyle: markerStyle ?? WorktreeVisualIdentity.defaultMarkerStyle,
-            updatedAt: nil
-        )
-    }
-
-    func resolvedWorktreeVisualIdentity(
-        repositoryID: String,
-        worktreeID: String,
-        fallbackLabel: String? = nil,
-        fallbackIconName: String? = nil,
-        fallbackMarkerStyle: WorktreeVisualMarkerStyle? = nil
-    ) -> WorktreeVisualIdentity {
-        worktreeVisualIdentity(repositoryID: repositoryID, worktreeID: worktreeID)
-            ?? fallbackWorktreeVisualIdentity(
-                repositoryID: repositoryID,
-                worktreeID: worktreeID,
-                label: fallbackLabel,
-                iconName: fallbackIconName,
-                markerStyle: fallbackMarkerStyle
-            )
-    }
-
-    @discardableResult
-    func ensureWorktreeVisualIdentity(
-        repositoryID: String,
-        worktreeID: String,
-        label: String? = nil,
-        colorHex: String? = nil,
-        iconName: String? = nil,
-        markerStyle: WorktreeVisualMarkerStyle? = nil,
-        updatedAt: Date = Date(),
-        commit: Bool = true
-    ) throws -> WorktreeVisualIdentity {
-        let repositoryID = normalizedWorktreeIdentityKey(repositoryID)
-        let worktreeID = normalizedWorktreeIdentityKey(worktreeID)
-        guard !repositoryID.isEmpty else { throw WorktreeVisualIdentityError.emptyRepositoryID }
-        guard !worktreeID.isEmpty else { throw WorktreeVisualIdentityError.emptyWorktreeID }
-
-        let existing = worktreeVisualIdentity(repositoryID: repositoryID, worktreeID: worktreeID)
-        let requestedLabel = normalizedWorktreeVisualLabel(label)
-        let requestedColor = try normalizedWorktreeColorHex(colorHex)
-        let requestedIconName = normalizedWorktreeIconName(iconName)
-        if let existing, requestedLabel == nil, requestedColor == nil, requestedIconName == nil, markerStyle == nil {
-            return existing
-        }
-        let normalizedLabel = requestedLabel ?? existing?.label
-        let normalizedColor = requestedColor
-            ?? existing?.colorHex
-            ?? Self.deterministicWorktreeColorHex(repositoryID: repositoryID, worktreeID: worktreeID)
-        let identity = WorktreeVisualIdentity(
-            label: normalizedLabel,
-            colorHex: normalizedColor,
-            iconName: requestedIconName ?? existing?.iconName ?? WorktreeVisualIdentity.defaultIconName,
-            markerStyle: markerStyle ?? existing?.markerStyle ?? WorktreeVisualIdentity.defaultMarkerStyle,
-            updatedAt: updatedAt
-        )
-        guard existing != identity else { return identity }
-        setValidatedWorktreeVisualIdentity(identity, repositoryID: repositoryID, worktreeID: worktreeID, commit: commit)
-        return identity
-    }
-
-    func setWorktreeVisualIdentity(
-        _ identity: WorktreeVisualIdentity,
-        repositoryID: String,
-        worktreeID: String,
-        commit: Bool = true
-    ) throws {
-        let repositoryID = normalizedWorktreeIdentityKey(repositoryID)
-        let worktreeID = normalizedWorktreeIdentityKey(worktreeID)
-        guard !repositoryID.isEmpty else { throw WorktreeVisualIdentityError.emptyRepositoryID }
-        guard !worktreeID.isEmpty else { throw WorktreeVisualIdentityError.emptyWorktreeID }
-        let normalizedColor = try normalizedWorktreeColorHex(identity.colorHex) ?? identity.colorHex
-        let normalizedIdentity = WorktreeVisualIdentity(
-            label: normalizedWorktreeVisualLabel(identity.label),
-            colorHex: normalizedColor,
-            iconName: normalizedWorktreeIconName(identity.iconName) ?? WorktreeVisualIdentity.defaultIconName,
-            markerStyle: identity.markerStyle,
-            updatedAt: identity.updatedAt
-        )
-        setValidatedWorktreeVisualIdentity(
-            normalizedIdentity,
-            repositoryID: repositoryID,
-            worktreeID: worktreeID,
-            commit: commit
-        )
-    }
-
-    private func setValidatedWorktreeVisualIdentity(
-        _ identity: WorktreeVisualIdentity,
-        repositoryID: String,
-        worktreeID: String,
-        commit: Bool
-    ) {
-        var repositories = globalDefaults.worktreeVisualIdentitiesByRepositoryID ?? [:]
-        var bucket = repositories[repositoryID] ?? WorktreeVisualIdentityRepositoryBucket()
-        bucket.identitiesByWorktreeID[worktreeID] = identity
-        repositories[repositoryID] = bucket
-        globalDefaults.worktreeVisualIdentitiesByRepositoryID = repositories
-        objectWillChange.send()
-        if commit {
-            save()
-        }
-    }
-
-    private func normalizedWorktreeIdentityKey(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func normalizedWorktreeVisualLabel(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private func normalizedWorktreeIconName(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private func normalizedWorktreeColorHex(_ value: String?) throws -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard Self.isValidWorktreeColorHex(trimmed) else {
-            throw WorktreeVisualIdentityError.invalidColorHex(value)
-        }
-        return trimmed
-    }
-
-    static func isValidWorktreeColorHex(_ value: String) -> Bool {
-        let scalars = Array(value.unicodeScalars)
-        guard scalars.count == 7, scalars.first == "#" else { return false }
-        return scalars.dropFirst().allSatisfy { scalar in
-            (48 ... 57).contains(scalar.value)
-                || (65 ... 70).contains(scalar.value)
-                || (97 ... 102).contains(scalar.value)
-        }
-    }
-
-    private static func deterministicWorktreeColorHex(repositoryID: String, worktreeID: String) -> String {
-        let palette = [
-            "#2563EB", "#7C3AED", "#DB2777", "#DC2626", "#EA580C", "#CA8A04",
-            "#16A34A", "#059669", "#0891B2", "#4F46E5", "#9333EA", "#C026D3"
-        ]
-        let seed = "\(repositoryID)\u{0}\(worktreeID)"
-        let hash = seed.unicodeScalars.reduce(UInt64(14_695_981_039_346_656_037)) { result, scalar in
-            (result ^ UInt64(scalar.value)).multipliedReportingOverflow(by: 1_099_511_628_211).partialValue
-        }
-        return palette[Int(hash % UInt64(palette.count))]
-    }
-
-    // MARK: - Global Code Maps Override
-
-    func globalCodeMapsDisabled() -> Bool {
-        codeMapsGloballyDisabled
-    }
-
-    func setCodeMapsGloballyDisabled(_ disabled: Bool, commit: Bool = true) {
-        guard codeMapsGloballyDisabled != disabled || (globalDefaults.codeMapsGloballyDisabled ?? false) != disabled else {
-            return
-        }
-        globalDefaults.codeMapsGloballyDisabled = disabled
-        codeMapsGloballyDisabled = disabled
-        if commit {
-            save()
-        }
-    }
-
-    /// Publishes `objectWillChange` when `globalDefaults` changed and persists if `commit`.
-    /// Centralizes the publish-on-mutate contract for the global-defaults surface (Context
-    /// Builder agent, MCP role overrides, recommendation provider filter) so any change
-    /// propagates to every observing window; route all `globalDefaults` mutations through here.
-    private func persistGlobalDefaultsChange(before: GlobalDefaults, commit: Bool) {
-        if before != globalDefaults {
-            objectWillChange.send()
-        }
-        if commit {
-            save()
-        }
-    }
-
-    // MARK: - Global Context Builder Agent Selection (Single Source of Truth)
-
-    /// Returns the raw persisted global Context Builder selection without synthesizing a fallback.
-    /// Startup restoration needs to distinguish a real saved value from the catalog's historical
-    /// Claude Code / Opus default so it can validate availability and use recommendations instead.
-    func persistedGlobalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
-        guard let agentRaw = globalDefaults.discoverAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !agentRaw.isEmpty
-        else {
-            return (nil, nil)
-        }
-        let modelRaw = globalDefaults.discoverModelsByAgent?[agentRaw]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (agentRaw, modelRaw?.isEmpty == false ? modelRaw : nil)
+    func notificationPreferences() -> NotificationPreferences {
+        (scalarPreferences.notifications ?? GlobalScalarPreferences.NotificationSettings()).resolved()
     }
 
     /// Returns a normalized global Context Builder agent and model selection.
@@ -1760,50 +598,6 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
-    /// Returns whether the user has explicitly set the global Context Builder agent defaults.
-    /// Used by recommendation engine to determine if auto-apply should be allowed.
-    /// NOTE: For existing installs, `didUserSetDiscoverAgentDefaults` will be nil but
-    /// they may already have a configured selection. We treat nil + existing selection
-    /// as "user-defined" to avoid overwriting their settings via auto-apply.
-    var hasUserSetGlobalContextBuilderAgentDefaults: Bool {
-        // Explicit true = definitely user-set
-        if globalDefaults.didUserSetDiscoverAgentDefaults == true {
-            return true
-        }
-        // nil (legacy) + existing selection = treat as user-set to be safe
-        if globalDefaults.didUserSetDiscoverAgentDefaults == nil,
-           globalDefaults.discoverAgentRaw != nil
-        {
-            return true
-        }
-        // false (seeded/new) or nil + no selection = not user-set
-        return false
-    }
-
-    // MARK: - Helper Methods
-
-    // MARK: - Global MCP Agent Role Defaults (Single Source of Truth)
-
-    /// Returns global MCP Agent Mode role-default overrides.
-    /// nil means all roles use the recommended defaults.
-    func globalMCPAgentRoleOverrides() -> [String: String]? {
-        normalizedRoleOverrides(globalDefaults.mcpAgentRoleOverrides)
-    }
-
-    /// Updates global MCP Agent Mode role-default overrides.
-    /// Empty dictionaries are normalized to nil.
-    func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool = true) {
-        let globalDefaultsBeforeMutation = globalDefaults
-        globalDefaults.mcpAgentRoleOverrides = Self.normalizedMCPAgentRoleOverrides(overrides)
-        let globalDefaultsChanged = globalDefaultsBeforeMutation != globalDefaults
-        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: commit)
-        if globalDefaultsChanged {
-            postAgentModelsSettingsDidChange(scope: .global)
-        }
-    }
-
-    // MARK: - Recommendation Provider Filter (Global)
-
     /// Returns the global provider filter for recommendation generation. Absence means all providers.
     func globalRecommendationProviderFilter() -> Set<RecommendationProviderKind> {
         Self.normalizedRecommendationProviderFilter(raw: globalDefaults.recommendationProviderFilterRaw)
@@ -1849,403 +643,89 @@ class GlobalSettingsStore: ObservableObject {
         persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: commit)
     }
 
-    private func normalizedRoleOverrides(_ overrides: [String: String]?) -> [String: String]? {
-        Self.normalizedMCPAgentRoleOverrides(overrides)
+    func normalizeDisabledOpenAIServiceTierVariants() {
+        normalizeDisabledOpenAIServiceTierVariants(normalizeModelRaw: AIModel.rawValueWithoutOpenAIServiceTier)
     }
 
-    private static func normalizedMCPAgentRoleOverrides(_ overrides: [String: String]?) -> [String: String]? {
-        guard let overrides else { return nil }
-        let normalized = overrides.reduce(into: [String: String]()) { result, entry in
-            let key = entry.key.trimmingCharacters(in: .whitespacesAndNewlines)
-            let value = entry.value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !key.isEmpty, !value.isEmpty else { return }
-            result[key] = value
-        }
-        return normalized.isEmpty ? nil : normalized
-    }
-
-    /// Check if recommendation schema version is current; if not, clear mutes across all workspaces.
-    /// Returns true if schema was updated (mutes cleared).
-    @discardableResult
-    func ensureLatestRecommendationSchema(currentVersion: Int) -> Bool {
-        if globalDefaults.recommendationSchemaVersion != currentVersion {
-            // Clear all mutedRecommendationIDs and completion timestamps across workspaces
-            for (id, var s) in chatSettings {
-                s.mutedRecommendationIDs = nil
-                s.lastRecommendationWizardCompletedAt = nil
-                chatSettings[id] = s
+    /// Invoke before constructing any settings store or decoding Agent Models profiles.
+    nonisolated static func installApplicationModelIdentityPolicy() {
+        SettingsModelIdentityPolicy.installCursorCanonicalizer { raw in
+            // Exact advertised identities win over historical rename aliases.
+            if AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.contains(where: { $0.rawValue == raw }) == true {
+                return raw
             }
-            globalDefaults.recommendationSchemaVersion = currentVersion
-            save()
-            return true
-        }
-        return false
-    }
-
-    private func agentModelsProfile(for scope: AgentModelsEditingScope) -> AgentModelsSettingsProfile {
-        switch scope {
-        case .global:
-            globalAgentModelsProfile()
-        case let .workspace(workspaceID):
-            workspaceAgentModelsProfile(for: workspaceID)
-                ?? effectiveAgentModelsProfile(workspaceID: workspaceID)
-        }
-    }
-
-    private func updateAgentModelsProfile(
-        scope: AgentModelsEditingScope,
-        _ mutation: (inout AgentModelsSettingsProfile) -> Void
-    ) {
-        switch scope {
-        case .global:
-            var profile = globalAgentModelsProfile()
-            mutation(&profile)
-            setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
-        case let .workspace(workspaceID):
-            var settings = agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings(
-                inheritanceMode: .useWorkspaceOverrides,
-                profile: globalAgentModelsProfile()
-            )
-            settings.inheritanceMode = .useWorkspaceOverrides
-            let oldProfile = settings.profile
-            var profile = settings.profile ?? globalAgentModelsProfile()
-            mutation(&profile)
-            let normalized = normalizedAgentModelsProfile(profile)
-            settings.profile = normalized
-            agentModelsSettingsByWorkspaceID[workspaceID] = settings
-            recordAgentModelsProfileWriteDiagnostic(
-                scope: .workspace,
-                workspaceID: workspaceID,
-                oldProfile: oldProfile,
-                newProfile: normalized
-            )
-            save()
-            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
-        }
-    }
-
-    private func normalizedAgentModelsProfile(_ profile: AgentModelsSettingsProfile) -> AgentModelsSettingsProfile {
-        AgentModelsSettingsProfile(
-            planningModelRaw: profile.planningModelRaw,
-            preferredComposeModelRaw: profile.preferredComposeModelRaw,
-            syncChatModelWithOracle: profile.syncChatModelWithOracle,
-            contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
-            contextBuilderModelsByAgent: profile.contextBuilderModelsByAgent,
-            mcpAgentRoleOverrides: profile.mcpAgentRoleOverrides,
-            restrictMCPAgentDiscoveryToRoleLabels: profile.restrictMCPAgentDiscoveryToRoleLabels
-        )
-    }
-
-    private func recordAgentModelsProfileWriteDiagnostic(
-        scope: AgentModelsSettingsNotification.Scope,
-        workspaceID: UUID?,
-        oldProfile: AgentModelsSettingsProfile?,
-        newProfile: AgentModelsSettingsProfile,
-        fileID: StaticString = #fileID,
-        line: UInt = #line,
-        function: StaticString = #function
-    ) {
-        let workspaceSuffix = workspaceID.map { ".\($0.uuidString)" } ?? ""
-        recordSettingsWriteDiagnostic(
-            key: "agentModelsProfile.\(scope.rawValue)\(workspaceSuffix)",
-            oldValue: agentModelsProfileDiagnosticValue(oldProfile),
-            newValue: agentModelsProfileDiagnosticValue(newProfile),
-            commit: true,
-            reason: "agent_models.profile.\(scope.rawValue)",
-            fileID: fileID,
-            line: line,
-            function: function
-        )
-    }
-
-    private func agentModelsProfileDiagnosticValue(_ profile: AgentModelsSettingsProfile?) -> String? {
-        guard let profile else { return nil }
-        let contextBuilderModelRaw = profile.contextBuilderAgentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
-        return [
-            "planning=\(profile.planningModelRaw ?? "nil")",
-            "compose=\(profile.preferredComposeModelRaw ?? "nil")",
-            "sync=\(profile.syncChatModelWithOracle)",
-            "contextBuilder=\(profile.contextBuilderAgentRaw ?? "nil"):\(contextBuilderModelRaw ?? "nil")",
-            "roleOverrides=\(profile.mcpAgentRoleOverrides?.count ?? 0)",
-            "restrictRoleDiscovery=\(profile.restrictMCPAgentDiscoveryToRoleLabels)"
-        ].joined(separator: ";")
-    }
-
-    private func postAgentModelsSettingsDidChange(
-        scope: AgentModelsSettingsNotification.Scope,
-        workspaceID: UUID? = nil,
-        notificationCenter: NotificationCenter = .default
-    ) {
-        var userInfo: [String: Any] = [
-            AgentModelsSettingsNotification.scopeKey: scope.rawValue
-        ]
-        if let workspaceID {
-            userInfo[AgentModelsSettingsNotification.workspaceIDKey] = workspaceID
-        }
-        notificationCenter.post(
-            name: .agentModelsSettingsDidChange,
-            object: self,
-            userInfo: userInfo
-        )
-    }
-
-    // MARK: - Persistence
-
-    private func load() {
-        let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
-        let loadedExistingDocument = fileExists ? try? fileStore.load() : nil
-        let existingFileWasCorrupt = fileExists && loadedExistingDocument == nil
-        if !fileExists {
-            defaults.removeObject(forKey: Self.telemetryEnabledDefaultsKey)
-        } else if existingFileWasCorrupt {
-            defaults.set(false, forKey: Self.telemetryEnabledDefaultsKey)
-        }
-        let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
-        copySettings = document.copySettings
-        let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
-            chatSettings: document.chatSettings,
-            globalDefaults: document.globalDefaults
-        )
-        chatSettings = migratedContextBuilderState.chatSettings
-        agentModelsSettingsByWorkspaceID = document.agentModelsSettings
-        globalDefaults = migratedContextBuilderState.globalDefaults
-        scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
-        if !existingFileWasCorrupt {
-            syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
-        }
-        codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
-        persistenceBlockReason = fileStore.blockReason
-    }
-
-    /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
-    /// up the offending on-disk file, writes the current in-memory settings as a fresh
-    /// current-schema document, and clears the block; this method then re-reads state so the
-    /// store and observers refresh.
-    /// Returns true only when recovery completed successfully.
-    @discardableResult
-    func recoverBlockedPersistenceAfterBackup() -> Bool {
-        let backedUp = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
-        objectWillChange.send()
-        load()
-        return backedUp
-    }
-
-    /// User-initiated compatible import from a blocked newer/different-schema settings file.
-    /// The file store backs up the original, writes a current-schema document containing only
-    /// CE-known fields, then this store reloads those imported settings.
-    @discardableResult
-    func importBlockedPersistenceAfterBackup() -> Bool {
-        let imported = fileStore.performUserInitiatedCompatibleImport()
-        objectWillChange.send()
-        if imported {
-            load()
-        } else {
-            persistenceBlockReason = fileStore.blockReason
-        }
-        return imported
-    }
-
-    /// Retries writing the current in-memory settings after a transient save failure, without
-    /// backing up or resetting the user's settings. Returns true when persistence is unblocked.
-    @discardableResult
-    func retryBlockedPersistenceSave() -> Bool {
-        save()
-    }
-
-    @discardableResult
-    func reloadFromDisk() -> Bool {
-        do {
-            let document = try fileStore.load()
-            objectWillChange.send()
-            copySettings = document.copySettings
-            let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
-                chatSettings: document.chatSettings,
-                globalDefaults: document.globalDefaults
-            )
-            chatSettings = migratedContextBuilderState.chatSettings
-            agentModelsSettingsByWorkspaceID = document.agentModelsSettings
-            globalDefaults = migratedContextBuilderState.globalDefaults
-            scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
-            syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
-            codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
-            persistenceBlockReason = fileStore.blockReason
-            return true
-        } catch {
-            persistenceBlockReason = fileStore.blockReason
-            print("⚠️ Failed to reload global settings JSON at \(fileStore.fileURL.path): \(error)")
-            return false
-        }
-    }
-
-    private func ensureFileSystemGlobalIgnoreDefaultsSeeded() {
-        var fileSystemSettings = scalarPreferences.fileSystem ?? GlobalScalarPreferences.FileSystemSettings()
-        guard fileSystemSettings.globalIgnoreDefaults == nil else { return }
-        fileSystemSettings.globalIgnoreDefaults = IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
-        scalarPreferences.fileSystem = fileSystemSettings
-        save()
-    }
-
-    private static func migratingLegacyContextBuilderState(
-        chatSettings: [UUID: ChatGlobalSettings],
-        globalDefaults: GlobalDefaults
-    ) -> (chatSettings: [UUID: ChatGlobalSettings], globalDefaults: GlobalDefaults) {
-        var migratedGlobalDefaults = globalDefaults
-        if migratedGlobalDefaults.discoverAgentRaw == nil,
-           let legacySelection = legacyContextBuilderSelection(
-               chatSettings: chatSettings,
-               globalDefaults: globalDefaults
-           )
-        {
-            migratedGlobalDefaults.discoverAgentRaw = legacySelection.agentRaw
-            if migratedGlobalDefaults.discoverModelsByAgent?[legacySelection.agentRaw] == nil,
-               let modelRaw = legacySelection.modelRaw
-            {
-                if migratedGlobalDefaults.discoverModelsByAgent == nil {
-                    migratedGlobalDefaults.discoverModelsByAgent = [:]
-                }
-                migratedGlobalDefaults.discoverModelsByAgent?[legacySelection.agentRaw] = modelRaw
+            if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: raw), !specifier.overrides.isEmpty {
+                return ACPModelParameterIdentity.canonicalBaseModelRaw(specifier.baseModelRaw, providerID: .cursor)
             }
-            migratedGlobalDefaults.didUserSetDiscoverAgentDefaults = true
+            return CursorAIModelCatalog.canonicalAlias(raw)
         }
-        migratedGlobalDefaults.contextBuilderAgentRaw = nil
-
-        return (
-            removingLegacyWorkspaceContextBuilderState(from: chatSettings),
-            migratedGlobalDefaults
-        )
     }
 
-    private static func legacyContextBuilderSelection(
-        chatSettings: [UUID: ChatGlobalSettings],
-        globalDefaults: GlobalDefaults
-    ) -> (agentRaw: String, modelRaw: String?)? {
-        let orderedSettings = chatSettings
-            .sorted { $0.key.uuidString < $1.key.uuidString }
-            .map(\.value)
+    static func installProcessApplicationEventBridge(notificationCenter: NotificationCenter = .default) {
+        applicationEventHandler = applicationEventAdapter(notificationCenter: notificationCenter)
+    }
 
-        if let agentRaw = validLegacyAgentRaw(globalDefaults.contextBuilderAgentRaw) {
-            let modelRaw = orderedSettings.lazy
-                .compactMap { legacyModelRaw(for: agentRaw, in: $0) }
-                .first
-            return (agentRaw, modelRaw)
-        }
-
-        for settings in orderedSettings {
-            if settings.didUserSetContextBuilderDefaults != false,
-               let agentRaw = validLegacyAgentRaw(settings.contextBuilderAgentRaw)
-            {
-                return (agentRaw, legacyModelRaw(for: agentRaw, in: settings))
-            }
-            if settings.didUserSetDiscoverAgentDefaults != false,
-               let agentRaw = validLegacyAgentRaw(settings.lastUsedDiscoverAgentRaw)
-            {
-                return (agentRaw, legacyModelRaw(for: agentRaw, in: settings))
+    private static func applicationEventAdapter(
+        notificationCenter: NotificationCenter
+    ) -> @MainActor (GlobalSettingsEvent, GlobalSettingsStore) -> Void {
+        { event, store in
+            switch event {
+            case .notificationPreferencesChanged:
+                notificationCenter.post(name: .notificationPreferencesDidChange, object: store)
+            case let .agentModelsSettingsChanged(scope):
+                notificationCenter.post(
+                    name: .agentModelsSettingsDidChange,
+                    object: store,
+                    userInfo: AgentModelsSettingsNotification.userInfo(scope: scope)
+                )
+            case .settingsInstalled:
+                notificationCenter.post(
+                    name: .recommendationsShouldRefresh,
+                    object: store,
+                    userInfo: ["reason": "globalSettingsInstalled"]
+                )
+            case .worktreeLocationLabelsChanged:
+                AgentSessionLinkLocationInvalidationSink.locationLabelsChanged(inWorkspace: nil)
             }
         }
-        return nil
     }
 
-    private static func validLegacyAgentRaw(_ rawValue: String?) -> String? {
-        guard let rawValue else { return nil }
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return AgentProviderKind(rawValue: trimmed)?.rawValue
+    /// Install before feature startup; no buffering or asynchronous delivery is introduced.
+    func installApplicationEventBridge(notificationCenter: NotificationCenter = .default) {
+        eventHandler = Self.applicationEventAdapter(notificationCenter: notificationCenter)
     }
+}
 
-    private static func legacyModelRaw(
-        for agentRaw: String,
-        in settings: ChatGlobalSettings
-    ) -> String? {
-        if validLegacyAgentRaw(settings.contextBuilderAgentRaw) == agentRaw,
-           let modelRaw = nonEmptyTrimmed(settings.contextBuilderAgentModelRaw)
-        {
-            return modelRaw
-        }
-        return nonEmptyTrimmed(settings.lastUsedDiscoverModelsByAgent?[agentRaw])
+extension GlobalScalarPreferences.NotificationSettings {
+    func resolved(over defaults: NotificationPreferences = .defaults) -> NotificationPreferences {
+        var preferences = defaults
+        preferences.enabled = enabled ?? defaults.enabled
+        preferences.agentInteractions = agentInteractions ?? defaults.agentInteractions
+        preferences.agentInstructionWaits = agentInstructionWaits ?? defaults.agentInstructionWaits
+        preferences.agentTurnComplete = agentTurnComplete ?? defaults.agentTurnComplete
+        preferences.agentTurnFailed = agentTurnFailed ?? defaults.agentTurnFailed
+        preferences.chatComplete = chatComplete ?? defaults.chatComplete
+        preferences.contextBuilderComplete = contextBuilderComplete ?? defaults.contextBuilderComplete
+        preferences.approveFromNotifications = approveFromNotifications ?? defaults.approveFromNotifications
+        preferences.answerFromNotifications = answerFromNotifications ?? defaults.answerFromNotifications
+        preferences.replyFromCompletion = replyFromCompletion ?? defaults.replyFromCompletion
+        preferences.showDetails = showDetails ?? defaults.showDetails
+        preferences.notifyWhileActive = notifyWhileActive ?? defaults.notifyWhileActive
+        preferences.completionsWhileActive = completionsWhileActive ?? defaults.completionsWhileActive
+        preferences.includeAgentDrivenSessions = includeAgentDrivenSessions ?? defaults.includeAgentDrivenSessions
+        preferences.dockBadge = dockBadge ?? defaults.dockBadge
+        preferences.mcpAskUserNotifyInsteadOfActivate = mcpAskUserNotifyInsteadOfActivate
+            ?? defaults.mcpAskUserNotifyInsteadOfActivate
+        return preferences
     }
+}
 
-    private static func nonEmptyTrimmed(_ rawValue: String?) -> String? {
-        guard let rawValue else { return nil }
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func removingLegacyWorkspaceContextBuilderState(
-        from settingsByWorkspaceID: [UUID: ChatGlobalSettings]
-    ) -> [UUID: ChatGlobalSettings] {
-        settingsByWorkspaceID.mapValues { settings in
-            var settings = settings
-            settings.lastUsedDiscoverAgentRaw = nil
-            settings.lastUsedDiscoverModelsByAgent = nil
-            settings.contextBuilderAgentRaw = nil
-            settings.contextBuilderAgentModelRaw = nil
-            settings.didUserSetDiscoverAgentDefaults = nil
-            settings.didUserSetContextBuilderDefaults = nil
-            settings.didAutoApplyRecommendationsAt = nil
-            return settings
-        }
-    }
-
-    private func resolvedSyncChatModelWithOracleFromCurrentPreferences() -> Bool {
-        if let stored = scalarPreferences.modelSelection?.syncChatModelWithOracle {
-            return stored
-        }
-        let planning = scalarPreferences.modelSelection?.planningModel ?? ""
-        let compose = scalarPreferences.modelSelection?.preferredComposeModel ?? ""
-        return !planning.isEmpty && planning == compose
-    }
-
-    private func syncSiblingReason(from reason: String?) -> String? {
-        let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let trimmed, !trimmed.isEmpty else { return nil }
-        return "\(trimmed).sync_sibling"
-    }
-
-    private func syncSnapReason(from reason: String?) -> String? {
-        let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let trimmed, !trimmed.isEmpty else { return nil }
-        return "\(trimmed).snap_to_planning"
-    }
-
-    private func syncTelemetryMirrorFromLoadedSettings(_ preferences: GlobalScalarPreferences) {
-        if let enabled = preferences.telemetry?.enabled {
-            defaults.set(enabled, forKey: Self.telemetryEnabledDefaultsKey)
-        } else {
-            defaults.removeObject(forKey: Self.telemetryEnabledDefaultsKey)
-        }
-    }
-
-    private static var defaultTelemetryEnabled: Bool {
-        #if REPOPROMPT_SENTRY_ENABLED
-            true
-        #else
-            false
-        #endif
-    }
-
-    private func makeDocument() -> GlobalSettingsDocument {
-        GlobalSettingsDocument(
-            copySettings: copySettings,
-            chatSettings: chatSettings,
-            agentModelsSettings: agentModelsSettingsByWorkspaceID,
-            globalDefaults: globalDefaults,
-            scalarPreferences: scalarPreferences
-        )
-    }
-
-    @discardableResult
-    private func save() -> Bool {
-        do {
-            try fileStore.save(makeDocument())
-            if persistenceBlockReason != fileStore.blockReason {
-                persistenceBlockReason = fileStore.blockReason
-            }
-            return true
-        } catch {
-            if persistenceBlockReason != fileStore.blockReason {
-                persistenceBlockReason = fileStore.blockReason
-            }
-            print("⚠️ Failed to save global settings JSON at \(fileStore.fileURL.path): \(error)")
-            return false
-        }
+extension AgentModelsSettingsProfile {
+    func contextBuilderModelParameterSelections(
+        for agent: AgentProviderKind,
+        modelRaw: String
+    ) -> [ACPModelParameterSelection] {
+        guard let identity = SettingsAgentKind(rawValue: agent.rawValue) else { return [] }
+        return contextBuilderModelParameterSelections(forAgentIdentity: identity, modelRaw: modelRaw)
     }
 }

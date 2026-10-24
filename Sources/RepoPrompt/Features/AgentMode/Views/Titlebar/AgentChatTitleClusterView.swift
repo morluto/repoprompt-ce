@@ -6,18 +6,41 @@ final class AgentChatTitleClusterModel: ObservableObject {
     struct State: Equatable {
         var title: String
         var showsChatOptions: Bool
+        /// Transient confirmation shown on the persistent title cluster.
+        ///
+        /// The native chat-options menu dismisses the moment an item is chosen, so success feedback
+        /// for Copy Session ID cannot live on the menu itself.
+        var copiedNotice: String?
     }
 
     @Published private(set) var state: State
+    private var copiedNoticeGeneration: UInt64 = 0
 
     init(title: String) {
-        state = State(title: title, showsChatOptions: false)
+        state = State(title: title, showsChatOptions: false, copiedNotice: nil)
     }
 
     func update(title: String, showsChatOptions: Bool) {
-        let nextState = State(title: title, showsChatOptions: showsChatOptions)
+        let nextState = State(
+            title: title,
+            showsChatOptions: showsChatOptions,
+            copiedNotice: state.copiedNotice
+        )
         guard state != nextState else { return }
         state = nextState
+    }
+
+    /// Revision-guarded: a later confirmation always supersedes an in-flight reset, and a reset never
+    /// clears a newer notice.
+    func showCopiedNotice(_ message: String, duration: Duration = .milliseconds(1500)) {
+        copiedNoticeGeneration &+= 1
+        let generation = copiedNoticeGeneration
+        state.copiedNotice = message
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: duration)
+            guard let self, copiedNoticeGeneration == generation else { return }
+            state.copiedNotice = nil
+        }
     }
 }
 
@@ -41,14 +64,23 @@ struct AgentChatTitleClusterView: View {
                     menuActions: menuActions
                 )
             }
+
+            if let copiedNotice = model.state.copiedNotice {
+                Text(copiedNotice)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .transition(.opacity)
+                    .accessibilityIdentifier("AgentChatTitleCopiedNotice")
+                    .accessibilityLabel(copiedNotice)
+            }
         }
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
     }
 }
 
-private final class AgentChatOptionsButton: NSButton {
-    private var actionHandler: ((NSButton) -> Void)?
+final class AgentChatOptionsButton: NSButton {
     private var trackingArea: NSTrackingArea?
     private var isHovering = false {
         didSet { updateAppearance() }
@@ -60,7 +92,7 @@ private final class AgentChatOptionsButton: NSButton {
         image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "Chat Options")
         imagePosition = .imageOnly
         isBordered = false
-        focusRingType = .none
+        focusRingType = .exterior
         translatesAutoresizingMaskIntoConstraints = false
         toolTip = "Chat Options"
         setAccessibilityLabel("Chat Options")
@@ -83,17 +115,21 @@ private final class AgentChatOptionsButton: NSButton {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func setActionHandler(_ handler: @escaping (NSButton) -> Void) {
-        actionHandler = handler
-    }
-
     override func mouseDown(with _: NSEvent) {
-        actionHandler?(self)
+        guard isEnabled, let action else { return }
+        NSApplication.shared.sendAction(action, to: target, from: self)
     }
 
-    override func accessibilityPerformPress() -> Bool {
-        actionHandler?(self)
-        return true
+    override var focusRingMaskBounds: NSRect {
+        bounds
+    }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(
+            roundedRect: focusRingMaskBounds,
+            xRadius: layer?.cornerRadius ?? 6,
+            yRadius: layer?.cornerRadius ?? 6
+        ).fill()
     }
 
     override func updateTrackingAreas() {
@@ -135,9 +171,8 @@ private struct AgentChatOptionsMenuButton: NSViewRepresentable {
 
     func makeNSView(context: Context) -> AgentChatOptionsButton {
         let button = AgentChatOptionsButton()
-        button.setActionHandler { [coordinator = context.coordinator] sender in
-            coordinator.showMenu(sender)
-        }
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.showMenu(_:))
         return button
     }
 
@@ -148,7 +183,7 @@ private struct AgentChatOptionsMenuButton: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator {
+    final class Coordinator: NSObject {
         var menuSnapshot: () -> AgentChatOptionsMenuSnapshot?
         var menuActions: AgentChatOptionsMenuActions
 
@@ -160,7 +195,7 @@ private struct AgentChatOptionsMenuButton: NSViewRepresentable {
             self.menuActions = menuActions
         }
 
-        func showMenu(_ sender: NSButton) {
+        @objc func showMenu(_ sender: NSButton) {
             guard let snapshot = menuSnapshot() else { return }
             AgentChatOptionsMenuPresenter.popUp(
                 below: sender,
