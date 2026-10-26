@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
 
 /// Namespace for MCP Tool result DTOs.
 /// Using a namespace avoids name collisions with existing private structs
@@ -255,6 +257,10 @@ enum ToolResultDTOs {
         let note: String?
         let wasTruncated: Bool?
         let worktreeScope: WorktreeScopeDTO?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
 
         init(
             rootsCount: Int,
@@ -262,7 +268,11 @@ enum ToolResultDTOs {
             tree: String,
             note: String? = nil,
             wasTruncated: Bool? = nil,
-            worktreeScope: WorktreeScopeDTO? = nil
+            worktreeScope: WorktreeScopeDTO? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil
         ) {
             self.rootsCount = rootsCount
             self.usesLegend = usesLegend
@@ -270,6 +280,10 @@ enum ToolResultDTOs {
             self.note = note
             self.wasTruncated = wasTruncated
             self.worktreeScope = worktreeScope
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -279,6 +293,10 @@ enum ToolResultDTOs {
             case note
             case wasTruncated = "was_truncated"
             case worktreeScope = "worktree_scope"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
         }
     }
 
@@ -302,6 +320,7 @@ enum ToolResultDTOs {
         enum IndexState: String, Codable {
             case complete
             case indexing
+            case stopped
         }
 
         enum UnresolvedReason: String, Codable {
@@ -328,6 +347,9 @@ enum ToolResultDTOs {
             let state: IndexState
             let indexed: UInt64
             let total: UInt64
+            var reason: String?
+            var attempted: Int?
+            var limit: Int?
         }
 
         struct SeedDTO: Codable, Equatable {
@@ -871,7 +893,7 @@ enum ToolResultDTOs {
     /// - totalLinesChanged – sum of absolute line deltas across all committed chunks.
     /// - totalChunks       – number of diff chunks applied.
     struct EditSummary: Codable, Equatable {
-        let status: String // "success", "partial", "failed"
+        let status: String // "success", "partial", "failed", "no_change"
         let editsRequested: Int
         let editsApplied: Int
         let addedLines: Int?
@@ -1087,11 +1109,70 @@ enum ToolResultDTOs {
             let patch: String
         }
 
+        struct OracleLaneErrorDTO: Codable, Equatable {
+            let code: String
+            let message: String
+            let partialResponse: String?
+
+            private enum CodingKeys: String, CodingKey {
+                case code
+                case message
+                case partialResponse = "partial_response"
+            }
+        }
+
+        struct OracleLaneDTO: Codable, Equatable {
+            struct ExecutionProfileDTO: Codable, Equatable {
+                let providerID: String
+                let modelID: String
+                let effectiveReasoningEffort: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case providerID = "provider_id"
+                    case modelID = "model_id"
+                    case effectiveReasoningEffort = "effective_reasoning_effort"
+                }
+            }
+
+            let laneIndex: Int
+            let role: String
+            let chatID: String
+            let providerID: String?
+            let modelID: String
+            let status: String
+            let executionProfile: ExecutionProfileDTO?
+            let response: String?
+            let error: OracleLaneErrorDTO?
+
+            private enum CodingKeys: String, CodingKey {
+                case laneIndex = "lane_index"
+                case role
+                case chatID = "chat_id"
+                case providerID = "provider_id"
+                case modelID = "model_id"
+                case status
+                case executionProfile = "execution_profile"
+                case response
+                case error
+            }
+        }
+
+        struct OracleWarningDTO: Codable, Equatable {
+            let code: String
+            let message: String
+        }
+
         let chatID: String?
         let mode: String?
         let response: String?
         let diffs: [Diff]?
         let errors: [String]?
+        let oracleGroupID: String?
+        let oracleReconciliationGuidance: String?
+        let status: String?
+        let oracleCount: Int?
+        let oracleResults: [OracleLaneDTO]?
+        let warnings: [OracleWarningDTO]?
 
         private enum CodingKeys: String, CodingKey {
             case chatID = "chat_id"
@@ -1100,14 +1181,38 @@ enum ToolResultDTOs {
             case diffs
             case patches
             case errors
+            case oracleGroupID = "oracle_group_id"
+            case oracleReconciliationGuidance = "oracle_reconciliation_guidance"
+            case status
+            case oracleCount = "oracle_count"
+            case oracleResults = "oracle_results"
+            case warnings
         }
 
-        init(chatID: String?, mode: String?, response: String?, diffs: [Diff]?, errors: [String]?) {
+        init(
+            chatID: String?,
+            mode: String?,
+            response: String?,
+            diffs: [Diff]?,
+            errors: [String]?,
+            oracleGroupID: String? = nil,
+            oracleReconciliationGuidance: String? = nil,
+            status: String? = nil,
+            oracleCount: Int? = nil,
+            oracleResults: [OracleLaneDTO]? = nil,
+            warnings: [OracleWarningDTO]? = nil
+        ) {
             self.chatID = chatID
             self.mode = mode
             self.response = response
             self.diffs = diffs
             self.errors = errors
+            self.oracleGroupID = oracleGroupID
+            self.oracleReconciliationGuidance = oracleReconciliationGuidance
+            self.status = status
+            self.oracleCount = oracleCount
+            self.oracleResults = oracleResults
+            self.warnings = warnings
         }
 
         init(from decoder: Decoder) throws {
@@ -1121,6 +1226,12 @@ enum ToolResultDTOs {
                 diffs = try container.decodeIfPresent([Diff].self, forKey: .patches)
             }
             errors = try container.decodeIfPresent([String].self, forKey: .errors)
+            oracleGroupID = try container.decodeIfPresent(String.self, forKey: .oracleGroupID)
+            oracleReconciliationGuidance = try container.decodeIfPresent(String.self, forKey: .oracleReconciliationGuidance)
+            status = try container.decodeIfPresent(String.self, forKey: .status)
+            oracleCount = try container.decodeIfPresent(Int.self, forKey: .oracleCount)
+            oracleResults = try container.decodeIfPresent([OracleLaneDTO].self, forKey: .oracleResults)
+            warnings = try container.decodeIfPresent([OracleWarningDTO].self, forKey: .warnings)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -1130,6 +1241,12 @@ enum ToolResultDTOs {
             try container.encodeIfPresent(response, forKey: .response)
             try container.encodeIfPresent(diffs, forKey: .diffs)
             try container.encodeIfPresent(errors, forKey: .errors)
+            try container.encodeIfPresent(oracleGroupID, forKey: .oracleGroupID)
+            try container.encodeIfPresent(oracleReconciliationGuidance, forKey: .oracleReconciliationGuidance)
+            try container.encodeIfPresent(status, forKey: .status)
+            try container.encodeIfPresent(oracleCount, forKey: .oracleCount)
+            try container.encodeIfPresent(oracleResults, forKey: .oracleResults)
+            try container.encodeIfPresent(warnings, forKey: .warnings)
         }
     }
 
@@ -1517,10 +1634,19 @@ enum ToolResultDTOs {
         let repositories: [RepositoryDTO]?
         let worktree: WorktreeDTO?
         let worktrees: [WorktreeDTO]?
+        /// `list` only: usable (non-prunable) worktrees before paging.
+        let totalCount: Int?
+        /// `list` only: `true` when worktrees after this page remain; omitted otherwise.
+        let truncated: Bool?
+        /// `list` only: offset of the next page when `truncated` is true.
+        let nextOffset: Int?
         let createdWorktree: WorktreeDTO?
         let binding: BindingDTO?
         let bindings: [BindingDTO]?
         let previousBinding: BindingDTO?
+        /// Present when a session changed its own execution worktree from its live turn: the binding
+        /// applies after that turn completes and the session then continues automatically.
+        let pendingApplication: PendingApplicationDTO?
         let graph: GraphDTO?
         let merge: MergeDTO?
         let warning: String?
@@ -1532,10 +1658,14 @@ enum ToolResultDTOs {
             repositories: [RepositoryDTO]? = nil,
             worktree: WorktreeDTO? = nil,
             worktrees: [WorktreeDTO]? = nil,
+            totalCount: Int? = nil,
+            truncated: Bool? = nil,
+            nextOffset: Int? = nil,
             createdWorktree: WorktreeDTO? = nil,
             binding: BindingDTO? = nil,
             bindings: [BindingDTO]? = nil,
             previousBinding: BindingDTO? = nil,
+            pendingApplication: PendingApplicationDTO? = nil,
             graph: GraphDTO? = nil,
             merge: MergeDTO? = nil,
             warning: String? = nil,
@@ -1546,10 +1676,14 @@ enum ToolResultDTOs {
             self.repositories = repositories
             self.worktree = worktree
             self.worktrees = worktrees
+            self.totalCount = totalCount
+            self.truncated = truncated
+            self.nextOffset = nextOffset
             self.createdWorktree = createdWorktree
             self.binding = binding
             self.bindings = bindings
             self.previousBinding = previousBinding
+            self.pendingApplication = pendingApplication
             self.graph = graph
             self.merge = merge
             self.warning = warning
@@ -1557,9 +1691,29 @@ enum ToolResultDTOs {
         }
 
         private enum CodingKeys: String, CodingKey {
-            case op, repository, repositories, worktree, worktrees, binding, bindings, graph, merge, warning, error
+            case op, repository, repositories, worktree, worktrees, truncated, binding, bindings, graph, merge, warning, error
+            case totalCount = "total_count"
+            case nextOffset = "next_offset"
             case createdWorktree = "created_worktree"
             case previousBinding = "previous_binding"
+            case pendingApplication = "pending_application"
+        }
+
+        struct PendingApplicationDTO: Codable, Equatable {
+            /// `scheduled`: recorded, nothing about execution has changed yet.
+            let state: String
+            /// `current_turn_completes`: the boundary at which the binding is applied.
+            let appliesAfter: String
+            /// `automatic`: the session starts its own continuation turn in the new location.
+            let continuation: String
+            let relocationID: String
+            let detail: String
+
+            private enum CodingKeys: String, CodingKey {
+                case state, continuation, detail
+                case appliesAfter = "applies_after"
+                case relocationID = "relocation_id"
+            }
         }
 
         struct RepositoryDTO: Codable, Equatable {

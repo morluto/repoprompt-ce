@@ -1,9 +1,14 @@
+import Combine
+import Foundation
+import KeyboardShortcuts
+import RepoPromptInstrumentation
 import SwiftUI
 
 // MARK: - Context Pill
 
 /// Always-visible pill showing context usage wheel + file/token info.
 struct AgentContextPill: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @ObservedObject var promptManager: PromptViewModel
     let openContextDrawerFiles: () -> Void
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -13,12 +18,14 @@ struct AgentContextPill: View {
     let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
 
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
+
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
 
     private var estimatedUsedTokens: Int? {
-        runtimeVM.snapshot.usedTokens ?? runtimeVM.snapshot.estimatedTranscriptTokens
+        runtimeVM.snapshot.displayUsedTokens
     }
 
     private var contextWindowTokens: Int {
@@ -61,11 +68,18 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.selectionTokens
     }
 
+    private var contextComposerActionText: String {
+        guard let contextComposerShortcut else { return "Click to review and edit" }
+        return "Click to review and edit · \(contextComposerShortcut)"
+    }
+
     private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
-        if let usedTokens = estimatedUsedTokens,
-           contextWindowTokens > 0
+        if runtimeVM.snapshot.awaitingPostCompactionUsage {
+            lines.append(runtimeVM.snapshot.displayUsageLabel)
+        } else if let usedTokens = estimatedUsedTokens,
+                  contextWindowTokens > 0
         {
             let usedPercent = min(max((Double(usedTokens) / Double(contextWindowTokens)) * 100, 0), 100)
             lines.append("Context used: \(Int(usedPercent.rounded()))%")
@@ -76,17 +90,21 @@ struct AgentContextPill: View {
             lines.append("Context usage unavailable")
         }
 
+        if !runtimeVM.snapshot.awaitingPostCompactionUsage {
+            lines.append("Source: \(runtimeVM.snapshot.displayUsageLabel)")
+        }
         lines.append("Selected context: \(detailedFileSummaryText)")
         if let selectionTokens {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
         }
+        lines.append(contextComposerActionText)
 
         return lines.joined(separator: "\n")
     }
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.context")
+            let _ = perfRecorder.increment("ui.body.statusPills.context")
         #endif
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let displayText = selectionDisplayText
@@ -97,6 +115,10 @@ struct AgentContextPill: View {
             openContextDrawerFiles()
         } label: {
             HStack(spacing: 6) {
+                Image(systemName: "square.stack.3d.up")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+
                 Text(compactFileSummaryText)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                     .foregroundStyle(.secondary)
@@ -106,6 +128,8 @@ struct AgentContextPill: View {
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
                     usedTokens: estimatedUsedTokens,
+                    sourceLabel: runtimeVM.snapshot.displayUsageLabel,
+                    awaitingPostCompactionUsage: runtimeVM.snapshot.awaitingPostCompactionUsage,
                     style: .compact
                 )
             }
@@ -121,6 +145,9 @@ struct AgentContextPill: View {
         .buttonStyle(.plain)
         .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)
         .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
-        .accessibilityHint("Opens Compose selections")
+        .accessibilityHint("Review and edit selected context")
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            contextComposerShortcut = KeyboardShortcuts.getShortcut(for: .toggleContextComposer)
+        }
     }
 }
