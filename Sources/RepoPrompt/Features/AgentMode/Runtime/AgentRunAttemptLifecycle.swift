@@ -6,7 +6,7 @@ import Foundation
 /// terminal-settlement bookkeeping.
 ///
 /// This type consolidates what used to be a stored field cluster on
-/// `AgentModeViewModel.TabSession` (run identity, the attempt tracker, provider
+/// `AgentTabSession` (run identity, the attempt tracker, provider
 /// drain generation, the terminal-commit phase flag, the settled terminal
 /// revision/publication result, and exactly-once terminal resources) behind
 /// named single-writer operations.
@@ -20,7 +20,7 @@ import Foundation
 ///   ordering (revision staged before publication resolves; the in-progress
 ///   flag cleared only after publication and teardown registration) stays
 ///   representable across its suspension points.
-/// - Live tab/session binding remains owned by `TabSession`; binding currency
+/// - Live tab/session binding remains owned by `AgentTabSession`; binding currency
 ///   validation composes this facade's attempt check with the session's own
 ///   binding comparison.
 ///
@@ -60,7 +60,20 @@ final class AgentRunAttemptLifecycle {
     /// Provider process run identity for the active or most recent run.
     private(set) var currentRunID: UUID?
     private(set) var providerTerminalDrainGeneration: UInt64 = 0
-    private(set) var terminalCommitInProgress = false
+    private(set) var terminalCommitInProgress = false {
+        didSet {
+            guard oldValue != terminalCommitInProgress else { return }
+            onTerminalCommitPhaseChange?()
+        }
+    }
+
+    /// Change channel for observers that gate on the terminal-commit phase but cannot see it
+    /// otherwise: this state is owned here and is not `@Published`, so a settling run would look
+    /// idle to a cross-window observer without an explicit notification.
+    ///
+    /// Installed by the owning `TabSession`. It fires only on real transitions, so the phase reset
+    /// inside `beginAttempt` is silent when no commit was in progress.
+    var onTerminalCommitPhaseChange: (() -> Void)?
     private(set) var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
     private(set) var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
     private(set) var terminalResources: AgentRunAttemptTerminalResources?

@@ -3,6 +3,28 @@ import Darwin
 import Foundation
 import OSLog
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
+import RepoPromptInstrumentation
+import RepoPromptPersistence
+import RepoPromptProcess
+import RepoPromptShared
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
+
+extension GitDiffCompareSpec {
+    /// Validate even programmatically constructed or decoded specs before Git runs.
+    func validateRevisionArgument() throws {
+        switch self {
+        case let .uncommitted(base), let .uncommittedMergeBase(base),
+             let .staged(base), let .stagedMergeBase(base):
+            try GitRevisionArgument.validate(base)
+        case let .revspec(spec):
+            try GitRevisionArgument.validate(spec)
+        case .unstaged:
+            break
+        }
+    }
+}
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -87,6 +109,43 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
 /// Async Git helper for fetching repository information
 /// Based on the macOS 14+ Swift Git integration guide
 actor GitService {
+    private struct UntrackedStatsKey: Hashable {
+        let root: String
+        let path: String
+    }
+
+    private struct CachedUntrackedStats {
+        let fingerprint: FileContentFingerprint
+        let additions: Int?
+        let deletions: Int?
+        var lastUsed: Date
+    }
+
+    private var untrackedStatsCache: [UntrackedStatsKey: CachedUntrackedStats] = [:]
+    private let untrackedStatsCacheLimit: Int
+    #if DEBUG
+        private var untrackedStatsReadCount = 0
+        func untrackedStatsCacheSnapshotForTesting(at root: URL) -> (reads: Int, count: Int, paths: Set<String>) {
+            (untrackedStatsReadCount, untrackedStatsCache.count, Set(untrackedStatsCache.keys.filter {
+                $0.root == root.standardizedFileURL.path
+            }.map(\.path)))
+        }
+    #endif
+
+    func invalidateUntrackedStats(at root: URL) {
+        let path = root.standardizedFileURL.path
+        untrackedStatsCache = untrackedStatsCache.filter { $0.key.root != path }
+    }
+
+    private func pruneUntrackedStats(at root: URL, paths: Set<String>?) {
+        let rootPath = root.standardizedFileURL.path
+        let now = Date()
+        untrackedStatsCache = untrackedStatsCache.filter { key, value in
+            now.timeIntervalSince(value.lastUsed) < 300
+                && (key.root != rootPath || paths?.contains(key.path) != false)
+        }
+    }
+
     private static let gitProcessTimeout: Duration = .seconds(120)
     private static let gitProcessTerminationGrace: Duration = .seconds(5)
     private static let gitCheckAttrOutputByteLimit = 4 * 1024 * 1024
@@ -132,6 +191,8 @@ actor GitService {
     }
 
     private enum GitProcessRepositoryBinding {
+        /// Deliberate app discovery only; MCP root grants use scoped layout resolution.
+        case discovery
         case inferred
         case exactObjectRead(GitRepositoryLayout)
         case exactWorktree(GitRepositoryLayout)
@@ -357,7 +418,9 @@ actor GitService {
         private var worktreeMutationLockAcquiredHandlerForTesting: (@Sendable (UUID?) async -> Void)?
         private var targetEvidenceDidSealBeforeCommandHandlerForTesting: (@Sendable () async throws -> Void)?
         private var drainCreationFailureForTesting: (any Error)?
+        private var trackedCheckoutCloneSyscallForTesting: GitWorktreeFileCloner.CloneSyscall?
     #endif
+    private static let worktreeCloneLogger = Logger(subsystem: "com.repoprompt.git", category: "worktree-clone")
 
     /// Spawns one git child. Injectable for deterministic launch-failure and
     /// launch-blocking tests; production always uses `ProcessLauncher`.
@@ -373,7 +436,8 @@ actor GitService {
             command: executablePath,
             arguments: arguments,
             environment: environment,
-            workingDirectory: workingDirectoryPath
+            workingDirectory: workingDirectoryPath,
+            purpose: .tool
         )
     }
 
@@ -384,15 +448,18 @@ actor GitService {
         processTerminationGrace: Duration = GitService.gitProcessTerminationGrace,
         processSpawner: @escaping ProcessSpawner = GitService.defaultProcessSpawner,
         worktreeLayoutCacheLimit: Int = 128,
+        untrackedStatsCacheLimit: Int = 4096,
         inheritedProcessEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         precondition(worktreeLayoutCacheLimit > 0)
+        precondition(untrackedStatsCacheLimit >= 0)
         self.gitExecutableURL = gitExecutableURL
         self.processAdmissionController = processAdmissionController
         self.workspaceStateAuthority = workspaceStateAuthority
         self.processTerminationGrace = processTerminationGrace
         self.processSpawner = processSpawner
         self.worktreeLayoutCacheLimit = worktreeLayoutCacheLimit
+        self.untrackedStatsCacheLimit = untrackedStatsCacheLimit
         self.inheritedProcessEnvironment = inheritedProcessEnvironment
     }
 
@@ -408,6 +475,11 @@ actor GitService {
             _ handler: (@Sendable (UUID?) async -> Void)?
         ) {
             worktreeMutationLockAcquiredHandlerForTesting = handler
+        }
+
+        /// Replaces `fclonefileat` for tracked-checkout materialization in tests.
+        func setTrackedCheckoutCloneSyscallForTesting(_ clone: GitWorktreeFileCloner.CloneSyscall?) {
+            trackedCheckoutCloneSyscallForTesting = clone
         }
 
         func setTargetEvidenceDidSealBeforeCommandHandlerForTesting(
@@ -590,7 +662,8 @@ actor GitService {
     func findGitRoot(from path: URL) async throws -> URL? {
         let (stdout, _, exitCode) = try await runGit(
             ["rev-parse", "--show-toplevel"],
-            at: path
+            at: path,
+            repositoryBinding: .discovery
         )
 
         guard exitCode == 0 else {
@@ -619,7 +692,8 @@ actor GitService {
         }
         let (stdout, _, exitCode) = try await runGit(
             ["rev-parse", "--is-bare-repository"],
-            at: path
+            at: path,
+            repositoryBinding: .discovery
         )
         guard exitCode == 0 else {
             // `rev-parse` has no repository context to inspect when this structured probe
@@ -693,10 +767,13 @@ actor GitService {
     /// Create a Git worktree and return best-effort `.worktreeinclude` copy details.
     /// Receipt observation is additive and fail-open: creation remains successful when
     /// authority or witness evidence cannot be proven.
+    @TaskLocal private static var worktreeCreationCommitFence: (@Sendable () async throws -> Void)?
+
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
         at repoURL: URL,
-        initializationContext: GitWorktreeInitializationContext? = nil
+        initializationContext: GitWorktreeInitializationContext? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeCreateResult {
         let sourceLayout = getLayout(for: repoURL)
         let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
@@ -786,6 +863,9 @@ actor GitService {
                         throw error
                     }
                 }
+                // Deterministic Git refusals settle here, before any creation side effect and
+                // before the caller's commit fence, so a protected caller can report not-applied.
+                try await validateWorktreeCreatePreconditions(mutationRequest, at: repoURL)
                 var parentEvidence: (
                     lease: GitWorkspaceAuthorityLease,
                     snapshot: WorkspaceRootReusableSnapshot,
@@ -864,7 +944,7 @@ actor GitService {
                         #endif
                         parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
                         if let stableWatchRootURL = mutationRequest.appManagedContainer {
-                            witnessSession = creationReceiptCoordinator.start(
+                            witnessSession = await creationReceiptCoordinator.start(
                                 destinationURL: mutationRequest.path,
                                 stableWatchRootURL: stableWatchRootURL
                             )
@@ -902,7 +982,18 @@ actor GitService {
                     nil
                 }
                 do {
+                    #if DEBUG
+                        let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
+                    #endif
+                    let eligibilityClock = ContinuousClock()
+                    let eligibilityStarted = eligibilityClock.now
+                    let trackedCloneDecision = try await trackedCheckoutCloneDecision(
+                        request: mutationRequest,
+                        sourceLayout: sourceLayout
+                    )
+                    let eligibilityMilliseconds = Self.milliseconds(eligibilityClock.now - eligibilityStarted)
                     var args = ["worktree", "add"]
+                    if case .eligible = trackedCloneDecision { args.append("--no-checkout") }
                     if mutationRequest.force { args.append("--force") }
                     if mutationRequest.detach { args.append("--detach") }
                     if let lockReason = mutationRequest.lockReason {
@@ -919,13 +1010,30 @@ actor GitService {
                     args.append(mutationRequest.path.standardizedFileURL.path)
                     if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
-                    #if DEBUG
-                        let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
-                    #endif
-                    let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+                    let (_, stderr, exitCode) = try await Self.$worktreeCreationCommitFence.withValue(beforeCommit) {
+                        try await runGit(args, at: repoURL)
+                    }
                     guard exitCode == 0 else {
                         throw GitError(message: "git worktree add failed: \(stderr)")
                     }
+                    let checkoutReport: GitWorktreeCheckoutReport
+                    switch trackedCloneDecision {
+                    case let .ineligible(reason):
+                        checkoutReport = GitWorktreeCheckoutReport(
+                            strategy: .ordinary,
+                            ineligibilityReason: reason.rawValue,
+                            eligibilityMilliseconds: eligibilityMilliseconds
+                        )
+                    case let .eligible(plan):
+                        await clearLayoutCache()
+                        checkoutReport = try await completeTrackedCheckoutClone(
+                            plan: plan,
+                            destinationURL: mutationRequest.path.standardizedFileURL
+                        ).withEligibilityMilliseconds(eligibilityMilliseconds)
+                    }
+                    Self.worktreeCloneLogger.debug(
+                        "worktree checkout strategy=\(checkoutReport.strategy.rawValue, privacy: .public) ineligible=\(checkoutReport.ineligibilityReason ?? "-", privacy: .public) files=\(checkoutReport.clonedFileCount, privacy: .public) links=\(checkoutReport.symbolicLinkCount, privacy: .public) bytes=\(checkoutReport.clonedByteCount, privacy: .public) fallback=\(checkoutReport.fallbackReason ?? "-", privacy: .private)"
+                    )
                     #if DEBUG
                         let benchmarkMutationFinished = DispatchTime.now().uptimeNanoseconds
                         let benchmarkPostMutationStarted = benchmarkMutationFinished
@@ -953,7 +1061,10 @@ actor GitService {
                             targetLayout = nil
                         }
                     #endif
-                    var witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    var witnessCoverage: GitWorktreeCreationWitnessCoverage?
+                    if let activeWitnessSession = witnessSession {
+                        witnessCoverage = await creationReceiptCoordinator.finish(activeWitnessSession)
+                    }
                     witnessSession = nil
                     #if DEBUG
                         if consumeReceiptCreationFailureForTesting(
@@ -1037,11 +1148,14 @@ actor GitService {
                     let includeCopyHadFailures = includeCopyResult.map {
                         !$0.skippedSummaries.isEmpty || !$0.errorSummaries.isEmpty
                     } ?? false
+                    // Opt-in untracked copies are not part of the parent snapshot's ignored-file
+                    // model, so they conservatively disable receipt reuse.
                     var includeCopyWasComplete = reusableReceiptDestinationIsEligible
                         && !includeCopyHadFailures
                         && (includeCopyResult.map {
                             $0.copiedCount == $0.matchedCount
                                 && $0.copiedRelativePaths.count == $0.copiedCount
+                                && $0.copiedUntrackedCount == 0
                         } ?? true)
                     #if DEBUG
                         if consumeReceiptCreationFailureForTesting(
@@ -1166,11 +1280,16 @@ actor GitService {
                     return GitWorktreeCreateResult(
                         descriptor: created,
                         includeCopyResult: includeCopyResult,
+                        checkoutReport: checkoutReport,
                         initializationReceipt: receipt,
                         initializationFallbackReason: initializationFallbackReason
                     )
                 } catch is CancellationError {
-                    let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    let witnessCoverage: GitWorktreeCreationWitnessCoverage? = if let activeWitnessSession = witnessSession {
+                        await creationReceiptCoordinator.finish(activeWitnessSession)
+                    } else {
+                        nil
+                    }
                     if let mutationToken {
                         await workspaceStateAuthority.finishMutation(mutationToken, outcome: .cancelled)
                     }
@@ -1190,7 +1309,11 @@ actor GitService {
                     #endif
                     throw CancellationError()
                 } catch {
-                    let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                    let witnessCoverage: GitWorktreeCreationWitnessCoverage? = if let activeWitnessSession = witnessSession {
+                        await creationReceiptCoordinator.finish(activeWitnessSession)
+                    } else {
+                        nil
+                    }
                     if let mutationToken {
                         await workspaceStateAuthority.finishMutation(mutationToken, outcome: .failed)
                     }
@@ -1592,6 +1715,13 @@ actor GitService {
         let includeURL = sourceRepoURL.appendingPathComponent(".worktreeinclude", isDirectory: false)
         guard FileManager.default.fileExists(atPath: includeURL.path) else { return nil }
         let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        if MCPDomainMutationCommitContext.controller != nil, physicalMutationGuard == nil {
+            return GitWorktreeIncludeCopyResult(
+                copiedCount: 0,
+                matchedCount: 0,
+                errorSummaries: ["protected .worktreeinclude copying has no admitted path fence"]
+            )
+        }
 
         do {
             let (stdout, stderr, exitCode) = try await runGit(
@@ -1605,10 +1735,26 @@ actor GitService {
                     errorSummaries: ["could not list Git-ignored files: \(stderr)"]
                 )
             }
+            var untrackedStdout = ""
+            if request.copyWorktreeIncludeUntrackedFiles {
+                let (untracked, untrackedStderr, untrackedExitCode) = try await runGit(
+                    ["ls-files", "--others", "--exclude-standard", "-z"],
+                    at: sourceRepoURL
+                )
+                guard untrackedExitCode == 0 else {
+                    return GitWorktreeIncludeCopyResult(
+                        copiedCount: 0,
+                        matchedCount: 0,
+                        errorSummaries: ["could not list untracked files: \(untrackedStderr)"]
+                    )
+                }
+                untrackedStdout = untracked
+            }
             return try GitWorktreeIncludeCopier.copyIncludedFiles(
                 from: sourceRepoURL,
                 to: destinationURL,
                 ignoredFilesNULOutput: stdout,
+                untrackedFilesNULOutput: untrackedStdout,
                 appManagedContainer: appManagedContainer,
                 physicalMutationGuard: physicalMutationGuard
             )
@@ -1621,6 +1767,446 @@ actor GitService {
                 errorSummaries: ["could not copy .worktreeinclude files: \(error.localizedDescription)"]
             )
         }
+    }
+
+    // MARK: - Tracked checkout APFS clone fast path
+
+    struct TrackedCheckoutClonePlan {
+        let sourceRoot: URL
+        let commonDirectory: URL
+        let treeOID: String
+        let entries: [GitWorktreeTrackedTreeEntry]
+        /// Paths whose raw bytes must equal their blob (see `assessCheckoutAttributes`).
+        let rawByteVerificationPaths: [String]
+        let rawByteVerificationObjectIDs: [String]
+        let physicalMutationGuard: GitWorktreePhysicalMutationGuardBox
+    }
+
+    enum TrackedCheckoutCloneDecision {
+        case eligible(TrackedCheckoutClonePlan)
+        case ineligible(GitWorktreeTrackedCloneIneligibility)
+    }
+
+    /// Decides, before `git worktree add`, whether tracked files can be APFS clones of the
+    /// source checkout. Every check is read-only and conservative: anything that could make a
+    /// fresh checkout differ from the clean source bytes leaves the work to an ordinary Git
+    /// checkout. Git failures while probing also choose the ordinary path.
+    private func trackedCheckoutCloneDecision(
+        request: GitWorktreeCreateRequest,
+        sourceLayout: GitRepositoryLayout?
+    ) async throws -> TrackedCheckoutCloneDecision {
+        guard request.cloneTrackedCheckout else { return .ineligible(.notRequested) }
+        guard !request.force else { return .ineligible(.forceRequested) }
+        guard !request.allowExternalPath,
+              let appManagedContainer = request.appManagedContainer,
+              Self.isPath(request.path, equalToOrInside: appManagedContainer)
+        else { return .ineligible(.destinationNotAppManaged) }
+        guard let sourceLayout else { return .ineligible(.sourceLayoutUnavailable) }
+
+        let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        if MCPDomainMutationCommitContext.controller != nil, physicalMutationGuard == nil {
+            return .ineligible(.protectedMutationWithoutCapability)
+        }
+        try physicalMutationGuard?.revalidate()
+
+        do {
+            return try await evaluateTrackedCheckoutClone(
+                request: request,
+                sourceLayout: sourceLayout,
+                physicalMutationGuard: GitWorktreePhysicalMutationGuardBox(value: physicalMutationGuard)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as DomainMutationPathFenceError {
+            throw error
+        } catch {
+            return .ineligible(.gitCommandFailed)
+        }
+    }
+
+    private func evaluateTrackedCheckoutClone(
+        request: GitWorktreeCreateRequest,
+        sourceLayout: GitRepositoryLayout,
+        physicalMutationGuard: GitWorktreePhysicalMutationGuardBox
+    ) async throws -> TrackedCheckoutCloneDecision {
+        let sourceRoot = sourceLayout.workTreeRoot.standardizedFileURL
+        let volume: GitWorktreeTrackedCheckoutClone.VolumeProbe
+        switch GitWorktreeTrackedCheckoutClone.probeVolumes(sourceRoot: sourceRoot, destination: request.path) {
+        case let .success(probe): volume = probe
+        case let .failure(reason): return .ineligible(reason)
+        }
+
+        let environment = GitWorktreeTrackedCheckoutClone.gitEnvironment
+        func git(_ args: [String], stdin: Data? = nil) async throws -> (String, String, Int32) {
+            try await runGit(args, at: sourceRoot, env: environment, stdin: stdin)
+        }
+        func trimmed(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let (config, _, configExitCode) = try await git(["config", "--list", "-z"])
+        guard configExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        let configAssessment = GitWorktreeTrackedCheckoutClone.assessConfig(config)
+        if let reason = configAssessment.ineligibility { return .ineligible(reason) }
+
+        let (sourceTree, _, sourceTreeExitCode) = try await git(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"])
+        let sourceTreeOID = trimmed(sourceTree)
+        guard sourceTreeExitCode == 0, !sourceTreeOID.isEmpty else { return .ineligible(.sourceHeadUnavailable) }
+        let targetRef = request.baseRef.flatMap { $0.isEmpty ? nil : $0 } ?? "HEAD"
+        let (targetTree, _, targetTreeExitCode) = try await git(
+            ["rev-parse", "--verify", "--quiet", "--end-of-options", "\(targetRef)^{tree}"]
+        )
+        guard targetTreeExitCode == 0 else { return .ineligible(.baseTreeUnavailable) }
+        guard trimmed(targetTree) == sourceTreeOID else { return .ineligible(.baseTreeMismatch) }
+
+        // `worktree add --no-checkout` does not run `post-checkout`, so any hook (file-based or
+        // configured) keeps the ordinary checkout that runs it.
+        let (_, _, hookListExitCode) = try await git(["hook", "list", "post-checkout"])
+        if hookListExitCode == 0 { return .ineligible(.postCheckoutHook) }
+        let (hookPath, _, hookPathExitCode) = try await git(["rev-parse", "--git-path", "hooks/post-checkout"])
+        guard hookPathExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        let hookPathValue = trimmed(hookPath)
+        let hookURL = hookPathValue.hasPrefix("/")
+            ? URL(fileURLWithPath: hookPathValue)
+            : sourceRoot.appendingPathComponent(hookPathValue)
+        if FileManager.default.fileExists(atPath: hookURL.path) { return .ineligible(.postCheckoutHook) }
+
+        let (status, _, statusExitCode) = try await git(
+            ["status", "--porcelain=v2", "-z", "--untracked-files=no", "--ignore-submodules=none"]
+        )
+        guard statusExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        guard status.isEmpty else { return .ineligible(.sourceHasTrackedChanges) }
+
+        let (indexTags, _, indexTagsExitCode) = try await git(["ls-files", "-v", "-z"])
+        guard indexTagsExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        if GitWorktreeTrackedCheckoutClone.hasHiddenIndexState(indexTags) { return .ineligible(.hiddenIndexState) }
+
+        // No `-l`: sizes would force Git to read every blob header.
+        let (treeListing, _, treeListingExitCode) = try await git(
+            ["ls-tree", "-r", "-z", "--full-tree", sourceTreeOID]
+        )
+        guard treeListingExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+        let entries: [GitWorktreeTrackedTreeEntry]
+        switch GitWorktreeTrackedCheckoutClone.parseTree(treeListing, caseSensitiveVolume: volume.caseSensitive) {
+        case let .success(parsed): entries = parsed
+        case let .failure(reason): return .ineligible(reason)
+        }
+
+        let fileManager = FileManager.default
+        let xdgConfigHome = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".config").path
+        let attributeSourcesPresent = entries.contains { $0.pathComponents.last == ".gitattributes" }
+            || configAssessment.attributesFileConfigured
+            || fileManager.fileExists(atPath: sourceLayout.commonDir.appendingPathComponent("info/attributes").path)
+            || fileManager.fileExists(atPath: sourceLayout.gitDir.appendingPathComponent("info/attributes").path)
+            || fileManager.fileExists(atPath: URL(fileURLWithPath: xdgConfigHome).appendingPathComponent("git/attributes").path)
+        var rawByteVerificationPaths: [String] = []
+        var rawByteVerificationObjectIDs: [String] = []
+        if attributeSourcesPresent {
+            let paths = entries.map(\.relativePath).joined(separator: "\0") + "\0"
+            let (attributes, _, attributesExitCode) = try await git(
+                ["check-attr", "-z", "--stdin"] + GitWorktreeTrackedCheckoutClone.checkedAttributes,
+                stdin: Data(paths.utf8)
+            )
+            guard attributesExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+            let assessment = GitWorktreeTrackedCheckoutClone.assessCheckoutAttributes(attributes)
+            if assessment.blocksClone { return .ineligible(.checkoutAttributes) }
+            let entriesByPath = Dictionary(
+                entries.map { ($0.relativePath, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            for path in assessment.rawByteVerificationPaths {
+                // `--stdin-paths` is line based; symlinks carry no line-ending conversion.
+                guard !path.contains("\n") else { return .ineligible(.checkoutAttributes) }
+                guard let entry = entriesByPath[path], entry.kind != .symbolicLink else { continue }
+                rawByteVerificationPaths.append(path)
+                rawByteVerificationObjectIDs.append(entry.objectID)
+            }
+            // A clean source can still hold CRLF bytes that normalize to an LF blob; an
+            // ordinary checkout would write the blob bytes, so require raw equality up front.
+            if !rawByteVerificationPaths.isEmpty {
+                let (hashes, _, hashesExitCode) = try await git(
+                    ["hash-object", "--no-filters", "--stdin-paths"],
+                    stdin: Data((rawByteVerificationPaths.joined(separator: "\n") + "\n").utf8)
+                )
+                guard hashesExitCode == 0 else { return .ineligible(.gitCommandFailed) }
+                guard hashes.split(separator: "\n").map(String.init) == rawByteVerificationObjectIDs else {
+                    return .ineligible(.lineEndingConversion)
+                }
+            }
+        }
+
+        return .eligible(TrackedCheckoutClonePlan(
+            sourceRoot: sourceRoot.resolvingSymlinksInPath().standardizedFileURL,
+            commonDirectory: sourceLayout.commonDir,
+            treeOID: sourceTreeOID,
+            entries: entries,
+            rawByteVerificationPaths: rawByteVerificationPaths,
+            rawByteVerificationObjectIDs: rawByteVerificationObjectIDs,
+            physicalMutationGuard: physicalMutationGuard
+        ))
+    }
+
+    /// The freshly created worktree, pinned by directory identity and by its own Git metadata
+    /// so verification and fallback commands can never be redirected to another checkout.
+    struct TrackedCheckoutCloneTarget {
+        let url: URL
+        let layout: GitRepositoryLayout
+        let identity: GitWorktreeTrackedCheckoutClone.DirectoryIdentity
+        let admittedDirectories: DomainMutationWorktreeDirectories?
+    }
+
+    /// Materializes and verifies a `--no-checkout` worktree. Once Git has published the
+    /// worktree it is finished (clone or ordinary fallback) even if the caller is cancelled,
+    /// so it is never left without an index.
+    private func completeTrackedCheckoutClone(
+        plan: TrackedCheckoutClonePlan,
+        destinationURL: URL
+    ) async throws -> GitWorktreeCheckoutReport {
+        #if DEBUG
+            let clone = trackedCheckoutCloneSyscallForTesting ?? GitWorktreeFileCloner.systemClone
+        #else
+            let clone = GitWorktreeFileCloner.systemClone
+        #endif
+        // Fail closed unless the destination is a real directory whose gitfile points into this
+        // repository's linked-worktree metadata.
+        let worktreesDirectory = plan.commonDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("worktrees", isDirectory: true)
+        guard let identity = GitWorktreeTrackedCheckoutClone.directoryIdentity(destinationURL),
+              let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: destinationURL),
+              layout.isLinkedWorktree,
+              layout.commonDir.resolvingSymlinksInPath().standardizedFileURL.path
+              == plan.commonDirectory.resolvingSymlinksInPath().standardizedFileURL.path,
+              Self.isPath(layout.gitDir.resolvingSymlinksInPath(), equalToOrInside: worktreesDirectory)
+        else {
+            throw GitError(
+                message: "created worktree at \(destinationURL.path) could not be verified before cloning; it was left without a checkout"
+            )
+        }
+        let admittedDirectories = try plan.physicalMutationGuard.value?.openCreatedWorktreeDirectories(
+            sourcePath: plan.sourceRoot.path,
+            destinationPath: destinationURL.path,
+            destinationDevice: UInt64(identity.device),
+            destinationInode: UInt64(identity.inode)
+        )
+        let target = TrackedCheckoutCloneTarget(
+            url: destinationURL,
+            layout: layout,
+            identity: identity,
+            admittedDirectories: admittedDirectories
+        )
+        return try await Task.detached(priority: .userInitiated) { [self] in
+            try await finishTrackedCheckoutClone(plan: plan, target: target, clone: clone)
+        }.value
+    }
+
+    private nonisolated static func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
+    }
+
+    private nonisolated static func ensureTrackedCloneTargetIdentity(_ target: TrackedCheckoutCloneTarget) throws {
+        guard GitWorktreeTrackedCheckoutClone.directoryIdentity(target.url) == target.identity else {
+            throw GitError(
+                message: "worktree at \(target.url.path) changed identity during tracked clone; refusing to run Git there"
+            )
+        }
+    }
+
+    private nonisolated func finishTrackedCheckoutClone(
+        plan: TrackedCheckoutClonePlan,
+        target: TrackedCheckoutCloneTarget,
+        clone: @escaping GitWorktreeFileCloner.CloneSyscall
+    ) async throws -> GitWorktreeCheckoutReport {
+        let clock = ContinuousClock()
+        let materializationStarted = clock.now
+        var verificationStarted: ContinuousClock.Instant?
+        let failureReason: String
+        do {
+            let summary = try GitWorktreeTrackedCheckoutClone.materialize(
+                entries: plan.entries,
+                sourceRoot: plan.sourceRoot,
+                destinationRoot: target.url,
+                destinationRootIdentity: target.identity,
+                admittedDirectories: target.admittedDirectories,
+                revalidate: {
+                    if let admittedDirectories = target.admittedDirectories {
+                        try admittedDirectories.revalidate()
+                    } else {
+                        try plan.physicalMutationGuard.value?.revalidate()
+                    }
+                },
+                clone: clone
+            )
+            let verificationStart = clock.now
+            verificationStarted = verificationStart
+            if let mismatch = try await verifyClonedCheckout(target: target, plan: plan) {
+                failureReason = mismatch
+            } else {
+                return GitWorktreeCheckoutReport(
+                    strategy: .cloned,
+                    clonedFileCount: summary.regularFileCount,
+                    symbolicLinkCount: summary.symbolicLinkCount,
+                    clonedByteCount: summary.byteCount,
+                    materializationMilliseconds: Self.milliseconds(verificationStart - materializationStarted),
+                    verificationMilliseconds: Self.milliseconds(clock.now - verificationStart)
+                )
+            }
+        } catch let error as DomainMutationPathFenceError {
+            // The authorized roots changed; writing a fallback checkout would be unsafe too.
+            throw error
+        } catch {
+            failureReason = String(describing: error)
+        }
+        let fallbackStart = verificationStarted ?? clock.now
+        try await resetFailedTrackedCheckoutClone(target: target, plan: plan, reason: failureReason)
+        return GitWorktreeCheckoutReport(
+            strategy: .checkoutFallback,
+            fallbackReason: failureReason,
+            materializationMilliseconds: Self.milliseconds(fallbackStart - materializationStarted),
+            verificationMilliseconds: Self.milliseconds(clock.now - fallbackStart)
+        )
+    }
+
+    /// Builds the index from `HEAD` and proves the cloned files match it. `read-tree` leaves
+    /// zeroed stat data, so `update-index --refresh` re-hashes every file and exits non-zero on
+    /// any content, executable-bit, or symlink mismatch (`-q` would mask that exit status).
+    private nonisolated func verifyClonedCheckout(
+        target: TrackedCheckoutCloneTarget,
+        plan: TrackedCheckoutClonePlan
+    ) async throws -> String? {
+        try Self.ensureTrackedCloneTargetIdentity(target)
+        func git(_ args: [String], stdin: Data? = nil) async throws -> (String, String, Int32) {
+            try await runGit(
+                args,
+                at: target.url,
+                env: GitWorktreeTrackedCheckoutClone.gitEnvironment,
+                stdin: stdin,
+                repositoryBinding: .exactWorktree(target.layout)
+            )
+        }
+        if !plan.rawByteVerificationPaths.isEmpty {
+            let (hashes, _, hashesExitCode) = try await git(
+                ["hash-object", "--no-filters", "--stdin-paths"],
+                stdin: Data((plan.rawByteVerificationPaths.joined(separator: "\n") + "\n").utf8)
+            )
+            guard hashesExitCode == 0,
+                  hashes.split(separator: "\n").map(String.init) == plan.rawByteVerificationObjectIDs
+            else { return "cloned bytes differ from checkout bytes for line-ending-normalized files" }
+        }
+        let (headTree, _, headTreeExitCode) = try await git(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"])
+        guard headTreeExitCode == 0,
+              headTree.trimmingCharacters(in: .whitespacesAndNewlines) == plan.treeOID
+        else { return "target HEAD does not resolve to the cloned tree" }
+        let (_, readTreeError, readTreeExitCode) = try await git(["read-tree", "HEAD"])
+        guard readTreeExitCode == 0 else { return "read-tree failed: \(readTreeError)" }
+        let (_, _, refreshExitCode) = try await git(["update-index", "--refresh"])
+        guard refreshExitCode == 0 else { return "index refresh found files that differ from the target tree" }
+        let (status, _, statusExitCode) = try await git(
+            ["status", "--porcelain=v2", "-z", "--untracked-files=all"]
+        )
+        guard statusExitCode == 0, status.isEmpty else { return "cloned worktree status is not clean" }
+        return nil
+    }
+
+    /// Replaces a failed clone with Git's own checkout inside the new worktree only. The
+    /// source worktree, branches, and other worktrees are never touched; a fallback that
+    /// cannot be verified clean fails loudly and leaves the worktree in place for inspection.
+    private nonisolated func resetFailedTrackedCheckoutClone(
+        target: TrackedCheckoutCloneTarget,
+        plan: TrackedCheckoutClonePlan,
+        reason: String
+    ) async throws {
+        if let admittedDirectories = target.admittedDirectories {
+            try admittedDirectories.revalidate()
+        } else {
+            try plan.physicalMutationGuard.value?.revalidate()
+        }
+        try Self.ensureTrackedCloneTargetIdentity(target)
+        func git(_ args: [String]) async throws -> (String, String, Int32) {
+            try await runGit(
+                args,
+                at: target.url,
+                env: GitWorktreeTrackedCheckoutClone.gitEnvironment,
+                repositoryBinding: .exactWorktree(target.layout)
+            )
+        }
+        let destinationPath = target.url.path
+        // Empty the new worktree's index first: refreshed stat data could otherwise make
+        // `reset --hard` keep a cloned file whose raw bytes differ from Git's checkout.
+        var (_, resetError, resetExitCode) = try await git(["read-tree", "--empty"])
+        if resetExitCode == 0 {
+            (_, resetError, resetExitCode) = try await git(["reset", "--quiet", "--hard", "HEAD"])
+        }
+        guard resetExitCode == 0 else {
+            throw GitError(
+                message: "worktree checkout fallback failed at \(destinationPath): git reset --hard failed (\(resetError.trimmingCharacters(in: .whitespacesAndNewlines))) after tracked clone failure: \(reason)"
+            )
+        }
+        let (status, statusError, statusExitCode) = try await git(
+            ["status", "--porcelain=v2", "-z", "--untracked-files=all"]
+        )
+        guard statusExitCode == 0, status.isEmpty else {
+            let statusSummary = status.split(separator: "\0").prefix(5).joined(separator: "; ")
+            throw GitError(
+                message: "worktree checkout fallback left \(destinationPath) unclean after tracked clone failure (\(reason)): \(statusSummary)\(statusError)"
+            )
+        }
+    }
+
+    /// Refuses requests that `git worktree add` would deterministically reject. Runs under the
+    /// repository's worktree mutation lock and before any creation side effect, so a refusal here
+    /// proves this request created nothing. Races with Git processes outside RepoPrompt still
+    /// surface from `git worktree add` itself, after the commit fence.
+    private func validateWorktreeCreatePreconditions(
+        _ request: GitWorktreeCreateRequest,
+        at repoURL: URL
+    ) async throws {
+        let branch = request.branch.flatMap { $0.isEmpty ? nil : $0 }
+        if let branch {
+            // `-b` never overwrites an existing branch, with or without `--force`.
+            let (_, _, exitCode) = try await runGit(
+                ["show-ref", "--verify", "--quiet", "refs/heads/\(branch)"],
+                at: repoURL
+            )
+            if exitCode == 0 {
+                throw GitError(message: Self.worktreeCreateRefusal(
+                    "a branch named '\(branch)' already exists; choose a new branch name, or bind the worktree that has it checked out"
+                ))
+            }
+        }
+        // Without `-b`/`--detach`, Git may DWIM a remote-tracking branch name; leave that to Git.
+        if let baseRef = request.baseRef, !baseRef.isEmpty, branch != nil || request.detach {
+            // Like `git worktree add`, a lone "-" names the previously checked-out ref.
+            let resolvableRef = baseRef == "-" ? "@{-1}" : baseRef
+            let resolves: Bool
+            if resolvableRef.hasPrefix("-") {
+                resolves = false
+            } else {
+                let (_, _, exitCode) = try await runGit(
+                    ["rev-parse", "--verify", "--quiet", "\(resolvableRef)^{commit}"],
+                    at: repoURL
+                )
+                resolves = exitCode == 0
+            }
+            guard resolves else {
+                throw GitError(message: Self.worktreeCreateRefusal("base ref '\(baseRef)' does not resolve to a commit"))
+            }
+        }
+        // Git accepts an existing empty directory; anything else at the destination is refused.
+        let destinationPath = request.path.standardizedFileURL.path
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: destinationPath) {
+            let isDirectory = (attributes[.type] as? FileAttributeType) == .typeDirectory
+            let isEmptyDirectory = isDirectory
+                && ((try? FileManager.default.contentsOfDirectory(atPath: destinationPath).isEmpty) ?? false)
+            guard isEmptyDirectory else {
+                throw GitError(message: Self.worktreeCreateRefusal("destination path is occupied: \(destinationPath)"))
+            }
+        }
+    }
+
+    private static func worktreeCreateRefusal(_ detail: String) -> String {
+        "git worktree add refused before creation: \(detail). Nothing was created."
     }
 
     private static func canonicalizedAppManagedRequestAtMutationBoundary(
@@ -1651,7 +2237,9 @@ actor GitService {
             appManagedContainer: URL(fileURLWithPath: canonicalContainer, isDirectory: true),
             mainWorktreeRoot: request.mainWorktreeRoot,
             knownWorktreeRoots: request.knownWorktreeRoots,
-            copyWorktreeIncludeFiles: request.copyWorktreeIncludeFiles
+            copyWorktreeIncludeFiles: request.copyWorktreeIncludeFiles,
+            copyWorktreeIncludeUntrackedFiles: request.copyWorktreeIncludeUntrackedFiles,
+            cloneTrackedCheckout: request.cloneTrackedCheckout
         )
     }
 
@@ -1669,6 +2257,8 @@ actor GitService {
     // MARK: - Worktree Merge Primitives
 
     func getMergeBase(sourceHead: String, targetHead: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(sourceHead)
+        try GitRevisionArgument.validate(targetHead)
         let (stdout, stderr, exitCode) = try await runGit(
             ["merge-base", targetHead, sourceHead],
             at: repoURL
@@ -1680,6 +2270,8 @@ actor GitService {
     }
 
     func isAncestor(_ ancestor: String, of descendant: String, at repoURL: URL) async throws -> Bool {
+        try GitRevisionArgument.validate(ancestor)
+        try GitRevisionArgument.validate(descendant)
         let (_, stderr, exitCode) = try await runGit(
             ["merge-base", "--is-ancestor", ancestor, descendant],
             at: repoURL
@@ -2139,6 +2731,7 @@ actor GitService {
 
     /// Get uncommitted modified files in the repository
     func getUncommittedFiles(at repoURL: URL) async throws -> [UncommittedFile] {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "--untracked-files=all"],
             at: repoURL
@@ -2165,8 +2758,9 @@ actor GitService {
 
     /// Resolve any ref (branch, tag, commit-ish) to a SHA.
     func getRefSHA(at repoURL: URL, ref: String) async throws -> String {
+        try GitRevisionArgument.validate(ref)
         let (stdout, stderr, exitCode) = try await runGit(
-            ["rev-parse", ref],
+            ["rev-parse", "--verify", "--end-of-options", ref],
             at: repoURL
         )
         guard exitCode == 0 else {
@@ -2177,6 +2771,7 @@ actor GitService {
 
     /// Get git status output in porcelain format with NUL delimiters.
     func getStatusPorcelainZ(at repoURL: URL) async throws -> Data {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "-z", "--untracked-files=all"],
             at: repoURL
@@ -2274,6 +2869,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree
     func getDiff(from branch: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Compare branch to working tree to include all uncommitted changes
         let (stdout, stderr, exitCode) = try await runGit(
             ["diff", branch],
@@ -2289,6 +2885,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree for specific files
     func getDiff(from branch: String, for files: [String], at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Prefer normal argv for smaller file sets (compatibility),
         // use pathspec-from-file when args are large, and chunk as a fallback.
         let maxChunk = 3000
@@ -2681,6 +3278,28 @@ actor GitService {
         paths: [String]?,
         at repoURL: URL
     ) async throws -> String {
+        let data = try await runDiffData(
+            argsPrefix: argsPrefix,
+            contextLines: contextLines,
+            detectRenames: detectRenames,
+            refArg: refArg,
+            paths: paths,
+            legacyTextOutput: true,
+            at: repoURL
+        )
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func runDiffData(
+        argsPrefix: [String],
+        contextLines: Int?,
+        detectRenames: Bool,
+        refArg: String?,
+        paths: [String]?,
+        legacyTextOutput: Bool = false,
+        at repoURL: URL
+    ) async throws -> Data {
+        if let refArg { try GitRevisionArgument.validate(refArg) }
         let maxChunk = 3000
         let pathspecByteLimit = 128 * 1024
         let cleanedPaths = (paths ?? []).filter { !$0.isEmpty }
@@ -2704,15 +3323,15 @@ actor GitService {
             do {
                 var args = baseArgs()
                 args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
-                if let refArg, !refArg.isEmpty {
+                if let refArg {
                     args.append(refArg)
                 }
                 let stdin = makePathspecStdinData(cleanedPaths)
-                let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL, stdin: stdin)
+                let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL, stdin: stdin)
                 guard exitCode == 0 || exitCode == 1 else {
-                    throw GitError(message: "git diff failed: \(stderr)")
+                    throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
                 }
-                return stdout
+                return legacyTextOutput ? Self.diffTextChunkBytes(stdout) : stdout
             } catch {
                 if !shouldFallbackFromPathspecError(error) {
                     throw error
@@ -2722,48 +3341,62 @@ actor GitService {
 
         guard !cleanedPaths.isEmpty else {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            args.append("--")
+            let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
-                throw GitError(message: "git diff failed: \(stderr)")
+                throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
             }
-            return stdout
+            return legacyTextOutput ? Self.diffTextChunkBytes(stdout) : stdout
         }
 
         if cleanedPaths.count <= maxChunk {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
             args.append(contentsOf: cleanedPaths)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
-                throw GitError(message: "git diff failed: \(stderr)")
+                throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
             }
-            return stdout
+            return legacyTextOutput ? Self.diffTextChunkBytes(stdout) : stdout
         }
 
-        var combined = ""
+        var combined = Data()
         for chunk in cleanedPaths.chunked(into: maxChunk) {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
             args.append(contentsOf: chunk)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
-                throw GitError(message: "git diff failed: \(stderr)")
+                throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
             }
-            if !stdout.isEmpty {
-                combined += stdout
-                if !combined.hasSuffix("\n") { combined += "\n" }
-            }
+            Self.appendDiffChunk(stdout, to: &combined, legacyTextOutput: legacyTextOutput)
         }
         return combined
+    }
+
+    nonisolated static func diffTextChunkBytes(_ output: Data) -> Data {
+        // Preserve the existing text API's per-invocation UTF-8 export behavior.
+        Data((String(data: output, encoding: .utf8) ?? "").utf8)
+    }
+
+    nonisolated static func appendDiffChunk(
+        _ output: Data,
+        to combined: inout Data,
+        legacyTextOutput: Bool
+    ) {
+        let chunk = legacyTextOutput ? diffTextChunkBytes(output) : output
+        guard !chunk.isEmpty else { return }
+        combined.append(chunk)
+        if legacyTextOutput, combined.last != 10 { combined.append(10) }
     }
 
     func getDiffUncommitted(
@@ -3244,22 +3877,26 @@ actor GitService {
         case let .branch(ref): [ref]
         }
 
-        let numstatArgs = ["diff"] + reference + ["--numstat"]
-        let nameStatusArgs = ["diff"] + reference + ["--name-status"]
+        for ref in reference {
+            try GitRevisionArgument.validate(ref)
+        }
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
+        let numstatArgs = ["diff"] + reference + ["--numstat", "-z"]
+        let nameStatusArgs = ["diff"] + reference + ["--name-status", "-z"]
 
         // Run all commands in parallel -----------------------------------------
-        async let numstatResult = runGit(numstatArgs, at: repoURL)
-        async let nameStatResult = runGit(nameStatusArgs, at: repoURL)
-        async let untrackedResult = runGit(["ls-files", "--others", "--exclude-standard"], at: repoURL)
+        async let numstatResult = runGitData(numstatArgs, at: repoURL)
+        async let nameStatResult = runGitData(nameStatusArgs, at: repoURL)
+        async let untrackedResult = runGitData(["ls-files", "--others", "--exclude-standard", "-z"], at: repoURL)
 
         let (numOut, numErr, numExit) = try await numstatResult
         guard numExit == 0 || numExit == 1 else {
-            throw GitError(message: "git diff --numstat failed: \(numErr)")
+            throw GitError(message: "git diff --numstat failed: \(String(decoding: numErr, as: UTF8.self))")
         }
 
         let (nameOut, nameErr, nameExit) = try await nameStatResult
         guard nameExit == 0 || nameExit == 1 else {
-            throw GitError(message: "git diff --name-status failed: \(nameErr)")
+            throw GitError(message: "git diff --name-status failed: \(String(decoding: nameErr, as: UTF8.self))")
         }
 
         let (untrackedOut, _, untrackedExit) = try await untrackedResult
@@ -3268,8 +3905,8 @@ actor GitService {
         }
 
         // Parse outputs ----------------------------------------------------------
-        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
-            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        let (statsMap, statusMap) = try MCPToolWorkCountDiagnostics.measureGitParse {
+            try (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
         }
 
         // Merge into unified results --------------------------------------------
@@ -3281,9 +3918,9 @@ actor GitService {
             let tuple = statsMap[path]
             let additions = tuple?.0
             let deletions = tuple?.1
-            results.append(
+            try results.append(
                 UncommittedFile(
-                    path: path,
+                    path: path.utf8String(),
                     status: status,
                     additions: additions,
                     deletions: deletions
@@ -3292,14 +3929,12 @@ actor GitService {
         }
 
         // Add untracked files ----------------------------------------------------
-        let untrackedFiles = untrackedOut
-            .split(separator: "\n")
-            .map { String($0) }
-            .filter { !$0.isEmpty }
+        let untrackedFiles = try GitDiffMachineRecords.paths(untrackedOut).map { try $0.utf8String() }
 
+        pruneUntrackedStats(at: repoURL, paths: Set(untrackedFiles))
         for path in untrackedFiles {
             // Only add if not already in the results (avoid duplicates)
-            if !allPaths.contains(path) {
+            if try !allPaths.contains(GitDiffPath(bytes: Data(path.utf8))) {
                 let stats = untrackedLineStats(for: path, repoURL: repoURL)
                 results.append(
                     UncommittedFile(
@@ -3347,9 +3982,9 @@ actor GitService {
         }
         switch kind {
         case .numstat:
-            argsPrefix.append("--numstat")
+            argsPrefix.append(contentsOf: ["--numstat", "-z"])
         case .nameStatus:
-            argsPrefix.append("--name-status")
+            argsPrefix.append(contentsOf: ["--name-status", "-z"])
         }
 
         let refArg: String? = switch compare {
@@ -3374,9 +4009,9 @@ actor GitService {
         detectRenames: Bool = false,
         paths: [String]? = nil,
         at repoURL: URL
-    ) async throws -> String {
+    ) async throws -> Data {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .numstat)
-        return try await runDiff(
+        return try await runDiffData(
             argsPrefix: argsPrefix,
             contextLines: nil,
             detectRenames: detectRenames,
@@ -3391,9 +4026,9 @@ actor GitService {
         detectRenames: Bool = false,
         paths: [String]? = nil,
         at repoURL: URL
-    ) async throws -> String {
+    ) async throws -> Data {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .nameStatus)
-        return try await runDiff(
+        return try await runDiffData(
             argsPrefix: argsPrefix,
             contextLines: nil,
             detectRenames: detectRenames,
@@ -3410,7 +4045,14 @@ actor GitService {
         paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
+        try compare.validateRevisionArgument()
         if let paths, paths.isEmpty { return [] }
+        switch compare {
+        case .uncommitted, .uncommittedMergeBase, .unstaged:
+            try await requireCompleteWorkingTreeInspection(at: repoURL)
+        case .staged, .stagedMergeBase, .revspec:
+            break
+        }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
             case .uncommitted, .uncommittedMergeBase, .unstaged:
@@ -3424,8 +4066,8 @@ actor GitService {
         async let nameOutTask = getDiffNameStatus(compare: compare, detectRenames: detectRenames, paths: paths, at: repoURL)
         async let untrackedFilesTask = includeUntracked ? getUntrackedPaths(paths: paths, at: repoURL) : []
         let (numOut, nameOut, untrackedFiles) = try await (numOutTask, nameOutTask, untrackedFilesTask)
-        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
-            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        let (statsMap, statusMap) = try MCPToolWorkCountDiagnostics.measureGitParse {
+            try (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
         }
 
         var results: [UncommittedFile] = []
@@ -3436,9 +4078,9 @@ actor GitService {
             let tuple = statsMap[path]
             let additions = tuple?.0
             let deletions = tuple?.1
-            results.append(
+            try results.append(
                 UncommittedFile(
-                    path: path,
+                    path: path.utf8String(),
                     status: status,
                     additions: additions,
                     deletions: deletions
@@ -3447,8 +4089,10 @@ actor GitService {
         }
 
         if includeUntracked {
+            // A path-scoped listing cannot evict entries outside its pathspec.
+            pruneUntrackedStats(at: repoURL, paths: paths == nil ? Set(untrackedFiles) : nil)
             for path in untrackedFiles {
-                if !allPaths.contains(path) {
+                if try !allPaths.contains(GitDiffPath(bytes: Data(path.utf8))) {
                     let stats = untrackedLineStats(for: path, repoURL: repoURL)
                     results.append(
                         UncommittedFile(
@@ -3475,19 +4119,19 @@ actor GitService {
 
     private func getUntrackedPaths(paths: [String]?, at repoURL: URL) async throws -> [String] {
         if let paths, paths.isEmpty { return [] }
-        var args = ["ls-files", "--others", "--exclude-standard"]
+        var args = ["ls-files", "--others", "--exclude-standard", "-z"]
         if let paths {
             args.append("--")
             args.append(contentsOf: paths)
         }
-        let (stdout, stderr, exitCode) = try await runGit(
+        let (stdout, stderr, exitCode) = try await runGitData(
             args,
             at: repoURL
         )
         guard exitCode == 0 else {
-            throw GitError(message: "git ls-files failed: \(stderr)")
+            throw GitError(message: "git ls-files failed: \(String(decoding: stderr, as: UTF8.self))")
         }
-        return stdout.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        return try GitDiffMachineRecords.paths(stdout).map { try $0.utf8String() }
     }
 
     func getCommitGraph(maxLines: Int, at repoURL: URL) async throws -> String {
@@ -3554,8 +4198,21 @@ actor GitService {
         let workingStatus: WorkingStatus
     }
 
+    private func requireCompleteWorkingTreeInspection(at repoURL: URL) async throws {
+        // The passive status fence suppresses Git's recursive submodule status:
+        // children have independent executable configuration that has not been
+        // validated. Never interpret that deliberately partial view as clean.
+        // Index metadata is safe to read without entering those repositories.
+        let (index, indexError, indexExit) = try await runGitData(["ls-files", "--stage", "-z", "--", ":/"], at: repoURL)
+        guard indexExit == 0 else { throw GitError(message: "Could not determine status completeness: \(String(decoding: indexError, as: UTF8.self))") }
+        if index.split(separator: 0).contains(where: { $0.starts(with: "160000 ".utf8) }) {
+            throw GitError(message: "Working-tree status is incomplete: tracked submodules cannot be safely inspected by passive Git reads. Cleanliness is unknown; inspect submodules with Git outside RepoPrompt before merging. RepoPrompt cannot approve a worktree merge from this partial status.")
+        }
+    }
+
     /// Read branch metadata and working-tree state from one porcelain-v2 snapshot.
     func getRepositoryStatus(at repoURL: URL) async throws -> RepositoryStatus {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -4358,15 +5015,9 @@ actor GitService {
     private nonisolated static func targetEvidenceGitArguments(
         _ arguments: [String]
     ) -> [String] {
-        let safetyArguments = [
-            "-c", "core.fsmonitor=false",
-            "-c", "core.hooksPath=/dev/null",
-            "-c", "core.untrackedCache=false"
-        ]
-        if Array(arguments.prefix(safetyArguments.count)) == safetyArguments {
-            return arguments
-        }
-        return safetyArguments + arguments
+        let fenced = GitReadSafety.arguments(arguments)
+        return fenced.starts(with: GitReadSafety.configurationArguments)
+            ? fenced : GitReadSafety.configurationArguments + fenced
     }
 
     private nonisolated static func targetEvidenceEnvironmentIdentity(
@@ -6748,6 +7399,7 @@ actor GitService {
 
     /// Get commit info (metadata only, no diff).
     func commitInfo(ref: String, at repoURL: URL) async throws -> CommitInfo {
+        try GitRevisionArgument.validate(ref)
         let args = [
             "show",
             "-s",
@@ -6756,7 +7408,9 @@ actor GitService {
             "--no-ext-diff",
             "--no-textconv",
             "--color=never",
-            ref
+            // Peel annotated tags so their headers cannot enter the commit metadata.
+            "\(ref)^{commit}",
+            "--"
         ]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -6902,11 +7556,21 @@ actor GitService {
         return "\(action) couldn’t launch git-lfs from RepoPrompt’s subprocess environment. If git-lfs is installed, restart RepoPrompt and make sure it’s available from your login shell PATH.\n\nRaw error: \(rawMessage)"
     }
 
+    /// The exact environment this instance's Git subprocesses inherit (memoized on first use).
+    func preparedProcessEnvironment() async -> [String: String] {
+        await processEnvironment()
+    }
+
     private func processEnvironment() async -> [String: String] {
         if let preparedBaseProcessEnvironment {
             return preparedBaseProcessEnvironment
         }
         let shellEnvironment = await CLIEnvironmentCache.shared.environment(enableLogging: false)
+        // Another first-use caller may have prepared the environment while this one was suspended;
+        // the first prepared environment wins so every caller observes the same snapshot.
+        if let preparedBaseProcessEnvironment {
+            return preparedBaseProcessEnvironment
+        }
         let environment = Self.mergedProcessEnvironment(
             baseEnvironment: inheritedProcessEnvironment,
             shellEnvironment: shellEnvironment
@@ -6916,25 +7580,7 @@ actor GitService {
     }
 
     nonisolated static func isVerifiedReadOnlyGitOperation(_ args: [String]) -> Bool {
-        guard let command = args.first else { return false }
-        switch command {
-        case "rev-parse", "status", "ls-files", "ls-tree", "diff", "diff-tree", "check-attr", "merge-base", "merge-tree",
-             "show-ref", "for-each-ref", "log", "rev-list", "show", "blame", "cat-file":
-            return true
-        case "worktree":
-            return args.dropFirst().first == "list"
-        case "symbolic-ref":
-            return args.contains("--short") && args.last == "HEAD"
-        case "branch":
-            return args == ["branch", "--show-current"]
-        case "config":
-            return args.contains("--get") || args.contains("--get-regexp")
-        default:
-            if command == "--git-dir", let configIndex = args.firstIndex(of: "config") {
-                return args[configIndex...].contains("--get")
-            }
-            return false
-        }
+        GitReadSafety.isRead(args)
     }
 
     private func withWorkspaceAuthorityMutation<T>(
@@ -7024,16 +7670,31 @@ actor GitService {
             environment["GIT_OPTIONAL_LOCKS"] = "0"
         }
 
+        var readBinding: GitReadRepositoryBinding?
         switch repositoryBinding {
+        case .discovery:
+            // Native discovery retains Git's ownership checks and may search parents.
+            // Never use it to authorize an MCP data read or reuse ambient selectors.
+            environment.merge(env) { _, new in new }
+            environment = GitReadRepositoryBinding.discoveryEnvironment(environment)
         case .inferred:
-            // For gitfile worktrees, inject GIT_DIR and GIT_WORK_TREE to ensure
-            // git commands operate in the correct context.
-            // Skip for commands that don't need repo context (e.g., --no-index diffs).
-            if requiresRepoContext, let layout = getLayout(for: repoURL), layout.isWorktree {
+            if requiresRepoContext, Self.isVerifiedReadOnlyGitOperation(args) {
+                guard let layout = getLayout(for: repoURL) else {
+                    return (Data(), Data("Repository metadata is missing at the requested Git read root.".utf8), 128)
+                }
+                readBinding = try GitReadRepositoryBinding(layout: layout)
+                environment.merge(env) { _, new in new }
+                environment = GitReadRepositoryBinding.discoveryEnvironment(environment)
                 environment["GIT_DIR"] = layout.gitDir.path
                 environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
+            } else {
+                // Preserve the existing explicit binding for gitfile mutations.
+                if requiresRepoContext, let layout = getLayout(for: repoURL), layout.isWorktree {
+                    environment["GIT_DIR"] = layout.gitDir.path
+                    environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
+                }
+                environment.merge(env) { _, new in new }
             }
-            environment.merge(env) { _, new in new }
         case let .exactObjectRead(layout):
             environment.merge(env) { _, new in new }
             environment = Self.capabilityBoundObjectReadEnvironment(
@@ -7050,7 +7711,7 @@ actor GitService {
 
         let budgetURL = budgetRepoURL ?? repoURL
         let repositoryKey = switch repositoryBinding {
-        case .inferred:
+        case .discovery, .inferred:
             getLayout(for: budgetURL)?.commonDir.standardizedFileURL.path
                 ?? budgetURL.standardizedFileURL.path
         case let .exactObjectRead(layout):
@@ -7065,18 +7726,43 @@ actor GitService {
         )
         do {
             try Task.checkCancellation()
+            if let readBinding {
+                // Explicit GIT_DIR skips Git's native ownership check. Probe the
+                // exact checkout first, without ambient repository selectors, then
+                // keep the captured metadata binding for the actual data command.
+                let probe = try await runAdmittedGitData(
+                    readBinding.ownershipProbeArguments,
+                    at: readBinding.layout.workTreeRoot,
+                    environment: readBinding.ownershipProbeEnvironment(environment),
+                    stdin: nil,
+                    diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
+                    processQueueWaitMicroseconds: lease.queueWaitMicroseconds,
+                    stdoutByteLimit: 4096,
+                    stderrByteLimit: stderrByteLimit,
+                    admissionPriority: admissionPriority,
+                    commandFamily: .repositoryRead,
+                    commandTimeout: commandTimeout,
+                    readBinding: readBinding
+                )
+                if probe.2 != 0 {
+                    throw GitError(message: GitReadSafety.ownershipProbeFailure(exitCode: probe.2, stderr: probe.1))
+                }
+                try readBinding.validateOwnershipProbe(String(decoding: probe.0, as: UTF8.self))
+                try Task.checkCancellation()
+            }
             let result = try await runAdmittedGitData(
                 args,
                 at: repoURL,
                 environment: environment,
                 stdin: stdin,
                 diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
-                processQueueWaitMicroseconds: lease.queueWaitMicroseconds,
+                processQueueWaitMicroseconds: readBinding.map { _ in 0 } ?? lease.queueWaitMicroseconds,
                 stdoutByteLimit: stdoutByteLimit,
                 stderrByteLimit: stderrByteLimit,
                 admissionPriority: admissionPriority,
                 commandFamily: commandFamily ?? Self.commandFamily(for: args),
-                commandTimeout: commandTimeout
+                commandTimeout: commandTimeout,
+                readBinding: readBinding
             )
             await processAdmissionController.release(lease)
             return result
@@ -7150,6 +7836,11 @@ actor GitService {
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily
     ) async throws -> (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: resourcePolicy.activityTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
@@ -7497,7 +8188,7 @@ actor GitService {
         environment["GIT_ALLOW_PROTOCOL"] = ""
         environment["LC_ALL"] = "C"
         environment["LANG"] = "C"
-        return environment
+        return GitReadSafety.environment(environment)
     }
 
     private nonisolated static func exactWorktreeEnvironment(
@@ -7534,6 +8225,39 @@ actor GitService {
         }
     }
 
+    /// Called inside the existing admission lease; the config query uses that
+    /// lease too, rather than recursively acquiring a per-repository slot.
+    /// Do not cache this result: includes and worktree configuration can change
+    /// without changing the main config's modification time.
+    private func preparePassiveGitRead(
+        _ args: [String],
+        at repoURL: URL,
+        environment: [String: String],
+        diagnosticRepositoryPath: String,
+        admissionPriority: GitProcessAdmissionPriority,
+        commandTimeout: Duration
+    ) async throws -> ([String], [String: String]) {
+        guard GitReadSafety.isRead(args) else { return (args, environment) }
+        try GitReadSafety.validateSupportedRead(args)
+        let safeEnvironment = GitReadSafety.environment(environment)
+        if GitReadSafety.needsDriverCheck(args), let commandIndex = GitReadSafety.commandIndex(in: args) {
+            let query = Array(args.prefix(commandIndex)) + GitReadSafety.driverQuery
+            let (configuration, diagnostic, exitCode) = try await runAdmittedGitData(
+                query, at: repoURL, environment: safeEnvironment, stdin: nil,
+                diagnosticRepositoryPath: diagnosticRepositoryPath,
+                processQueueWaitMicroseconds: 0,
+                stdoutByteLimit: 1024 * 1024, stderrByteLimit: 64 * 1024,
+                admissionPriority: admissionPriority, commandFamily: .repositoryRead,
+                commandTimeout: commandTimeout
+            )
+            guard exitCode == 0 || (exitCode == 1 && configuration.isEmpty && diagnostic.isEmpty) else {
+                throw GitError(message: GitReadSafety.driverQueryFailure(exitCode: exitCode, stderr: diagnostic))
+            }
+            try GitReadSafety.validateDriverConfiguration(configuration, for: args)
+        }
+        return (GitReadSafety.arguments(args), safeEnvironment)
+    }
+
     private func runAdmittedGitData(
         _ args: [String],
         at repoURL: URL,
@@ -7545,8 +8269,14 @@ actor GitService {
         stderrByteLimit: Int?,
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily,
-        commandTimeout: Duration
+        commandTimeout: Duration,
+        readBinding: GitReadRepositoryBinding? = nil
     ) async throws -> (Data, Data, Int32) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: commandTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
@@ -7563,6 +8293,12 @@ actor GitService {
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
         let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        // Only delegated creation carries this callback. All repository resolution, mutation-lock,
+        // eligibility and process-lane waits have completed; rejection here leaves no Git worktree
+        // or branch. Once admitted, checkout and receipt completion retain ordinary semantics.
+        if args.prefix(2).elementsEqual(["worktree", "add"]) {
+            try await Self.worktreeCreationCommitFence?()
+        }
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
@@ -7618,6 +8354,7 @@ actor GitService {
                 do {
                     try lifecycleController.checkCancellationBeforeSpawn()
                     try physicalMutationGuard?.revalidate()
+                    try readBinding?.revalidate()
                     let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
                         family: commandFamily,
                         priority: admissionPriority
@@ -8039,23 +8776,15 @@ actor GitService {
             )
         }
 
-        let worktreeRecords = aliasResolution.records.map(\.record)
-        let layoutsByPath: [String: GitRepositoryLayout] = Dictionary(
-            uniqueKeysWithValues: aliasResolution.records.compactMap { resolvedRecord in
-                resolvedRecord.layout.map { (resolvedRecord.pathURL.path, $0) }
-            }
-        )
-
         let commonGitDir = currentLayout?.commonDir
-            ?? layoutsByPath.values.first?.commonDir
+            ?? aliasResolution.records.lazy.compactMap(\.layout).first?.commonDir
         guard let commonGitDir else {
             throw GitError(message: "git worktree list succeeded but repository layout could not be resolved")
         }
 
-        let discoveredMainRoot = worktreeRecords.first { record in
-            let path = URL(fileURLWithPath: record.path).standardizedFileURL.path
-            return layoutsByPath[path].map { !$0.isLinkedWorktree } ?? false
-        }.map { URL(fileURLWithPath: $0.path).standardizedFileURL }
+        let discoveredMainRoot = aliasResolution.records.first { resolvedRecord in
+            resolvedRecord.layout.map { !$0.isLinkedWorktree } ?? false
+        }.map(\.pathURL)
         let mainURL = resolvedMainRoot ?? discoveredMainRoot
         let repository = GitWorktreeIdentity.repositoryIdentity(
             commonGitDir: commonGitDir,
@@ -8063,10 +8792,11 @@ actor GitService {
         )
         let currentPath = currentRepoURL.standardizedFileURL.path
 
-        return worktreeRecords.map { record in
-            let pathURL = URL(fileURLWithPath: record.path).standardizedFileURL
+        return aliasResolution.records.map { resolvedRecord in
+            let record = resolvedRecord.record
+            let pathURL = resolvedRecord.pathURL
             let path = pathURL.path
-            let layout = layoutsByPath[path]
+            let layout = resolvedRecord.layout
             let gitDir = layout?.gitDir.standardizedFileURL
             let isMain: Bool = if let layout {
                 !layout.isLinkedWorktree
@@ -8209,10 +8939,37 @@ actor GitService {
 
     private func untrackedLineStats(for path: String, repoURL: URL) -> (additions: Int?, deletions: Int?) {
         let fileURL = repoURL.appendingPathComponent(path)
+        let key = UntrackedStatsKey(root: repoURL.standardizedFileURL.path, path: path)
+        // lstat deliberately makes symlinks uncacheable; their existing read behavior is unchanged.
+        // ctime also catches many same-size writes with restored mtime. Metadata collisions on
+        // coarse filesystems remain possible; this is a statistics cache, not content authority.
+        let fingerprint = try? FileContentFingerprintReader.fingerprint(atPath: fileURL.path)
+        if let fingerprint, var cached = untrackedStatsCache[key], cached.fingerprint == fingerprint {
+            cached.lastUsed = Date()
+            untrackedStatsCache[key] = cached
+            return (cached.additions, cached.deletions)
+        }
+        untrackedStatsCache.removeValue(forKey: key)
         guard let handle = try? FileHandle(forReadingFrom: fileURL) else {
             return (nil, nil)
         }
+        #if DEBUG
+            untrackedStatsReadCount += 1
+        #endif
+        let openedFingerprint = try? FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)
+        var stats: (additions: Int?, deletions: Int?) = (nil, nil)
+        var cacheable = false
         defer {
+            // Never retain partial reads, non-regular files, or content changed/replaced during reading.
+            if cacheable, untrackedStatsCache.count < untrackedStatsCacheLimit,
+               let fingerprint, openedFingerprint == fingerprint,
+               (try? FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)) == fingerprint,
+               (try? FileContentFingerprintReader.fingerprint(atPath: fileURL.path)) == fingerprint
+            {
+                untrackedStatsCache[key] = CachedUntrackedStats(
+                    fingerprint: fingerprint, additions: stats.additions, deletions: stats.deletions, lastUsed: Date()
+                )
+            }
             try? handle.close()
         }
 
@@ -8222,20 +8979,28 @@ actor GitService {
         var lastByte: UInt8?
 
         while true {
-            guard let data = try? handle.read(upToCount: chunkSize),
-                  !data.isEmpty
-            else {
+            let data: Data
+            do {
+                guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                    cacheable = true
+                    break
+                }
+                data = chunk
+            } catch {
                 break
             }
             sawData = true
-            for byte in data {
-                if byte == 0 {
-                    return (nil, nil)
+            let isText = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                for byte in bytes {
+                    if byte == 0 { return false }
+                    if byte == 0x0A { lineCount += 1 }
                 }
-                if byte == 0x0A {
-                    lineCount += 1
-                }
-                lastByte = byte
+                lastByte = bytes.last
+                return true
+            }
+            guard isText else {
+                cacheable = true
+                return stats
             }
         }
 
@@ -8244,96 +9009,23 @@ actor GitService {
                 lineCount += 1
             }
         }
-
-        return (lineCount, 0)
+        stats = (lineCount, 0)
+        return stats
     }
 
-    /// Parses `git diff --numstat` output into a map of path → (additions, deletions)
-    nonisolated func parseNumstatOutput(_ output: String) -> [String: (Int?, Int?)] {
-        var map: [String: (Int?, Int?)] = [:]
-
-        for rawLine in output.split(separator: "\n") {
-            let parts = rawLine.split(separator: "\t", maxSplits: 2).map(String.init)
-            guard parts.count == 3 else { continue }
-
-            let addStr = parts[0]
-            let delStr = parts[1]
-            let pathRaw = parts[2]
-            let path = normalizeRenamedPath(pathRaw)
-
-            let additions = Int(addStr) // nil when "-"
-            let deletions = Int(delStr)
-
-            map[path] = (additions, deletions)
+    /// Decode NUL-framed machine output and join on exact bytes, never pretty-text spelling.
+    nonisolated func parseNumstatOutput(_ output: Data) throws -> [GitDiffPath: (Int?, Int?)] {
+        var map: [GitDiffPath: (Int?, Int?)] = [:]
+        for record in try GitDiffMachineRecords.numstat(output) {
+            map[record.path] = (record.additions, record.deletions)
         }
         return map
     }
 
-    /// Convert numstat rename formats to the final/new path so they line up with name-status.
-    /// Handles:
-    ///  - "old/path => new/path"
-    ///  - "dir/{old => new}/file.swift"
-    nonisolated func normalizeRenamedPath(_ s: String) -> String {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Brace segment renames: "a/{old => new}/b"
-        if trimmed.contains("{"), trimmed.contains("}"), trimmed.contains(" => ") {
-            var out = ""
-            var i = trimmed.startIndex
-            var handledBraceRename = false
-            while i < trimmed.endIndex {
-                if trimmed[i] == "{", let end = trimmed[i...].firstIndex(of: "}") {
-                    let inner = trimmed[trimmed.index(after: i) ..< end]
-                    if let sep = inner.range(of: " => ") {
-                        handledBraceRename = true
-                        out += inner[sep.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-                    } else {
-                        out.append("{")
-                        out += inner
-                        out.append("}")
-                    }
-                    i = trimmed.index(after: end)
-                } else {
-                    out.append(trimmed[i])
-                    i = trimmed.index(after: i)
-                }
-            }
-            if handledBraceRename {
-                return out
-            }
-        }
-
-        // Simple "old/path => new/path" whole-path rename
-        if let arrow = trimmed.range(of: " => ") {
-            return String(trimmed[arrow.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        return trimmed
-    }
-
-    /// Parses `git diff --name-status` lines into a map of path → single-letter status
-    nonisolated func parseNameStatusOutput(_ output: String) -> [String: String] {
-        var map: [String: String] = [:]
-
-        for rawLine in output.split(separator: "\n") {
-            let parts = rawLine
-                .split(separator: "\t", omittingEmptySubsequences: false)
-                .map(String.init)
-            guard !parts.isEmpty else { continue }
-
-            let statusCode = parts[0].trimmingCharacters(in: .whitespaces)
-
-            // Handle rename/copy which provide two paths
-            let path: String = if statusCode.hasPrefix("R") || statusCode.hasPrefix("C") {
-                // new path is last field
-                parts.last ?? ""
-            } else {
-                parts.count > 1 ? parts[1] : ""
-            }
-
-            if !path.isEmpty {
-                map[path] = String(statusCode.prefix(1)) // e.g. "M"
-            }
+    nonisolated func parseNameStatusOutput(_ output: Data) throws -> [GitDiffPath: String] {
+        var map: [GitDiffPath: String] = [:]
+        for record in try GitDiffMachineRecords.nameStatus(output) {
+            map[record.path] = String(record.status.prefix(1))
         }
         return map
     }

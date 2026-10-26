@@ -1,8 +1,10 @@
+import AppKit
 import Foundation
 import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 @MainActor
 final class MCPAskUserToolProvider: MCPAppToolProviding {
@@ -17,19 +19,22 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
     }
 
     var domainInteractionAdapter: DomainLongRunningInteractionAdapter {
-        let requireTargetWindow = dependencies.requireTargetWindow
-        let requireCurrentTabContext = dependencies.requireCurrentTabContext
-        let resolveAgentModeTabID = dependencies.resolveAgentModeTabID
+        let execution = dependencies
+        let requireTargetWindow = execution.requireTargetWindow
+        let requireCurrentTabContext = execution.requireCurrentTabContext
+        let resolveAgentModeTabID = execution.resolveAgentModeTabID
         return DomainLongRunningInteractionAdapter(
             isAvailable: { request in
-                guard let connectionID = request.clientID,
+                guard let invocationContext = try? MCPInvocationContextBridge.require(toolName: MCPWindowToolName.askUser),
+                      let connectionID = invocationContext.connectionID,
+                      request.clientID == connectionID,
                       let targetWindow = await MainActor.run(body: {
                           try? requireTargetWindow()
                       })
                 else {
                     return false
                 }
-                switch await ServerNetworkManager.shared.runPurpose(for: connectionID) {
+                switch await execution.liveRunPurpose(connectionID) {
                 case .discoverRun:
                     guard let tabContext = try? await requireCurrentTabContext(
                         MCPWindowToolName.askUser
@@ -57,11 +62,17 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                     return false
                 }
             },
-            resolveDefaultTimeoutSeconds: { _ in
-                try await MainActor.run {
-                    let targetWindow = try requireTargetWindow()
-                    return targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds
+            resolveDefaultTimeoutSeconds: { request in
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: MCPWindowToolName.askUser)
+                guard let connectionID = invocationContext.connectionID,
+                      request.clientID == connectionID
+                else {
+                    throw MCPError.invalidParams("ask_user requires an active MCP connection")
                 }
+                return try await Self.resolveDefaultTimeoutSeconds(
+                    invocationContext: invocationContext,
+                    dependencies: execution
+                )
             },
             cancel: { requestID in
                 await MCPAskUserPresentationCoordinator.shared.cancel(requestID: requestID)
@@ -102,7 +113,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
             - `questions`: Required array of structured questions. Each question requires stable `id` and `question` fields. Use `allows_multiple` and `allows_custom` for selection/custom-answer behavior.
             - `title`: Optional title for the wizard card.
             - `context`: Optional overall context shown above the questions.
-            - `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting.
+            - `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference.
 
             **Response:**
             - `answers`: Object keyed by question ID. Each value contains `answers`, `selected_options`, `custom_response`, and `skipped`.
@@ -115,7 +126,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                 properties: [
                     "title": .string(description: "Optional title shown above the question wizard."),
                     "context": .string(description: "Optional overall context shown above the wizard."),
-                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting."),
+                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction. Defaults to the global Question Timeout preference."),
                     "questions": .array(
                         description: "One or more structured questions to ask as a single wizard.",
                         items: .object(
@@ -146,28 +157,31 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                 ],
                 required: ["questions"]
             )
-        ) { [dependencies] _, args in
-            try await Self.executeAskUser(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeAskUser(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
     /// Execute the ask_user tool - routes to appropriate UI based on run purpose.
     private static func executeAskUser(
         args: [String: Value],
+        invocationContext: ToolInvocationContext,
         dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         // Get connection ID and determine run purpose for routing.
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+        guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("ask_user requires an active MCP connection")
         }
-        let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
+        let purpose = await dependencies.liveRunPurpose(connectionID)
 
         // Get target window.
         let targetWindow = try dependencies.requireTargetWindow()
 
-        // Resolve timeout: use explicit value from caller, or workspace setting.
-        let workspaceTimeout = await MainActor.run { targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds }
-        let parsed = try parseAskUserInteraction(args: args, defaultTimeout: workspaceTimeout)
+        let defaultTimeout = try await resolveDefaultTimeoutSeconds(
+            invocationContext: invocationContext,
+            dependencies: dependencies
+        )
+        let parsed = try parseAskUserInteraction(args: args, defaultTimeout: defaultTimeout)
 
         // Route based on run purpose.
         let response: AgentAskUserResponse
@@ -207,7 +221,12 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
             // For non-MCP-controlled sessions, surface the tab so the user can
             // see and answer the question. MCP-controlled runs handle interactions
             // programmatically via `respond`, so pulling focus would be disruptive.
-            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID) {
+            if !targetWindow.agentModeViewModel.isMCPControlled(tabID: tabID),
+               !Self.prefersNotificationOverActivation(
+                   isAppActive: NSApp?.isActive == true,
+                   preferences: GlobalSettingsStore.shared.notificationPreferences()
+               )
+            {
                 _ = await targetWindow.revealPendingInteraction(
                     tabID: tabID,
                     surface: .agentQuestion
@@ -240,6 +259,34 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         return askUserResponseValue(response, includeLegacyResponse: parsed.includeLegacyResponse)
     }
 
+    private static func resolveDefaultTimeoutSeconds(
+        invocationContext: ToolInvocationContext,
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
+    ) async throws -> TimeInterval {
+        guard let connectionID = invocationContext.connectionID else {
+            throw MCPError.invalidParams("ask_user requires an active MCP connection")
+        }
+        let targetWindow = try dependencies.requireTargetWindow()
+        switch await dependencies.liveRunPurpose(connectionID) {
+        case .discoverRun:
+            let tabContext = try await dependencies.requireCurrentTabContext(MCPWindowToolName.askUser)
+            guard let runID = tabContext.runID else {
+                throw MCPError.invalidParams("ask_user requires an active Context Builder run with tab context")
+            }
+            guard let timeout = targetWindow.contextBuilderAgentViewModel.capturedQuestionTimeoutSeconds(
+                tabID: tabContext.tabID,
+                runID: runID
+            ) else {
+                throw MCPError.internalError("ask_user Context Builder run behavior is unavailable")
+            }
+            return timeout
+        case .agentModeRun:
+            return targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds
+        case .unknown:
+            throw MCPError.invalidParams("ask_user is only available during Context Builder or agent mode runs")
+        }
+    }
+
     private static func withPresentationRegistration<Result>(
         requestID: UUID?,
         cancellation: @escaping MCPAskUserPresentationCoordinator.Cancellation,
@@ -262,6 +309,19 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
         } onCancel: {
             Task { await coordinator.cancel(requestID: requestID) }
         }
+    }
+
+    /// Opt-in (`notifications.mcp_ask_user_notify_instead_of_activate`): while RepoPrompt is in the
+    /// background, let the attention-notification reconciler surface the question instead of pulling
+    /// the app to the front. Default behavior (reveal the tab) is unchanged.
+    nonisolated static func prefersNotificationOverActivation(
+        isAppActive: Bool,
+        preferences: NotificationPreferences
+    ) -> Bool {
+        !isAppActive
+            && preferences.enabled
+            && preferences.agentInteractions
+            && preferences.mcpAskUserNotifyInsteadOfActivate
     }
 
     nonisolated static func resolvedInteractionTimeoutSeconds(

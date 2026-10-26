@@ -17,15 +17,17 @@ class OpenAIProvider: AIProvider {
     // Instance-level cache
     private let cachedApiKey: String?
     private let cachedBaseURL: URL?
+    private let httpCredentialConsentEndpoint: String?
     private var failedSetup: Bool = false
     private let configuredMaxTokens: Int? // Add property to store configured max tokens
     private let overrideVersion: String? // Add property for API version override
     private let includeUsageInStream: Bool // Whether to include usage in streamed responses
     private let serviceTier: String? // Service tier for Responses API (auto/default/flex/priority)
 
-    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil) {
+    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil, httpCredentialConsentEndpoint: String? = nil) {
         cachedApiKey = apiKey
         cachedBaseURL = baseURL
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
         self.configuredMaxTokens = configuredMaxTokens
         self.overrideVersion = overrideVersion
         self.includeUsageInStream = includeUsageInStream
@@ -41,10 +43,11 @@ class OpenAIProvider: AIProvider {
     }
 
     /// Get service using cached values
-    open func getService() -> OpenAIService {
+    open func getService() throws -> OpenAIService {
         let apiKey = cachedApiKey ?? ""
 
         if let baseURL = cachedBaseURL {
+            try ProviderEndpointConsent.validate(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
             let configuration = URLSessionConfiguration.default
             configuration.timeoutIntervalForRequest = 21600 // 6 hours
             configuration.timeoutIntervalForResource = 21600 // 6 hours
@@ -88,6 +91,9 @@ class OpenAIProvider: AIProvider {
         case .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             128_000
         // Fallback: Let the API handle it by not setting a token limit.
@@ -127,6 +133,9 @@ class OpenAIProvider: AIProvider {
              .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             return true
         default:
@@ -311,7 +320,7 @@ class OpenAIProvider: AIProvider {
             parameters.temperature = messageTemperature
         }
 
-        let service = getService()
+        let service = try getService()
         let stream = try await service.startStreamedChat(parameters: parameters)
 
         return AsyncThrowingStream { continuation in
@@ -376,7 +385,7 @@ class OpenAIProvider: AIProvider {
         model: AIModel, // Keep model parameter for clarity and potential future use
         maxTokens: Int? // Keep maxTokens parameter
     ) async throws -> AICompletionResult {
-        let service = getService()
+        let service = try getService()
         let parameters = buildForegroundResponseParameters(
             aiMessage,
             model: model,
@@ -442,7 +451,7 @@ class OpenAIProvider: AIProvider {
         model: AIModel,
         maxTokens: Int?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let service = getService()
+        let service = try getService()
         let parameters = buildForegroundResponseParameters(
             aiMessage,
             model: model,
@@ -509,7 +518,7 @@ class OpenAIProvider: AIProvider {
             parameters.temperature = messageTemperature
         }
 
-        let service = getService()
+        let service = try getService()
         let response = try await service.startChat(parameters: parameters)
 
         // Extract token usage if available
@@ -746,6 +755,22 @@ class OpenAIProvider: AIProvider {
         case .gpt54High: return (.gpt54, "high")
         case .gpt54Low: return (.gpt54, "low")
         case .gpt54: return (.gpt54, "medium")
+        // ── GPT-6 family (no none/minimal on 6.1 Sol or Astra) ──
+        case .gpt61SolMax: return (.gpt61Sol, "max")
+        case .gpt61SolXHigh: return (.gpt61Sol, "xhigh")
+        case .gpt61SolHigh: return (.gpt61Sol, "high")
+        case .gpt61SolLow: return (.gpt61Sol, "low")
+        case .gpt61Sol: return (.gpt61Sol, "medium")
+        case .gpt6AstraMax: return (.gpt6Astra, "max")
+        case .gpt6AstraXHigh: return (.gpt6Astra, "xhigh")
+        case .gpt6AstraHigh: return (.gpt6Astra, "high")
+        case .gpt6AstraLow: return (.gpt6Astra, "low")
+        case .gpt6Astra: return (.gpt6Astra, "medium")
+        case .gpt6LunaXHigh: return (.gpt6Luna, "xhigh")
+        case .gpt6LunaHigh: return (.gpt6Luna, "high")
+        case .gpt6LunaLow: return (.gpt6Luna, "low")
+        case .gpt6Luna: return (.gpt6Luna, "medium")
+        case .gpt6Sol: return (.gpt6Sol, "medium")
         // ── gpt5-codex-max family (Responses API) ──
         case .gpt5CodexXHigh: return (.gpt5CodexMed, "xhigh")
         case .gpt5CodexHigh: return (.gpt5CodexMed, "high")
@@ -784,7 +809,7 @@ extension OpenAIProvider: ResponsesJobProvider {
     }
 
     func streamResponse(id: String) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let service = getService()
+        let service = try getService()
 
         // Use polling instead of SSE for more reliable background job monitoring
         return AsyncThrowingStream { continuation in

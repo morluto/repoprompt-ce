@@ -593,14 +593,14 @@ def render_report(
             "## 6. License and NOTICE review",
             "",
             "- Compare upstream `LICENSE` and `NOTICE` at the candidate tag with `ThirdPartyLicenses/codex/`.",
-            "- Recheck the packaged Zsh licence, refresh the flat legal `SHA256SUMS`, and review `THIRD_PARTY_NOTICES.md`.",
+            "- Recheck packaged third-party licences against the candidate inventory, refresh the flat legal `SHA256SUMS`, and review `THIRD_PARTY_NOTICES.md`.",
             "- Artifact verification does not approve legal-text changes.",
             "",
             "## 7. External override floor policy",
             "",
-            "- **UNRESOLVED MANUAL POLICY GATE:** `CodexRuntimeAuthority.minimumExternalVersion` currently equals `bundledVersion`.",
+            "- **UNRESOLVED MANUAL POLICY GATE:** `CodexRuntimeAuthority.minimumExternalVersion` is a separate compatibility floor from the candidate bundle and schema pins.",
             "- This candidate makes no external override floor decision and applies no Swift edit.",
-            "- A maintainer must decide explicitly whether the floor moves, then revalidate `CodexIntegrationConfiguration` direct-only contract refusal behavior and user guidance.",
+            "- A maintainer must decide explicitly whether observed consumed protocol drift requires the floor to move, then revalidate `CodexIntegrationConfiguration` direct-only contract refusal behavior and user guidance.",
             "",
             "## 8. Required validation",
             "",
@@ -798,8 +798,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Prepare guarded, review-only evidence for an official stable Codex runtime update"
     )
     selector = parser.add_mutually_exclusive_group(required=True)
-    selector.add_argument("--version", help="explicit stable Codex version (for example 0.148.0)")
-    selector.add_argument("--tag", help="explicit stable Codex tag (for example rust-v0.148.0)")
+    selector.add_argument("--version", help="explicit stable Codex version (for example 0.154.0)")
+    selector.add_argument("--tag", help="explicit stable Codex tag (for example rust-v0.154.0)")
     selector.add_argument(
         "--latest-stable",
         action="store_true",
